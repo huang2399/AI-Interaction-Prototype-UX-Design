@@ -1,0 +1,7 @@
+build/
+sdkconfig.old
+*.bin
+*.elf
+*.map
+managed_components/
+*.log
