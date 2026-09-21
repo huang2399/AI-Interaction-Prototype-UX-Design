@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32-S3 EYE · DevBench 控制台</title>
+<script src="/static/echarts.min.js"></script>
+<script>if (!window.echarts) { document.write('<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"><\/script>'); }</script>
+<style>
+:root{
+  --bg:#0f172a; --card:#1e293b; --card2:#16203a; --line:rgba(148,163,184,.16);
+  --txt:#e2e8f0; --dim:#94a3b8; --dim2:#64748b;
+  --cyan:#22d3ee; --green:#34d399; --yellow:#fbbf24; --red:#f87171; --violet:#a78bfa; --orange:#fb923c;
+}
+*{box-sizing:border-box; margin:0; padding:0;}
+body{background:radial-gradient(1200px 600px at 80% -10%, rgba(34,211,238,.08), transparent 60%), var(--bg); color:var(--txt); font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; min-height:100vh;}
+.mono{font-family:Consolas,"JetBrains Mono",monospace;}
+.topbar{display:flex; align-items:center; gap:14px; padding:14px 26px; border-bottom:1px solid var(--line); background:rgba(15,23,42,.85); backdrop-filter:blur(6px); position:sticky; top:0; z-index:10;}
+.brand{font-size:19px; letter-spacing:.5px;}
+.brand b{color:var(--cyan);}
+.brand-sub{color:var(--dim); font-weight:600;}
+.top-right{margin-left:auto; display:flex; align-items:center; gap:12px;}
+.clock{color:var(--dim); font-family:Consolas,monospace; font-size:14px;}
+.pill{font-size:12px; padding:4px 10px; border-radius:999px; border:1px solid var(--line); background:var(--card2); color:var(--dim); white-space:nowrap;}
+.pill-info{color:var(--cyan); border-color:rgba(34,211,238,.35);}
+.pill-live{color:var(--green); border-color:rgba(52,211,153,.4);}
+.pill-dim{color:var(--dim2);}
+.layout{display:grid; grid-template-columns:380px 1fr; gap:18px; padding:18px 26px;}
+.col{display:flex; flex-direction:column; gap:18px;}
+.card{background:linear-gradient(180deg, rgba(30,41,59,.92), rgba(30,41,59,.78)); border:1px solid var(--line); border-radius:14px; box-shadow:0 0 0 1px rgba(56,189,248,.05), 0 10px 30px rgba(2,6,23,.45); padding:16px 18px;}
+.card-h{display:flex; align-items:center; gap:10px; margin-bottom:12px; flex-wrap:wrap;}
+.card-t{font-size:15px; font-weight:700; letter-spacing:.3px;}
+.hint{color:var(--dim2); font-size:12px; line-height:1.7; margin-top:10px;}
+.btn-capture{width:100%; padding:18px 10px; font-size:18px; font-weight:800; letter-spacing:1px; color:#06202a; background:linear-gradient(135deg,#22d3ee,#0ea5e9); border:none; border-radius:12px; cursor:pointer; box-shadow:0 0 18px rgba(34,211,238,.35), inset 0 1px 0 rgba(255,255,255,.35); transition:transform .12s, box-shadow .2s;}
+.btn-capture:hover{transform:translateY(-1px); box-shadow:0 0 26px rgba(34,211,238,.5);}
+.btn-capture small{font-weight:600; opacity:.75;}
+.btn-ack{display:none; width:100%; margin-top:12px; padding:12px; font-size:15px; font-weight:700; color:#2a1204; background:linear-gradient(135deg,#fb923c,#f97316); border:none; border-radius:10px; cursor:pointer; box-shadow:0 0 14px rgba(251,146,60,.4);}
+.btn{padding:10px 14px; border-radius:10px; border:1px solid var(--line); background:var(--card2); color:var(--txt); font-size:13px; font-weight:600; cursor:pointer; transition:filter .15s;}
+.btn:hover{filter:brightness(1.2);}
+.btn-on{background:rgba(34,211,238,.15); color:var(--cyan); border-color:rgba(34,211,238,.4);}
+.btn-off{background:rgba(148,163,184,.08); color:var(--dim);}
+.dash{display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;}
+.dash.four{grid-template-columns:repeat(4,1fr);}
+.dash-item{background:var(--card2); border:1px solid var(--line); border-radius:10px; padding:10px 12px; min-width:0;}
+.dash-k{font-size:11px; color:var(--dim2); margin-bottom:6px; letter-spacing:.4px;}
+.dash-v{font-size:15px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.dash-v.small{font-size:12px; font-weight:600; color:var(--dim);}
+.badge{display:inline-block; padding:3px 10px; border-radius:6px; font-size:12px; font-weight:800; letter-spacing:.6px;}
+.badge-ok{background:rgba(52,211,153,.15); color:var(--green); border:1px solid rgba(52,211,153,.4);}
+.badge-warn{background:rgba(251,191,36,.15); color:var(--yellow); border:1px solid rgba(251,191,36,.4);}
+.badge-err{background:rgba(248,113,113,.15); color:var(--red); border:1px solid rgba(248,113,113,.4);}
+.badge-info{background:rgba(34,211,238,.12); color:var(--cyan); border:1px solid rgba(34,211,238,.35);}
+.badge-dim{background:rgba(148,163,184,.1); color:var(--dim); border:1px solid var(--line);}
+.form-row{display:flex; gap:10px; margin-bottom:10px; flex-wrap:wrap;}
+.form-row label{flex:1; min-width:120px; font-size:12px; color:var(--dim); display:flex; flex-direction:column; gap:6px;}
+input[type=number], select{background:#0b1220; border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:9px 10px; font-size:14px; font-family:Consolas,monospace; outline:none;}
+input[type=number]:focus, select:focus{border-color:rgba(34,211,238,.5);}
+#imu_chart{width:100%; height:300px; border:none;}
+.legend{display:flex; gap:12px; font-size:12px; color:var(--dim); align-items:center;}
+.legend i{display:inline-block; width:10px; height:3px; border-radius:2px; margin-right:5px; vertical-align:middle;}
+.imu-readout{margin-top:8px; color:var(--dim); font-size:12px; letter-spacing:.5px;}
+.bars{display:flex; gap:3px; margin-top:6px; align-items:flex-end; height:12px;}
+.bars i{width:5px; background:rgba(148,163,184,.25); border-radius:1px;}
+.bars i:nth-child(1){height:4px;} .bars i:nth-child(2){height:7px;} .bars i:nth-child(3){height:10px;} .bars i:nth-child(4){height:12px;}
+.bars i.on{background:var(--green);}
+.gallery-card{grid-column:1 / -1;}
+.retention{margin-left:auto; font-size:12px; color:var(--dim); display:flex; align-items:center; gap:8px;}
+.retention select{padding:6px 8px; font-size:12px;}
+.gallery{display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:14px;}
+.pcard{background:var(--card2); border:1px solid var(--line); border-radius:12px; overflow:hidden; transition:transform .18s, box-shadow .2s;}
+.pcard:hover{transform:translateY(-3px); box-shadow:0 12px 28px rgba(2,6,23,.6);}
+.thumb{height:160px; overflow:hidden; background:#0b1220; position:relative;}
+.thumb img{width:100%; height:100%; object-fit:cover; transition:transform .35s ease; display:block;}
+.pcard:hover .thumb img{transform:scale(1.12);}
+.placeholder{height:160px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; color:var(--dim2); font-size:12px; background:repeating-linear-gradient(45deg,#0b1220,#0b1220 12px,#101a30 12px,#101a30 24px);}
+.placeholder .icon{font-size:30px;}
+.pmeta{padding:10px 12px;}
+.prow{display:flex; align-items:center; justify-content:space-between; gap:8px;}
+.pname{font-size:13px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.psub{margin-top:7px; color:var(--dim2); font-size:11px; font-family:Consolas,monospace;}
+.tag{font-size:11px; font-weight:700; padding:2px 8px; border-radius:6px; white-space:nowrap;}
+.tag-stored{background:rgba(52,211,153,.15); color:var(--green); border:1px solid rgba(52,211,153,.4);}
+.tag-cleaned{background:rgba(148,163,184,.1); color:var(--dim2); border:1px solid var(--line);}
+.empty-state{text-align:center; color:var(--dim2); padding:40px 0; font-size:14px;}
+.empty-state .icon{font-size:40px; margin-bottom:10px;}
+.toast{display:none; position:fixed; right:26px; bottom:26px; padding:12px 18px; border-radius:10px; font-size:14px; font-weight:600; z-index:99; box-shadow:0 10px 30px rgba(2,6,23,.6);}
+.toast-ok{background:rgba(16,185,129,.95); color:#04211a;}
+.toast-err{background:rgba(239,68,68,.95); color:#2a0505;}
+@media (max-width:1100px){ .layout{grid-template-columns:1fr;} }
+button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">⚡ <b>ESP32-S3 EYE</b> <span class="brand-sub">DevBench</span></div>
+  <span class="pill pill-info">Dev/QA Console</span>
+  <span class="pill pill-dim">目标节点: esp32s3-eye-01</span>
+  <div class="top-right">
+    <span class="pill" id="online_pill">● 检测中</span>
+    <span class="clock" id="clock">--:--:--</span>
+  </div>
+</header>
+<main class="layout">
+  <section class="col">
+    <div class="card">
+      <div class="card-h"><span class="card-t">📷 相机远程抓拍控制台</span></div>
+      <button class="btn-capture" onclick="triggerCapture()">📷 立即抓拍 <small>(One-Shot)</small></button>
+      <button id="ack_btn" class="btn-ack" onclick="sendAck()">📷 确认收到照片 (ACK)</button>
+      <div class="hint">提示：下发后指令进入云端队列，单板模组在下一次轮询（约 2s）抓拍，拍摄完成后自动上传并刷新画廊。</div>
+    </div>
+    <div class="card">
+      <div class="card-h"><span class="card-t">🧭 任务仪表盘</span><span class="pill pill-dim" id="task_age">--</span></div>
+      <div class="dash">
+        <div class="dash-item"><div class="dash-k">当前任务 ID</div><div class="dash-v mono" id="task_id">--</div></div>
+        <div class="dash-item"><div class="dash-k">当前状态</div><div class="dash-v"><span class="badge badge-dim" id="status">IDLE</span></div></div>
+        <div class="dash-item"><div class="dash-k">触发来源</div><div class="dash-v"><span class="badge badge-info" id="trigger_src">--</span></div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-h"><span class="card-t">⏱ 定时自动抓拍 (Timer Cadence)</span><span class="pill pill-dim" id="timer_state">已停用</span></div>
+      <div class="form-row">
+        <label>抓拍周期 (秒)<input id="timer_period" type="number" min="1" max="86400" value="60"></label>
+        <label>批次上限 (张)<input id="timer_batch" type="number" min="1" max="1000" value="3"></label>
+      </div>
+      <div class="form-row">
+        <button class="btn btn-on" onclick="timerEnable()">▶ 启用定时抓拍</button>
+        <button class="btn btn-off" onclick="timerDisable()">■ 停用定时抓拍</button>
+      </div>
+      <div class="hint" id="timer_progress" style="display:none"></div>
+      <div class="hint">云端后台调度：启用后由服务器按周期自动下发抓拍任务；板端忙碌的轮次自动跳过；达到批次上限后自动停止。</div>
+    </div>
+  </section>
+  <section class="col">
+    <div class="card">
+      <div class="card-h"><span class="card-t">📈 IMU 实时波形 (Acc X/Y/Z)</span>
+        <span class="legend"><span><i style="background:#22d3ee"></i>Acc X</span><span><i style="background:#a78bfa"></i>Acc Y</span><span><i style="background:#34d399"></i>Acc Z</span></span>
+        <span class="pill pill-live" id="imu_src" style="margin-left:auto">● LIVE 1Hz</span></div>
+      <div id="imu_chart"></div>
+      <div class="imu-readout mono" id="imu_readout">AX: -- &nbsp; AY: -- &nbsp; AZ: --</div>
+    </div>
+    <div class="card">
+      <div class="card-h"><span class="card-t">📶 设备状态</span></div>
+      <div class="dash four">
+        <div class="dash-item"><div class="dash-k">开发板 IP</div><div class="dash-v mono" id="dev_ip">--</div></div>
+        <div class="dash-item"><div class="dash-k">RSSI 信号强度</div><div class="dash-v mono" id="dev_rssi">32</div><div class="bars"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></div></div>
+        <div class="dash-item"><div class="dash-k">链路</div><div class="dash-v" style="font-size:13px">HTTP 轮询 2s</div></div>
+        <div class="dash-item"><div class="dash-k">最近上传</div><div class="dash-v small mono" id="dev_last">--</div></div>
+      </div>
+    </div>
+  </section>
+  <section class="card gallery-card">
+    <div class="card-h"><span class="card-t">🖼 照片画廊与完整性校验 (Photo Gallery)</span>
+      <span class="pill pill-dim" id="photo_count">0 张</span>
+      <label class="retention">云端保留时长
+        <select id="retention" onchange="retentionChange(this.value)">
+          <option>1 天</option>
+          <option selected>7 天（推荐开发测试）</option>
+          <option>30 天</option>
+          <option>永久</option>
+        </select>
+      </label>
+    </div>
+    <div id="gallery" class="gallery"></div>
+    <div id="empty_state" class="empty-state" style="display:none"><div class="icon">📦</div><div>暂无照片</div></div>
+  </section>
+</main>
+<div id="toast" class="toast"></div>
+<script>
+const $ = id => document.getElementById(id);
+const VALID_PHOTO_RE = /^photo_\d+\.jpg$/;
+let lastStatus = '', chart = null, fbCanvas = null;
+let prevTimerRunning = false;
+const useEcharts = typeof echarts !== 'undefined';
+
+function pad(n){ return n < 10 ? '0' + n : '' + n; }
+function fmtTime(ts){ const d = new Date(ts*1000); return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds()); }
+function fmtClock(ts){ const d = new Date(ts*1000); return pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds()); }
+function fmtSize(b){ if (b == null) return '--'; if (b < 1024) return b + ' B'; return (b/1024).toFixed(1) + ' KB'; }
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function imgFail(el){ el.outerHTML = '<div class="placeholder"><div class="icon">📦</div><div>原图加载失败</div></div>'; }
+
+function showToast(type, msg){ const t = $('toast'); t.className = 'toast ' + (type==='ok'?'toast-ok':'toast-err'); t.innerText = msg; t.style.display='block'; setTimeout(()=>t.style.display='none', 2500); }
+
+function triggerCapture(){ fetch('/api/trigger_capture',{method:'POST'}).then(r=>r.json()).then(d=>showToast('ok','拍照指令已下发 #'+d.task_id)).catch(()=>showToast('err','指令发送失败')); }
+function sendAck(){ fetch('/api/device/ack',{method:'POST'}).then(r=>r.json()).then(()=>{ $('ack_btn').style.display='none'; showToast('ok','已确认收到'); }).catch(()=>showToast('err','ACK发送失败')); }
+function timerEnable(){
+  const p = parseFloat($('timer_period').value) || 60;
+  const b = parseInt($('timer_batch').value) || 3;
+  if (p < 5){ showToast('err','抓拍周期至少 5 秒（板端每 2s 轮询一次）'); return; }
+  fetch('/api/timer/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({interval: p, max_batches: b})})
+    .then(r=>r.json().then(j=>({ok:r.ok, j:j})))
+    .then(res=>{
+      if (res.ok && res.j.status==='ok') showToast('ok','定时抓拍已启用：每 '+res.j.interval+'s · 上限 '+res.j.max_batches+' 批');
+      else showToast('err', res.j.msg || '启动定时器失败');
+    })
+    .catch(()=>showToast('err','启动定时抓拍失败'));
+}
+function timerDisable(){
+  fetch('/api/timer/stop', {method:'POST'})
+    .then(r=>r.json())
+    .then(()=>showToast('ok','停用指令已发送'))
+    .catch(()=>showToast('err','停用定时抓拍失败'));
+}
+function retentionChange(v){ showToast('ok','云端保留策略: '+v+'（前端演示）'); }
+
+function updateTimerUI(st){
+  const run = !!st.timer_running;
+  const cb = st.timer_current_batch|0, mb = st.timer_max_batches|0;
+  const bOn = document.querySelector('button[onclick^="timerEnable"]');
+  const bOff = document.querySelector('button[onclick^="timerDisable"]');
+  if (bOn){ bOn.disabled = run; }
+  if (bOff){ bOff.disabled = !run; }
+  const s = $('timer_state');
+  let prog = $('timer_progress');
+  if (!prog){
+    prog = document.createElement('div');
+    prog.id = 'timer_progress';
+    prog.className = 'hint';
+    const card = $('timer_state').closest('.card');
+    card.insertBefore(prog, card.querySelector('.hint'));
+  }
+  prog.style.display = 'block';
+  if (run){
+    s.innerText = '运行中'; s.className = 'pill pill-live';
+    prog.style.color = 'var(--cyan)';
+    prog.innerText = cb > 0
+      ? '⏱ 定时抓拍中：第 ' + cb + '/' + mb + ' 批次（每 ' + Math.round(st.timer_interval) + 's，板端忙时自动跳过本轮）'
+      : '⏱ 定时抓拍已启用，' + Math.round(st.timer_interval) + 's 后触发首轮（共 ' + mb + ' 批）';
+  } else {
+    const res = st.timer_last_result;
+    if (res === 'completed'){
+      s.innerText = '已完成'; s.className = 'pill pill-info';
+      prog.style.color = 'var(--green)';
+      prog.innerText = '✔ 定时抓拍已完成（' + cb + '/' + mb + ' 批次全部执行）';
+    } else if (res === 'stopped'){
+      s.innerText = '已停用'; s.className = 'pill pill-dim';
+      prog.style.color = 'var(--dim)';
+      prog.innerText = '■ 定时抓拍已手动停用（已执行 ' + cb + '/' + mb + ' 批次）';
+    } else if (typeof res === 'string' && res.indexOf('error') === 0){
+      s.innerText = '调度异常'; s.className = 'pill pill-dim';
+      prog.style.color = 'var(--red)';
+      prog.innerText = '定时调度异常: ' + res;
+    } else {
+      s.innerText = '已停用'; s.className = 'pill pill-dim';
+      prog.style.color = 'var(--dim2)';
+      prog.innerText = '设置周期与批次上限后点击“启用”，由云端后台线程自动调度抓拍。';
+    }
+    if (prevTimerRunning){
+      if (res === 'completed') showToast('ok', '定时抓拍已完成');
+      else if (res === 'stopped') showToast('ok', '定时抓拍已停用');
+    }
+  }
+  prevTimerRunning = run;
+}
+function initChart(){
+  if (useEcharts){
+    chart = echarts.init($('imu_chart'));
+    chart.setOption({ backgroundColor:'transparent', animation:false,
+      grid:{left:44,right:14,top:20,bottom:26},
+      tooltip:{trigger:'axis',backgroundColor:'#0b1220',borderColor:'#334155',textStyle:{color:'#e2e8f0',fontSize:12}},
+      xAxis:{type:'category',boundaryGap:false,data:[],axisLine:{lineStyle:{color:'#334155'}},axisTick:{show:false},axisLabel:{color:'#64748b',fontSize:10}},
+      yAxis:{type:'value',scale:true,splitLine:{lineStyle:{color:'rgba(51,65,85,.35)'}},axisLabel:{color:'#64748b',fontSize:10}},
+      series:[
+        {name:'Acc X',type:'line',showSymbol:false,smooth:true,lineStyle:{width:2,color:'#22d3ee'},itemStyle:{color:'#22d3ee'},data:[]},
+        {name:'Acc Y',type:'line',showSymbol:false,smooth:true,lineStyle:{width:2,color:'#a78bfa'},itemStyle:{color:'#a78bfa'},data:[]},
+        {name:'Acc Z',type:'line',showSymbol:false,smooth:true,lineStyle:{width:2,color:'#34d399'},itemStyle:{color:'#34d399'},data:[]}
+      ]});
+    window.addEventListener('resize', ()=>chart.resize());
+  } else {
+    fbCanvas = document.createElement('canvas');
+    fbCanvas.style.width='100%'; fbCanvas.style.height='100%';
+    $('imu_chart').appendChild(fbCanvas);
+    window.addEventListener('resize', ()=>{ if (fbCanvas.last) drawFallback(fbCanvas.last); });
+  }
+}
+function drawFallback(hist){
+  const c = fbCanvas; if (!c) return; c.last = hist;
+  const w = c.clientWidth||600, h = c.clientHeight||300;
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d'); ctx.clearRect(0,0,w,h);
+  if (!hist.length) return;
+  let mn=Infinity, mx=-Infinity;
+  hist.forEach(s=>{ [s.ax,s.ay,s.az].forEach(v=>{ if(v<mn)mn=v; if(v>mx)mx=v; }); });
+  if (mn===mx){ mn-=1; mx+=1; }
+  const X=i=>i/(Math.max(hist.length-1,1))*(w-20)+10, Y=v=>h-14-((v-mn)/(mx-mn))*(h-28);
+  ctx.strokeStyle='rgba(51,65,85,.5)'; ctx.lineWidth=1;
+  for(let g=0; g<=4; g++){ const y=14+g*(h-28)/4; ctx.beginPath(); ctx.moveTo(10,y); ctx.lineTo(w-10,y); ctx.stroke(); }
+  [['ax','#22d3ee'],['ay','#a78bfa'],['az','#34d399']].forEach(pair=>{
+    ctx.strokeStyle=pair[1]; ctx.lineWidth=2; ctx.beginPath();
+    hist.forEach((s,i)=>{ const x=X(i), y=Y(s[pair[0]]); if(i){ctx.lineTo(x,y);}else{ctx.moveTo(x,y);} });
+    ctx.stroke();
+  });
+}
+function updateImu(){
+  fetch('/api/imu_data').then(r=>r.json()).then(d=>{
+    const h = d.history||[];
+    const srcPill = $('imu_src');
+    if (d.source==='device'){ srcPill.innerText='● DEVICE'; srcPill.className='pill pill-live'; }
+    else { srcPill.innerText='● SIM 1Hz'; srcPill.className='pill pill-dim'; }
+    if (h.length){ const l=h[h.length-1]; $('imu_readout').innerHTML='AX: '+l.ax+' &nbsp; AY: '+l.ay+' &nbsp; AZ: '+l.az+' &nbsp; @ '+fmtClock(l.t); }
+    if (useEcharts && chart){ chart.setOption({ xAxis:{data:h.map(s=>fmtClock(s.t))}, series:[{data:h.map(s=>s.ax)},{data:h.map(s=>s.ay)},{data:h.map(s=>s.az)}] }); }
+    else drawFallback(h);
+  }).catch(()=>{});
+}
+function updateStatus(st){
+  const badge=$('status');
+  let cls='badge badge-ok';
+  if (st.status==='PENDING'||st.status==='ACCEPTED') cls='badge badge-warn';
+  else if (st.status==='TIMEOUT'||st.status==='FAIL'||st.status==='OFFLINE'||!st.status) cls='badge badge-err';
+  else if (st.status==='IDLE') cls='badge badge-dim';
+  badge.className=cls; badge.innerText=st.status||'OFFLINE';
+  $('task_id').innerText=st.task_id||'--';
+  const src=$('trigger_src'); src.innerText=st.trigger_source||'--';
+  src.className='badge '+(st.trigger_source==='physical_button'?'badge-warn':'badge-info');
+  $('ack_btn').style.display = st.ack_needed ? 'block' : 'none';
+  $('dev_ip').innerText=st.device_ip||'--';
+  if (st.rssi!=null) $('dev_rssi').innerText=st.rssi;
+  const op=$('online_pill');
+  if (st.status==='OFFLINE'){ op.innerText='● 离线'; op.className='pill pill-dim'; }
+  else { op.innerText='● 在线 (LAN)'; op.className='pill pill-live'; }
+  if (st.last_update){ const age=Math.max(0,Math.round(Date.now()/1000-st.last_update)); $('task_age').innerText='更新于 '+age+'s 前'; }
+}
+function renderGallery(photos){
+  const g=$('gallery'), empty=$('empty_state');
+  const valid=photos.filter(p=>VALID_PHOTO_RE.test(p.name));
+  $('photo_count').innerText=valid.filter(p=>p.status==='stored').length+' 在库 / '+valid.length+' 总计';
+  if (!valid.length){ g.innerHTML=''; empty.style.display='block'; return; }
+  empty.style.display='none';
+  g.innerHTML=valid.map(p=>{
+    const tag = p.status==='stored' ? '<span class="tag tag-stored">已入库</span>' : '<span class="tag tag-cleaned">已清理</span>';
+    const thumb = p.status==='stored'
+      ? '<div class="thumb"><img src="/photos/'+p.name+'" loading="lazy" onerror="imgFail(this)"></div>'
+      : '<div class="placeholder"><div class="icon">📦</div><div>配额到期已清除原图</div><div>元数据与哈希完整保留</div></div>';
+    const sizeTxt = p.status==='stored' ? fmtSize(p.size) : '已清理';
+    return '<div class="pcard">'+thumb+
+      '<div class="pmeta"><div class="prow"><span class="pname" title="'+esc(p.name)+'">'+esc(p.name)+'</span>'+tag+'</div>'+
+      '<div class="prow psub"><span>🕒 '+p.time_str+'</span><span>'+sizeTxt+'</span></div></div></div>';
+  }).join('');
+}
+function refresh(){
+  fetch('/api/status').then(r=>r.json()).then(st=>{
+    updateStatus(st);
+    updateTimerUI(st);
+    if (st.status!==lastStatus){ lastStatus=st.status; if (st.status==='COMPLETED') showToast('ok','新照片已上传!'); }
+  }).catch(()=>updateStatus({status:'OFFLINE'}));
+  fetch('/api/photos').then(r=>r.json()).then(d=>{
+    renderGallery(d.photos||[]);
+    const first=(d.photos||[])[0];
+    $('dev_last').innerText = first ? first.time_str.slice(5) : '--';
+  }).catch(()=>{});
+}
+setInterval(()=>{ $('clock').innerText=fmtClock(Date.now()/1000); }, 1000);
+initChart(); updateImu(); refresh();
+setInterval(updateImu, 1000);
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
