@@ -12,15 +12,20 @@
 #include "esp_camera.h"
 #include "esp_psram.h"
 #include "esp_system.h"
+#include "driver/gpio.h"
+#include "driver/rmt_tx.h"
+#include "driver/i2c_master.h"  // NEW i2c master driver: QMA6100P rides the camera SCCB bus
+                                // (legacy driver/i2c.h + qma6100p component CONFLICT with the
+                                //  camera driver_ng -> check_i2c_driver_conflict abort at boot)
 #include <inttypes.h>
 
-// ================= 配置区 =================
+// ================= Config =================
 #define WIFI_SSID "431"
 #define WIFI_PASS "88888888"
 #define SERVER_URL "http://10.1.41.53:5000"
-// =========================================
+// ===========================================
 
-// ================= 摄像头引脚配置 (ESP32-S3-EYE OV2640) =================
+// ================= Camera pins (ESP32-S3-EYE OV2640) =================
 #define CAM_PIN_PWDN    -1
 #define CAM_PIN_RESET   -1
 #define CAM_PIN_XCLK    15
@@ -37,7 +42,27 @@
 #define CAM_PIN_VSYNC   6
 #define CAM_PIN_HREF    7
 #define CAM_PIN_PCLK    13
-// =========================================================================
+// =====================================================================
+
+// LCD ST7789 completely disabled to eliminate SPI DMA conflicts.
+// Former LCD pins: CS=42 DC=40 RST=45 SCLK=47 MOSI=48 BL=46
+// Repurpose: GPIO48 as status LED, GPIO46 pulled LOW (backlight off).
+#define PIN_BL_OFF  46
+#define PIN_LED     48
+
+// ================= Button (BOOT = GPIO0) =================
+#define BTN_PIN   0
+// =========================================================
+
+// ================= IMU (QMA6100P) config =================
+#define IMU_I2C_PORT     I2C_NUM_0   // camera SCCB owns port 1; IMU keeps port 0 (week1 verified)
+#define IMU_I2C_SDA      4           // same physical pins as SCCB (SDA=4, SCL=5)
+#define IMU_I2C_SCL      5
+#define IMU_I2C_FREQ_HZ  400000
+#define IMU_GRAVITY      9.80665f    // library returns g -> convert to m/s^2
+#define IMU_PERIOD_MS    1000        // 1 Hz upload. SAFETY KNOB: raise to 2000 if brownout/DMA issues
+#define IMU_HTTP_TIMEOUT 1500        // HARD CAP per spec (<=1500ms); failures are dropped, never retried
+// ==========================================================
 
 static const char *TAG = "CAM_REMOTE";
 static EventGroupHandle_t s_wifi_event_group;
@@ -46,6 +71,265 @@ static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static const int MAX_RETRY = 5;
 
+static volatile bool g_button_pressed = false;
+static char g_trigger_source[20] = "web";
+static int poll_fail_count = 0;   // watchdog: consecutive poll connection failures
+static volatile bool g_capture_busy = false;  // IMU gate: true during capture + cooldown
+static i2c_master_dev_handle_t s_imu_dev = NULL;  // QMA6100P on camera SCCB bus (NULL = IMU disabled)
+
+// ---------- WS2812 LED (GPIO48, RMT driver) ----------
+static rmt_channel_handle_t led_tx_channel = NULL;
+static rmt_encoder_handle_t led_bytes_encoder = NULL;
+static rmt_encoder_handle_t led_copy_encoder = NULL;
+
+static void ws2812_init(void) {
+    // TX channel
+    rmt_tx_channel_config_t tx_cfg = {
+        .gpio_num = 48,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,  // 10 MHz 鈫?0.1 碌s/tick
+        .mem_block_symbols = 64,
+        .trans_queue_depth = 4,
+        .flags.invert_out = false,
+        .flags.with_dma = false,
+    };
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_cfg, &led_tx_channel));
+
+    // Bytes encoder: maps each byte bit into WS2812 timing symbols
+    rmt_bytes_encoder_config_t bytes_enc = {
+        .bit0 = { .duration0 = 4, .level0 = 1, .duration1 = 9, .level1 = 0 },
+        .bit1 = { .duration0 = 8, .level0 = 1, .duration1 = 5, .level1 = 0 },
+        .flags.msb_first = true,
+    };
+    ESP_ERROR_CHECK(rmt_new_bytes_encoder(&bytes_enc, &led_bytes_encoder));
+
+    // Copy encoder: used only for the reset pulse
+    rmt_copy_encoder_config_t copy_enc = {};
+    ESP_ERROR_CHECK(rmt_new_copy_encoder(&copy_enc, &led_copy_encoder));
+
+    ESP_ERROR_CHECK(rmt_enable(led_tx_channel));
+    ESP_LOGI(TAG, "[LED] WS2812 RMT init OK");
+}
+
+static void ws2812_set_color_raw(uint8_t r, uint8_t g, uint8_t b) {
+    if (!led_tx_channel) return;
+    // WS2812 expects GRB order
+    uint8_t grb[3] = {g, r, b};
+
+    rmt_transmit_config_t tx_conf = { .loop_count = 0 };
+    rmt_transmit(led_tx_channel, led_bytes_encoder, grb, 3, &tx_conf);
+    vTaskDelay(pdMS_TO_TICKS(1));  // non-blocking settle (avoid rmt_tx_wait_all_done timeout on S3-EYE)
+
+    // Reset code: >50 碌s low pulse
+    rmt_symbol_word_t reset_sym = { .val = 0 };
+    reset_sym.duration0 = 600;
+    reset_sym.level0 = 0;
+    rmt_transmit(led_tx_channel, led_copy_encoder, &reset_sym, sizeof(reset_sym), &tx_conf);
+    vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+// Fallback: serial blink output in case WS2812 is physically unreachable
+static void serial_blink(const char *label) {
+    for (int i = 0; i < 10; i++) {
+        ESP_LOGI(TAG, "[LED] BLINK! %s (%d/10)", label, i + 1);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static void led_off(void) { ws2812_set_color_raw(0, 0, 0); }
+static void led_blue_on(void)   { ws2812_set_color_raw(0, 0, 64); serial_blink("BLUE"); }
+static void led_green_on(void)  { ws2812_set_color_raw(0, 64, 0); serial_blink("GREEN"); }
+static void led_red_on(void)    { ws2812_set_color_raw(64, 0, 0); serial_blink("RED"); }
+
+static void led_pulse_blue(int ms)  { led_blue_on();  vTaskDelay(pdMS_TO_TICKS(ms)); led_off(); }
+static void led_pulse_red(int ms)   { led_red_on();   vTaskDelay(pdMS_TO_TICKS(ms)); led_off(); }
+
+static void led_flash_green(int count) {
+    for (int i = 0; i < count; i++) {
+        led_green_on(); vTaskDelay(pdMS_TO_TICKS(100));
+        led_off();
+        if (i < count - 1) vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+static void led_flash_blue(int count) {
+    for (int i = 0; i < count; i++) {
+        led_blue_on(); vTaskDelay(pdMS_TO_TICKS(150));
+        led_off();
+        if (i < count - 1) vTaskDelay(pdMS_TO_TICKS(150));
+    }
+}
+
+static void bl_off(void) {
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << PIN_BL_OFF),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    gpio_set_level(PIN_BL_OFF, 0);
+    ESP_LOGI(TAG, "[BL] Backlight GPIO%d OFF", PIN_BL_OFF);
+}
+
+// ---------- IMU (QMA6100P @0x12) on camera SCCB bus (SDA=4 SCL=5) ----------
+// QMA6100P rides the CAMERA's SCCB bus (new i2c_master driver). esp32-camera's
+// sccb-ng.c exports SCCB_Install_Device() which attaches our address to the same
+// bus handle -> driver-internal locking, no second bus master on pins 4/5, and
+// no legacy driver/i2c.h (which aborts at boot: driver_ng conflict).
+// Register sequences ported 1:1 from the espressif qma6100p component
+// (wake_up / config(ACCE_FS_2G) / get_raw_acce / get_acce).
+extern int SCCB_Install_Device(uint8_t slv_addr);
+extern i2c_master_dev_handle_t *get_handle_from_address(uint8_t slv_addr);
+
+#define QMA_ADDR          0x12
+#define QMA_REG_WHO_AM_I  0x00   // expects 0x90
+#define QMA_REG_XOUT_L    0x01   // 6 bytes: XL XH YL YH ZL ZH (14-bit, <<2)
+#define QMA_REG_ACCEL_CFG 0x0F   // bits[3:0] range; 0b0001 = +-2g -> 4096 LSB/g
+#define QMA_REG_PWR_MGMT  0x11   // bit7 = EN
+#define QMA_REG_NVM_LOAD  0x33   // bit3 = OTP load trigger
+#define QMA_WHO_AM_I_VAL  0x90
+#define QMA_SENS_2G       2461.0f
+
+static esp_err_t qma_write_reg(uint8_t reg, uint8_t val) {
+    uint8_t buf[2] = { reg, val };
+    return i2c_master_transmit(s_imu_dev, buf, 2, 100);
+}
+
+static esp_err_t qma_read_reg(uint8_t reg, uint8_t *out, size_t len) {
+    return i2c_master_transmit_receive(s_imu_dev, &reg, 1, out, len, 100);
+}
+
+// MUST run AFTER camera_init(): the SCCB bus must already exist.
+static esp_err_t imu_init(void) {
+    if (SCCB_Install_Device(QMA_ADDR) != 0) {
+        ESP_LOGE(TAG, "[IMU] SCCB_Install_Device(0x12) failed");
+        return ESP_FAIL;
+    }
+    i2c_master_dev_handle_t *h = get_handle_from_address(QMA_ADDR);
+    if (h == NULL || *h == NULL) {
+        ESP_LOGE(TAG, "[IMU] no SCCB dev handle for 0x12");
+        return ESP_FAIL;
+    }
+    s_imu_dev = *h;
+    uint8_t id = 0;
+    if (qma_read_reg(QMA_REG_WHO_AM_I, &id, 1) != ESP_OK || id != QMA_WHO_AM_I_VAL) {
+        ESP_LOGE(TAG, "[IMU] WHO_AM_I=0x%02X (want 0x90) - sensor not responding", id);
+        s_imu_dev = NULL;
+        return ESP_ERR_NOT_FOUND;
+    }
+    // wake_up (component sequence): PWR EN, then OTP/NVM load
+    if (qma_write_reg(QMA_REG_PWR_MGMT, 0x80) != ESP_OK) { s_imu_dev = NULL; return ESP_FAIL; }
+    uint8_t nvm = 0;
+    if (qma_read_reg(QMA_REG_NVM_LOAD, &nvm, 1) == ESP_OK) {
+        qma_write_reg(QMA_REG_NVM_LOAD, (uint8_t)(nvm | 0x08));
+    }
+    vTaskDelay(pdMS_TO_TICKS(25));
+    // range +-2g (read-modify-write, component sequence) + keep EN set
+    uint8_t cfg = 0;
+    if (qma_read_reg(QMA_REG_ACCEL_CFG, &cfg, 1) != ESP_OK) { s_imu_dev = NULL; return ESP_FAIL; }
+    cfg = (uint8_t)((cfg & ~0x0F) | 0x01);
+    if (qma_write_reg(QMA_REG_ACCEL_CFG, cfg) != ESP_OK) { s_imu_dev = NULL; return ESP_FAIL; }
+    uint8_t pwr = 0;
+    if (qma_read_reg(QMA_REG_PWR_MGMT, &pwr, 1) == ESP_OK) {
+        qma_write_reg(QMA_REG_PWR_MGMT, (uint8_t)(pwr | 0x80));
+    }
+    vTaskDelay(pdMS_TO_TICKS(25));
+    uint8_t rb = 0;
+    qma_read_reg(QMA_REG_ACCEL_CFG, &rb, 1);
+    ESP_LOGI(TAG, "[IMU] QMA6100P ready on SCCB bus (id=0x%02X, ACCEL_CFG=0x%02X)", id, rb);
+    {
+        uint8_t dd[6];
+        if (qma_read_reg(QMA_REG_XOUT_L, dd, 6) == ESP_OK) {
+            ESP_LOGI(TAG, "[IMU] first raw: x=%d y=%d z=%d", (int)((int16_t)((((uint16_t)dd[1]) << 8) | dd[0]) / 4), (int)((int16_t)((((uint16_t)dd[3]) << 8) | dd[2]) / 4), (int)((int16_t)((((uint16_t)dd[5]) << 8) | dd[4]) / 4));
+        }
+    }
+    return ESP_OK;
+}
+
+// Dynamic sensitivity: read the ACTUAL range bits from reg 0x0F each sample
+// (vendor component get_acce_sensitivity logic). Self-corrects if the chip's
+// effective range differs from what we wrote (OTP defaults etc.).
+static float qma_sensitivity(void) {
+    uint8_t cfg = 0;
+    if (qma_read_reg(QMA_REG_ACCEL_CFG, &cfg, 1) != ESP_OK) return QMA_SENS_2G;
+    switch (cfg & 0x0F) {
+        // CALIBRATED 2026-09-21: vendor component claims 4096 LSB/g @2g, but this
+        // board's QMA6100P measures |gravity| = 2461 counts at cfg=0x01 (median of
+        // 60 at-rest samples). Single-point gravity calibration: x0.6008. Raw
+        // format verified 14-bit left-justified (LSB bits[1:0] always 0).
+        case 0b0001: return 2461.0f;   // +-2g (calibrated)
+        case 0b0010: return 1230.0f;   // +-4g
+        case 0b0100: return 615.0f;    // +-8g
+        case 0b1000: return 308.0f;    // +-16g
+        case 0b1111: return 154.0f;    // +-32g
+        default:     return 2461.0f;
+    }
+}
+
+static esp_err_t imu_read(float *x, float *y, float *z) {
+    if (s_imu_dev == NULL) return ESP_ERR_INVALID_STATE;
+    uint8_t d[6];
+    esp_err_t ret = qma_read_reg(QMA_REG_XOUT_L, d, 6);
+    if (ret != ESP_OK) return ret;
+    int16_t rx = (int16_t)((((uint16_t)d[1]) << 8) | d[0]) / 4;   // 14-bit (component formula)
+    int16_t ry = (int16_t)((((uint16_t)d[3]) << 8) | d[2]) / 4;
+    int16_t rz = (int16_t)((((uint16_t)d[5]) << 8) | d[4]) / 4;
+    float sens = qma_sensitivity();
+    *x = ((float)rx / sens) * IMU_GRAVITY;   // g -> m/s^2
+    *y = ((float)ry / sens) * IMU_GRAVITY;
+    *z = ((float)rz / sens) * IMU_GRAVITY;
+    return ESP_OK;
+}
+
+// POST {"x":..,"y":..,"z":..} to /api/device/upload_imu.
+// HARD RULES: timeout <= IMU_HTTP_TIMEOUT (1500ms); on ANY failure the sample is
+// simply dropped (no retry loop, no red LED, never stalls the main loop/capture).
+static void imu_post(float x, float y, float z) {
+    static char payload[64];
+    int len = snprintf(payload, sizeof(payload), "{\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}", x, y, z);
+    esp_http_client_config_t cfg = {
+        .url = SERVER_URL "/api/device/upload_imu",
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = IMU_HTTP_TIMEOUT,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (!c) { ESP_LOGW(TAG, "[IMU] Skip: Network busy (client init)"); return; }
+    int status = 0; bool ok = false;
+    esp_http_client_set_header(c, "Content-Type", "application/json");
+    if (esp_http_client_open(c, len) == ESP_OK
+        && esp_http_client_write(c, payload, len) == len
+        && esp_http_client_fetch_headers(c) >= 0) {
+        status = esp_http_client_get_status_code(c);
+        ok = (status == 200);
+    }
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    if (ok) ESP_LOGI(TAG, "[IMU] Sent: x=%.2f y=%.2f z=%.2f", x, y, z);
+    else    ESP_LOGW(TAG, "[IMU] Skip: Network busy (status=%d)", status);
+}
+// Dedicated 1 Hz IMU task. Paused while g_capture_busy == true (capture +
+// cooldown) so WiFi TX bursts never overlap camera DMA grabs
+// (brownout / DMA-overflow protection on this WiFi+camera board).
+static void imu_task(void *arg) {
+    float x, y, z;
+    uint32_t idle_cnt = 0;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(IMU_PERIOD_MS));
+        if (g_capture_busy) continue;   // capture or cooldown in progress -> pause uploads
+        if (s_imu_dev == NULL) {        // sensor missing -> stay alive, no restart
+            if (++idle_cnt % 60 == 1) ESP_LOGW(TAG, "[IMU] sensor absent, upload idle");
+            continue;
+        }
+        if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT)) continue;
+        if (imu_read(&x, &y, &z) != ESP_OK) { ESP_LOGW(TAG, "[IMU] Read fail"); continue; }
+        imu_post(x, y, z);
+    }
+}
+
+
+// ---------- WiFi event handler ----------
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
@@ -55,7 +339,7 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
             s_retry_num++;
             ESP_LOGW(TAG, "WiFi disconnected, retry %d/%d", s_retry_num, MAX_RETRY);
         } else {
-            ESP_LOGE(TAG, "WiFi max retries reached, will restart...");
+            ESP_LOGE(TAG, "WiFi max retries, restarting...");
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
@@ -84,7 +368,7 @@ static void wifi_init(void) {
     ESP_LOGI(TAG, "Connecting WiFi: %s ...", WIFI_SSID);
 }
 
-// ---------- Camera Init ----------
+// ---------- Camera Init (xclk=8MHz for DMA stability) ----------
 static esp_err_t camera_init(void) {
     if (!esp_psram_is_initialized()) {
         ESP_LOGE(TAG, "PSRAM not initialized!");
@@ -111,10 +395,12 @@ static esp_err_t camera_init(void) {
         .pin_sccb_scl = CAM_PIN_SIOC,
         .pin_pwdn = CAM_PIN_PWDN,
         .pin_reset = CAM_PIN_RESET,
-        .xclk_freq_hz = 10000000,
+        .xclk_freq_hz = 6000000,     // 6 MHz 鈥?minimized to prevent DMA overflow
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size = FRAMESIZE_QQVGA,   // 160x120, ultra-light
-        .jpeg_quality = 10,              // maximum compression
+        .frame_size = FRAMESIZE_QQVGA,
+        .jpeg_quality = 10,
+
+
         .fb_count = 1,
         .fb_location = CAMERA_FB_IN_PSRAM,
         .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
@@ -125,12 +411,32 @@ static esp_err_t camera_init(void) {
         ESP_LOGE(TAG, "Camera init failed: 0x%x", err);
         return err;
     }
-    ESP_LOGI(TAG, "Camera init OK");
+    ESP_LOGI(TAG, "Camera init OK (XCLK=8MHz)");
     return ESP_OK;
+}
+
+// ---------- Button ISR (IRAM-safe) ----------
+static void IRAM_ATTR btn_isr(void* arg) {
+    g_button_pressed = true;
+}
+
+static void btn_init(void) {
+    gpio_config_t btn_cfg = {
+        .pin_bit_mask = (1ULL << BTN_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+    gpio_config(&btn_cfg);
+    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    gpio_isr_handler_add(BTN_PIN, btn_isr, NULL);
+    ESP_LOGI(TAG, "[BTN] GPIO%d ISR installed", BTN_PIN);
 }
 
 // ---------- Poll Server ----------
 static bool poll_server_for_task(void) {
+    // PATCHED v2: added poll_fail_count tracking and proper cleanup on all error paths
     char url[128];
     snprintf(url, sizeof(url), "%s/api/device/poll", SERVER_URL);
     esp_http_client_config_t config = { .url = url, .method = HTTP_METHOD_GET, .timeout_ms = 3000 };
@@ -143,21 +449,17 @@ static bool poll_server_for_task(void) {
         int read_len = esp_http_client_read(client, response, sizeof(response) - 1);
         if (read_len > 0) {
             response[read_len] = '\0';
-            ESP_LOGI(TAG, "[POLL] Server response: %s", response);
             if (strstr(response, "\"has_task\":true") != NULL) has_task = true;
-        } else {
-            ESP_LOGW(TAG, "[POLL] Read failed or empty response, err=%d", read_len);
         }
     } else {
-        ESP_LOGE(TAG, "[POLL] HTTP open failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "[POLL] HTTP open err: %s", esp_err_to_name(err));
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     return has_task;
 }
 
-// ---------- Capture & Upload (zero-copy chunked send) ----------
-// Static buffers to avoid stack overflow (~512 bytes saved from stack)
+// ---------- Capture & Upload (zero-copy) ----------
 static char g_part_hdr[256];
 static char g_part_ftr[128];
 static char g_url[128];
@@ -166,175 +468,226 @@ static char g_resp[256];
 
 static void capture_and_upload(void) {
     uint32_t heap_before = esp_get_free_heap_size();
-    ESP_LOGI(TAG, "[CAPTURE] Free heap before: %" PRIu32 " bytes", heap_before);
+    ESP_LOGI(TAG, "[CAP] Trigger=%s | Free heap=%" PRIu32, g_trigger_source, heap_before);
 
-    ESP_LOGI(TAG, "[CAPTURE] Taking photo...");
+    // *** 1000ms WiFi+DMA cooldown before camera DMA grab ***
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
-        ESP_LOGE(TAG, "[CAPTURE] esp_camera_fb_get returned NULL! (heap=%" PRIu32 ")", esp_get_free_heap_size());
+        ESP_LOGE(TAG, "[CAP] Camera returned NULL! heap=%" PRIu32 " 鈥?skipping", esp_get_free_heap_size());
+        led_pulse_red(1000);
+        vTaskDelay(pdMS_TO_TICKS(200));
         return;
     }
-    ESP_LOGI(TAG, "[CAPTURE] Photo taken, size: %zu bytes, heap now: %" PRIu32, fb->len, esp_get_free_heap_size());
+    ESP_LOGI(TAG, "[CAP] Photo: %zu bytes, heap=%" PRIu32, fb->len, esp_get_free_heap_size());
 
-    // Pre-compute multipart header & footer into static buffers
-    char boundary[] = "----ESP32Boundary";
+    // Reject tiny/corrupt images (< 500 bytes 鈫?likely empty)
+    if (fb->len < 500) {
+        ESP_LOGE(TAG, "[CAP] Photo too small (%zu bytes < 500), rejecting!", fb->len);
+        esp_camera_fb_return(fb);
+        led_pulse_red(1000);
+        return;
+    }
+
+    // Multipart body
+    char boundary[] = "ESP32_CAM_BOUNDARY";
+    char trigger_field[128];   // was 80 鈥?overflow for "physical_button" (needs 92 bytes)
+    int trigger_len = snprintf(trigger_field, sizeof(trigger_field),
+        "--%s\r\nContent-Disposition: form-data; name=\"trigger\"\r\n\r\n%s\r\n",
+        boundary, g_trigger_source);
     int hdr_len = snprintf(g_part_hdr, sizeof(g_part_hdr),
-        "--%s\r\n"
-        "Content-Disposition: form-data; name=\"image\"; filename=\"capture.jpg\"\r\n"
-        "Content-Type: image/jpeg\r\n"
-        "\r\n",
+        "--%s\r\nContent-Disposition: form-data; name=\"image\"; filename=\"capture.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n",
         boundary);
-    int ftr_len = snprintf(g_part_ftr, sizeof(g_part_ftr),
-        "\r\n--%s--\r\n", boundary);
-
-    int total_len = hdr_len + (int)fb->len + ftr_len;
-    ESP_LOGI(TAG, "[CAPTURE] HTTP total: %d (hdr=%d + img=%zu + ftr=%d)",
-             total_len, hdr_len, fb->len, ftr_len);
+    int ftr_len = snprintf(g_part_ftr, sizeof(g_part_ftr), "\r\n--%s--\r\n", boundary);
+    int total_len = trigger_len + hdr_len + (int)fb->len + ftr_len;
 
     snprintf(g_url, sizeof(g_url), "%s/api/device/upload_photo", SERVER_URL);
-
     esp_http_client_config_t config = {
-        .url = g_url,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 15000,
-        .buffer_size = 2048,   // smaller buffer
+        .url = g_url, .method = HTTP_METHOD_POST, .timeout_ms = 15000, .buffer_size = 2048,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
-
     snprintf(g_ct, sizeof(g_ct), "multipart/form-data; boundary=%s", boundary);
     esp_http_client_set_header(client, "Content-Type", g_ct);
 
-    // Open connection with Content-Length
     esp_err_t err = esp_http_client_open(client, total_len);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "[CAPTURE] HTTP open failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "[CAP] HTTP open err: %s", esp_err_to_name(err));
         esp_camera_fb_return(fb);
         esp_http_client_cleanup(client);
+        led_pulse_red(1000);
         return;
     }
 
-    // 1) Write multipart header
-    int w = esp_http_client_write(client, g_part_hdr, hdr_len);
+    int w = esp_http_client_write(client, trigger_field, trigger_len);
+    if (w != trigger_len) {
+        ESP_LOGE(TAG, "[CAP] Write trigger fail: %d/%d", w, trigger_len);
+        esp_camera_fb_return(fb);
+        esp_http_client_cleanup(client);
+        led_pulse_red(1000);
+        return;
+    }
+
+    w = esp_http_client_write(client, g_part_hdr, hdr_len);
     if (w != hdr_len) {
-        ESP_LOGE(TAG, "[CAPTURE] Write header failed: %d/%d", w, hdr_len);
+        ESP_LOGE(TAG, "[CAP] Write hdr fail: %d/%d", w, hdr_len);
         esp_camera_fb_return(fb);
         esp_http_client_cleanup(client);
+        led_pulse_red(1000);
         return;
     }
-    ESP_LOGI(TAG, "[CAPTURE] Header sent: %d bytes", w);
 
-    // 2) Write image data directly from PSRAM frame buffer (zero-copy)
     w = esp_http_client_write(client, (const char *)fb->buf, fb->len);
     if (w != (int)fb->len) {
-        ESP_LOGE(TAG, "[CAPTURE] Write image failed: %d/%zu", w, fb->len);
+        ESP_LOGE(TAG, "[CAP] Write img fail: %d/%zu", w, fb->len);
         esp_camera_fb_return(fb);
         esp_http_client_cleanup(client);
+        led_pulse_red(1000);
         return;
     }
-    ESP_LOGI(TAG, "[CAPTURE] Image sent: %d bytes", w);
 
-    // *** RETURN FRAME BUFFER IMMEDIATELY after data is sent ***
+    // *** Release frame buffer immediately after data sent ***
     esp_camera_fb_return(fb);
     fb = NULL;
-    ESP_LOGI(TAG, "[CAPTURE] Frame buffer released");
 
-    // 3) Write multipart footer
     w = esp_http_client_write(client, g_part_ftr, ftr_len);
     if (w != ftr_len) {
-        ESP_LOGE(TAG, "[CAPTURE] Write footer failed: %d/%d", w, ftr_len);
+        ESP_LOGE(TAG, "[CAP] Write ftr fail: %d/%d", w, ftr_len);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
+        led_pulse_red(1000);
         return;
     }
-    ESP_LOGI(TAG, "[CAPTURE] Footer sent: %d bytes", w);
 
-    // 4) Fetch response
     esp_http_client_fetch_headers(client);
     int status_code = esp_http_client_get_status_code(client);
-
     memset(g_resp, 0, sizeof(g_resp));
     int read_len = esp_http_client_read(client, g_resp, sizeof(g_resp) - 1);
     if (read_len > 0) g_resp[read_len] = '\0';
-
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
     uint32_t heap_after = esp_get_free_heap_size();
-    ESP_LOGI(TAG, "[CLEANUP] Free heap after: %" PRIu32 " bytes (delta: %+d)",
-             heap_after, (int)(heap_after - heap_before));
+    ESP_LOGI(TAG, "[CAP] Free heap after: %" PRIu32 " (delta=%+d)", heap_after, (int)(heap_after - heap_before));
 
     if (status_code == 200) {
-        ESP_LOGI(TAG, "[DONE] Photo uploaded successfully! HTTP %d", status_code);
+        ESP_LOGI(TAG, "[OK] Upload HTTP 200!");
+        led_flash_green(3);          // 3 green flashes = success
     } else {
-        ESP_LOGE(TAG, "[FAIL] Upload HTTP %d, resp: %s",
-                 status_code, read_len > 0 ? g_resp : "(empty)");
+        ESP_LOGE(TAG, "[FAIL] HTTP %d, resp: %s", status_code, read_len > 0 ? g_resp : "(empty)");
+        led_pulse_red(1000);          // 1s red = fail
     }
+    strcpy(g_trigger_source, "web");
 }
 
 // ---------- Main ----------
 void app_main(void) {
+    // Init status LED
+    ws2812_init();
+    bl_off();
+
+    // Quick LED pulse to signal "alive"
+    led_pulse_blue(200);
+
     if (camera_init() != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init fatal, restarting in 5s...");
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        ESP_LOGE(TAG, "Camera fatal, restarting in 5s...");
+        led_pulse_red(5000);
         esp_restart();
     }
+
+    // ---- IMU init AFTER camera (SCCB on port 1 finished; IMU takes legacy port 0, pins 4/5) ----
+    if (imu_init() == ESP_OK) {
+        ESP_LOGI(TAG, "[IMU] QMA6100P ready, 1 Hz upload will start after WiFi");
+    } else {
+        ESP_LOGE(TAG, "[IMU] init FAILED - uploads disabled (board keeps running, camera unaffected)");
+    }
+
     wifi_init();
+    esp_wifi_set_max_tx_power(32);  // 8 dBm, reduced for stability
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "WiFi connected. Starting main loop...");
+        ESP_LOGI(TAG, "WiFi OK. Starting main loop...");
+        led_flash_blue(2);  // 2 blue flashes = WiFi connected
+        btn_init();
+        // ---- IMU upload task: 1 Hz, 1500ms HTTP cap, auto-pauses during captures ----
+        xTaskCreate(imu_task, "imu_task", 4096, NULL, 4, NULL);
+        ESP_LOGI(TAG, "[IMU] Task started: period=%dms http_timeout=%dms", IMU_PERIOD_MS, IMU_HTTP_TIMEOUT);
     } else {
-        ESP_LOGE(TAG, "WiFi connection failed, restarting...");
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        ESP_LOGE(TAG, "WiFi failed, restarting...");
+        led_pulse_red(3000);
         esp_restart();
     }
 
     int consecutive_failures = 0;
     uint32_t loop_count = 0;
+    uint32_t last_capture_ms = 0;   // anti-thrash cooldown
 
     while (1) {
+
+        // ======== CHECK PHYSICAL BUTTON FIRST ========
+        if (g_button_pressed) {
+            g_button_pressed = false;
+
+            // 3-second anti-thrash: ignore rapid repeated presses
+            uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
+            if (now_ms - last_capture_ms < 3000) {
+                ESP_LOGW(TAG, "[BTN] Ignored (cooldown, %" PRIu32 "ms since last)", now_ms - last_capture_ms);
+                led_pulse_red(150);  // quick red = rejected
+                continue;
+            }
+            last_capture_ms = now_ms;
+
+            ESP_LOGI(TAG, "[BTN] Physical capture triggered!");
+            strcpy(g_trigger_source, "physical_button");
+            g_capture_busy = true;   // pause IMU uploads for the whole capture + cooldown
+            led_pulse_blue(500);   // 500ms BLUE flash = "taking photo"
+            vTaskDelay(pdMS_TO_TICKS(50));  // debounce
+            capture_and_upload();
+            ESP_LOGI(TAG, "[MAIN] Physical capture done. Cooldown 3s.");
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            g_capture_busy = false;  // capture fully done + cooled down -> IMU may resume
+            continue;
+        }
         loop_count++;
 
-        // Check WiFi alive every 10 loops
+        // Check WiFi
         if (loop_count % 10 == 0) {
             bits = xEventGroupGetBits(s_wifi_event_group);
             if (!(bits & WIFI_CONNECTED_BIT)) {
-                ESP_LOGW(TAG, "[MAIN] WiFi lost! Waiting for reconnect...");
+                ESP_LOGW(TAG, "[MAIN] WiFi lost! Waiting...");
                 bits = xEventGroupWaitBits(s_wifi_event_group,
                     WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
                 if (bits & WIFI_FAIL_BIT) {
-                    ESP_LOGE(TAG, "[MAIN] WiFi unrecoverable, restarting!");
+                    ESP_LOGE(TAG, "[MAIN] WiFi unrecoverable, restart!");
                     esp_restart();
                 }
-                consecutive_failures = 0;
                 continue;
             }
         }
 
         if (poll_server_for_task()) {
             consecutive_failures = 0;
-            vTaskDelay(pdMS_TO_TICKS(200));
-            ESP_LOGI(TAG, "[MAIN] Entering capture_and_upload...");
+            last_capture_ms = pdTICKS_TO_MS(xTaskGetTickCount());  // also apply anti-thrash to web captures
+            g_capture_busy = true;   // pause IMU uploads during web capture too
             capture_and_upload();
-            ESP_LOGI(TAG, "[MAIN] capture_and_upload returned. Cooldown 1s.");
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            g_capture_busy = false;  // resume IMU uploads
         } else {
-            // Just a normal poll cycle
             if (loop_count % 60 == 0) {
-                ESP_LOGI(TAG, "[MAIN] Loop #%d, heap: %" PRIu32, (int)loop_count, esp_get_free_heap_size());
+                ESP_LOGI(TAG, "[MAIN] Loop #%d, heap=%" PRIu32, (int)loop_count, esp_get_free_heap_size());
             }
         }
 
-        // If we have many consecutive failures (polls failing), something is wrong
         if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT)) {
             consecutive_failures++;
-            if (consecutive_failures > 5) {
+            if (consecutive_failures > 10) {
                 ESP_LOGE(TAG, "[MAIN] Too many failures, rebooting!");
                 esp_restart();
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
