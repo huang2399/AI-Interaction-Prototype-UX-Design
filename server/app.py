@@ -3,8 +3,8 @@ import time, threading, os, glob, json, math, random, re
 from collections import deque
 
 app = Flask(__name__)
-UPLOAD_FOLDER = 'photos'
-LEDGER_FILE = 'photos_ledger.json'
+UPLOAD_FOLDER = r'D:\esp_project\imu_web_demo\photos'
+LEDGER_FILE = r'D:\esp_project\imu_web_demo\server\photos_ledger.json'
 MIN_PHOTO_SIZE = 500  # reject images smaller than 500 bytes (corrupt/empty)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
