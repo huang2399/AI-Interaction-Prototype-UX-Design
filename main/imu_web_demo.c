@@ -7,6 +7,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_http_client.h"
+
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_camera.h"
@@ -20,9 +21,22 @@
 #include <inttypes.h>
 
 // ================= Config =================
+#define USE_STATIC_IP_ENV 1  // 0=教室网(DHCP)  1=手机热点(静态IP)
+
+#if USE_STATIC_IP_ENV == 0
+// ---- Classroom network (DHCP) ----
 #define WIFI_SSID "431"
 #define WIFI_PASS "88888888"
 #define SERVER_URL "http://10.1.41.53:5000"
+#else
+// ---- Windows hotspot (Static IP) ----
+#define WIFI_SSID "hotspot"
+#define WIFI_PASS "12345678"
+#define SERVER_URL "http://192.168.137.1:5000"
+#define STATIC_IP  "192.168.137.100"
+#define STATIC_GW  "192.168.137.1"
+#define STATIC_MASK "255.255.255.0"
+#endif
 // ===========================================
 
 // ================= Camera pins (ESP32-S3-EYE OV2640) =================
@@ -332,12 +346,14 @@ static void imu_task(void *arg) {
 // ---------- WiFi event handler ----------
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        // connect called manually after scan in wifi_init()
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t* disc = (wifi_event_sta_disconnected_t*) event_data;
+        ESP_LOGW(TAG, "WiFi disconnected, reason=%d", disc->reason);
         if (s_retry_num < MAX_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
-            ESP_LOGW(TAG, "WiFi disconnected, retry %d/%d", s_retry_num, MAX_RETRY);
+            ESP_LOGW(TAG, "WiFi retry %d/%d", s_retry_num, MAX_RETRY);
         } else {
             ESP_LOGE(TAG, "WiFi max retries, restarting...");
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
@@ -353,19 +369,74 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
 
 static void wifi_init(void) {
     s_wifi_event_group = xEventGroupCreate();
+    nvs_flash_erase();  // clean NVS between env switches
     nvs_flash_init();
     esp_netif_init();
     esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, NULL);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, NULL);
-    wifi_config_t wifi_config = { .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS } };
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = true,
+                .required = false,
+            },
+        },
+    };
     esp_wifi_set_mode(WIFI_MODE_STA);
+
+    // Set China country code to enable channels 1-13
+    wifi_country_t country = {
+        .cc = "CN",
+        .schan = 1,
+        .nchan = 13,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL,
+    };
+    esp_wifi_set_country(&country);
+    ESP_LOGI(TAG, "[WiFi] Country set: CN, channels 1-13");
+
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     esp_wifi_start();
+
+    // Active scan to find all visible APs before connecting
+    wifi_scan_config_t scan_cfg = { .scan_type = WIFI_SCAN_TYPE_ACTIVE };
+    ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_cfg, true));
+    uint16_t ap_count = 0;
+    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
+    ESP_LOGI(TAG, "[WiFi] Scan done, found %d AP(s)", ap_count);
+    wifi_ap_record_t *ap_list = calloc(ap_count, sizeof(wifi_ap_record_t));
+    if (ap_list) {
+        ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_list));
+        for (int i = 0; i < ap_count; i++) {
+            ESP_LOGI(TAG, "[WiFi]   %-24s ch=%d rssi=%d auth=%d",
+                     ap_list[i].ssid, ap_list[i].primary, ap_list[i].rssi, ap_list[i].authmode);
+        }
+        free(ap_list);
+    }
+
+    esp_wifi_connect();
     ESP_LOGI(TAG, "Connecting WiFi: %s ...", WIFI_SSID);
+
+#if USE_STATIC_IP_ENV
+    // Stop DHCP, assign static IP
+    esp_netif_dhcpc_stop(sta_netif);
+    esp_netif_ip_info_t ip_info = {0};
+    ESP_ERROR_CHECK(esp_netif_str_to_ip4(STATIC_IP, &ip_info.ip));
+    ESP_ERROR_CHECK(esp_netif_str_to_ip4(STATIC_GW, &ip_info.gw));
+    ESP_ERROR_CHECK(esp_netif_str_to_ip4(STATIC_MASK, &ip_info.netmask));
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(sta_netif, &ip_info));
+    esp_netif_dns_info_t dns;
+    dns.ip.u_addr.ip4.addr = ip_info.gw.addr;
+    dns.ip.type = ESP_IPADDR_TYPE_V4;
+    ESP_ERROR_CHECK(esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns));
+    ESP_LOGI(TAG, "[WiFi] Static IP set: " STATIC_IP);
+#endif
 }
 
 // ---------- Camera Init (xclk=8MHz for DMA stability) ----------
@@ -605,9 +676,45 @@ void app_main(void) {
     wifi_init();
     esp_wifi_set_max_tx_power(32);  // 8 dBm, reduced for stability
 
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
-    if (bits & WIFI_CONNECTED_BIT) {
+    // Wait for IP with retry logic --- classroom DHCP can be very slow (90+ sec).
+    // Retry up to 3 disconnect/reconnect cycles before giving up.
+    bool wifi_ok = false;
+    int dhcp_retries = 0;
+    const int MAX_DHCP_RETRIES = 3;
+    const int DHCP_TIMEOUT_SEC = 90;
+
+    while (!wifi_ok && dhcp_retries < MAX_DHCP_RETRIES) {
+        if (dhcp_retries > 0) {
+            ESP_LOGW(TAG, "[WiFi] DHCP timeout (attempt %d/%d), reconnecting...",
+                     dhcp_retries, MAX_DHCP_RETRIES);
+            s_retry_num = 0;              // reset disconnect counter
+            xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            esp_wifi_disconnect();
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            esp_wifi_connect();
+            xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        }
+
+        int elapsed = 0;
+        while (elapsed < DHCP_TIMEOUT_SEC) {
+            EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
+            elapsed += 5;
+            if (bits & WIFI_CONNECTED_BIT) {
+                wifi_ok = true;
+                break;
+            }
+            if (bits & WIFI_FAIL_BIT) {
+                ESP_LOGW(TAG, "[WiFi] AP disconnect at %d sec, will retry", elapsed);
+                break;  // exit inner loop -> go to retry
+            }
+            ESP_LOGI(TAG, "[WiFi] Waiting for IP... (%d sec)", elapsed);
+        }
+        if (!wifi_ok) dhcp_retries++;
+    }
+
+    if (wifi_ok) {
         ESP_LOGI(TAG, "WiFi OK. Starting main loop...");
         led_flash_blue(2);  // 2 blue flashes = WiFi connected
         btn_init();
@@ -615,7 +722,8 @@ void app_main(void) {
         xTaskCreate(imu_task, "imu_task", 4096, NULL, 4, NULL);
         ESP_LOGI(TAG, "[IMU] Task started: period=%dms http_timeout=%dms", IMU_PERIOD_MS, IMU_HTTP_TIMEOUT);
     } else {
-        ESP_LOGE(TAG, "WiFi failed, restarting...");
+        ESP_LOGE(TAG, "WiFi failed after %d retries (%d sec total), restarting...",
+                 MAX_DHCP_RETRIES, MAX_DHCP_RETRIES * DHCP_TIMEOUT_SEC);
         led_pulse_red(3000);
         esp_restart();
     }
@@ -623,6 +731,7 @@ void app_main(void) {
     int consecutive_failures = 0;
     uint32_t loop_count = 0;
     uint32_t last_capture_ms = 0;   // anti-thrash cooldown
+    EventBits_t bits;
 
     while (1) {
 
