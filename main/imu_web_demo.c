@@ -28,7 +28,7 @@
 #include "services/gatt/ble_svc_gatt.h"
 
 // ================= Config =================
-#define USE_STATIC_IP_ENV 1  // 0=教室网(DHCP)  1=手机热点(静态IP)
+#define USE_STATIC_IP_ENV 1  // 0=教室�?DHCP)  1=手机热点(静态IP)
 
 #if USE_STATIC_IP_ENV == 0
 // ---- Classroom network (DHCP) ----
@@ -94,7 +94,6 @@ static const int MAX_RETRY = 5;
 
 static volatile bool g_button_pressed = false;
 static char g_trigger_source[20] = "web";
-static int poll_fail_count = 0;   // watchdog: consecutive poll connection failures
 static volatile bool g_capture_busy = false;  // IMU gate: true during capture + cooldown
 static i2c_master_dev_handle_t s_imu_dev = NULL;  // QMA6100P on camera SCCB bus (NULL = IMU disabled)
 
@@ -108,7 +107,7 @@ static void ws2812_init(void) {
     rmt_tx_channel_config_t tx_cfg = {
         .gpio_num = 48,
         .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = 10 * 1000 * 1000,  // 10 MHz 鈫?0.1 碌s/tick
+        .resolution_hz = 10 * 1000 * 1000,  // 10 MHz �?0.1 碌s/tick
         .mem_block_symbols = 64,
         .trans_queue_depth = 4,
         .flags.invert_out = false,
@@ -473,7 +472,7 @@ static esp_err_t camera_init(void) {
         .pin_sccb_scl = CAM_PIN_SIOC,
         .pin_pwdn = CAM_PIN_PWDN,
         .pin_reset = CAM_PIN_RESET,
-        .xclk_freq_hz = 6000000,     // 6 MHz 鈥?minimized to prevent DMA overflow
+        .xclk_freq_hz = 6000000,     // 6 MHz �?minimized to prevent DMA overflow
         .pixel_format = PIXFORMAT_JPEG,
         .frame_size = FRAMESIZE_QQVGA,
         .jpeg_quality = 10,
@@ -514,7 +513,6 @@ static void btn_init(void) {
 
 // ---------- Poll Server ----------
 static bool poll_server_for_task(void) {
-    // PATCHED v2: added poll_fail_count tracking and proper cleanup on all error paths
     char url[128];
     snprintf(url, sizeof(url), "%s/api/device/poll", SERVER_URL);
     esp_http_client_config_t config = { .url = url, .method = HTTP_METHOD_GET, .timeout_ms = 3000 };
@@ -553,14 +551,14 @@ static void capture_and_upload(void) {
 
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
-        ESP_LOGE(TAG, "[CAP] Camera returned NULL! heap=%" PRIu32 " 鈥?skipping", esp_get_free_heap_size());
+        ESP_LOGE(TAG, "[CAP] Camera returned NULL! heap=%" PRIu32 " �?skipping", esp_get_free_heap_size());
         led_pulse_red(1000);
         vTaskDelay(pdMS_TO_TICKS(200));
         return;
     }
     ESP_LOGI(TAG, "[CAP] Photo: %zu bytes, heap=%" PRIu32, fb->len, esp_get_free_heap_size());
 
-    // Reject tiny/corrupt images (< 500 bytes 鈫?likely empty)
+    // Reject tiny/corrupt images (< 500 bytes �?likely empty)
     if (fb->len < 500) {
         ESP_LOGE(TAG, "[CAP] Photo too small (%zu bytes < 500), rejecting!", fb->len);
         esp_camera_fb_return(fb);
@@ -570,7 +568,7 @@ static void capture_and_upload(void) {
 
     // Multipart body
     char boundary[] = "ESP32_CAM_BOUNDARY";
-    char trigger_field[128];   // was 80 鈥?overflow for "physical_button" (needs 92 bytes)
+    char trigger_field[128];   // was 80 �?overflow for "physical_button" (needs 92 bytes)
     int trigger_len = snprintf(trigger_field, sizeof(trigger_field),
         "--%s\r\nContent-Disposition: form-data; name=\"trigger\"\r\n\r\n%s\r\n",
         boundary, g_trigger_source);
@@ -660,11 +658,17 @@ static void capture_and_upload(void) {
 
 // ---------- BLE Service (NimBLE) ----------
 #define BLE_DEVICE_NAME    "ESP32-S3-EYE"
-#define BLE_UUID128_SVC    {0xfb,0x34,0x9b,0x5f,0x80,0x00,0x00,0x80,0x00,0x10,0x00,0x00,0x4f,0xaf,0xc2,0x01}
-#define BLE_UUID128_CHAR   {0xfb,0x34,0x9b,0x5f,0x80,0x00,0x00,0x80,0x00,0x10,0x00,0x00,0xbe,0xb5,0x48,0x3e}
 
-static ble_uuid128_t g_ble_svc_uuid  = {.u = {.type = BLE_UUID_TYPE_128}, .value = BLE_UUID128_SVC};
-static ble_uuid128_t g_ble_char_uuid = {.u = {.type = BLE_UUID_TYPE_128}, .value = BLE_UUID128_CHAR};
+// Service UUID: 4fafc201-1fb5-459e-8fcc-c5c9c331914b
+// Bleprph convention: pass bytes in REVERSE order to BLE_UUID128_INIT
+static const ble_uuid128_t g_ble_svc_uuid =
+    BLE_UUID128_INIT(0x4b,0x91,0x31,0xc3, 0xc9,0xc5,0xcc,0x8f,
+                     0x9e,0x45,0xb5,0x1f, 0x01,0xc2,0xaf,0x4f);
+
+// Char UUID: beb5483e-1fb5-459e-8fcc-c5c9c331914b
+static const ble_uuid128_t g_ble_char_uuid =
+    BLE_UUID128_INIT(0x4b,0x91,0x31,0xc3, 0xc9,0xc5,0xcc,0x8f,
+                     0x9e,0x45,0xb5,0x1f, 0x3e,0x48,0xb5,0xbe);
 
 static volatile bool     g_ble_capture_req = false;
 static volatile int      g_ble_capture_ok  = 0;   // 0=pending, 1=ok, -1=fail
@@ -685,12 +689,22 @@ static int ble_gap_cb(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "[BLE] Disconnected, reason=%d", event->disconnect.reason);
         g_ble_conn_handle = 0;
+        // Re-start advertising so the device can be found again
+        {
+            struct ble_gap_adv_params adv = { .conn_mode = BLE_GAP_CONN_MODE_UND,
+                                              .disc_mode = BLE_GAP_DISC_MODE_GEN };
+            int rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv, ble_gap_cb, NULL);
+            if (rc == 0)
+                ESP_LOGI(TAG, "[BLE] Re-advertising after disconnect");
+            else
+                ESP_LOGE(TAG, "[BLE] Re-adv failed: %d", rc);
+        }
         return 0;
     default: return 0;
     }
 }
 
-// GATT characteristic write callback — triggers capture via semaphore
+// GATT characteristic write callback �?triggers capture via semaphore
 static int ble_char_write_cb(uint16_t conn_handle, uint16_t attr_handle,
                               struct ble_gatt_access_ctxt *ctxt, void *arg) {
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && ctxt->om) {
@@ -723,25 +737,77 @@ static int ble_char_write_cb(uint16_t conn_handle, uint16_t attr_handle,
     return 0;
 }
 
-// GATT service definition
+// ---------- GATT service definition (flat arrays — official NimBLE pattern) ----------
+
+// CCCD UUID — static variable (compile-time constant) instead of BLE_UUID16_DECLARE compound literal
+static ble_uuid16_t g_ble_cccd_uuid = BLE_UUID16_INIT(BLE_GATT_DSC_CLT_CFG_UUID16);
+
+// CCCD descriptor array (terminated by {0})
+static struct ble_gatt_dsc_def g_ble_dsc_defs[] = {
+    {
+        .uuid       = &g_ble_cccd_uuid.u,
+        .att_flags  = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
+        .access_cb  = NULL,
+    },
+    { 0 }   // sentinel: .uuid == NULL
+};
+
+// Characteristic array (terminated by {0})
+static struct ble_gatt_chr_def g_ble_chr_defs[] = {
+    {
+        .uuid         = &g_ble_char_uuid.u,
+        .access_cb    = ble_char_write_cb,
+        .flags        = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY,
+        .val_handle   = &g_ble_char_handle,
+        .descriptors  = g_ble_dsc_defs,
+    },
+    { 0 }   // sentinel: .uuid == NULL
+};
+
+// Service array (terminated by {0} — .type == 0 == BLE_GATT_SVC_TYPE_END)
 static const struct ble_gatt_svc_def g_ble_svcs[] = {
-    { .type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = (ble_uuid_t *)&g_ble_svc_uuid,
-      .characteristics = (struct ble_gatt_chr_def[]){
-          { .uuid = (ble_uuid_t *)&g_ble_char_uuid, .access_cb = ble_char_write_cb,
-            .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY, .val_handle = &g_ble_char_handle },
-          { 0 } } },
-    { 0 }
+    {
+        .type            = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid            = &g_ble_svc_uuid.u,
+        .characteristics = g_ble_chr_defs,
+    },
+    { 0 }   // sentinel
 };
 
 static void ble_on_reset(int reason) { ESP_LOGE(TAG, "[BLE] Reset: %d", reason); }
 
 static void ble_on_sync(void) {
-    ESP_LOGI(TAG, "[BLE] Synced, starting advertise...");
+    ESP_LOGI(TAG, "[BLE] Synced, registering GATT services...");
+
+    // Dump service definition for debug
+    const ble_uuid_t *svc_uuid = g_ble_svcs[0].uuid;
+    ESP_LOGI(TAG, "[BLE] Svc[0].type=%d, .uuid=%p, .uuid->type=%d",
+             g_ble_svcs[0].type, (void*)svc_uuid, svc_uuid ? svc_uuid->type : -1);
+    if (svc_uuid && svc_uuid->type == BLE_UUID_TYPE_128) {
+        const uint8_t *v = ((const ble_uuid128_t *)svc_uuid)->value;
+        ESP_LOGI(TAG, "[BLE] Svc UUID: %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                 v[0],v[1],v[2],v[3], v[4],v[5], v[6],v[7], v[8],v[9], v[10],v[11],v[12],v[13],v[14],v[15]);
+    }
+
+    const struct ble_gatt_chr_def *chr = g_ble_chr_defs;
+    ESP_LOGI(TAG, "[BLE] Chr[0].uuid=%p", (void*)chr->uuid);
+    if (chr->uuid) {
+        ESP_LOGI(TAG, "[BLE] Chr[0].uuid->type=%d, .flags=0x%02lx, .descriptors=%p",
+                 chr->uuid->type, (unsigned long)chr->flags, (void*)chr->descriptors);
+        if (chr->uuid->type == BLE_UUID_TYPE_128) {
+            const uint8_t *v = ((const ble_uuid128_t *)chr->uuid)->value;
+            ESP_LOGI(TAG, "[BLE] Chr UUID: %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                     v[0],v[1],v[2],v[3], v[4],v[5], v[6],v[7], v[8],v[9], v[10],v[11],v[12],v[13],v[14],v[15]);
+        }
+    }
+
     int rc;
     rc = ble_gatts_count_cfg(g_ble_svcs);
-    if (rc) { ESP_LOGE(TAG, "[BLE] count_cfg err %d", rc); return; }
+    if (rc) { ESP_LOGE(TAG, "[BLE] GATT count_cfg FAILED, rc=%d", rc); return; }
+    ESP_LOGI(TAG, "[BLE] GATT count_cfg OK, total_entries=%d", rc);
     rc = ble_gatts_add_svcs(g_ble_svcs);
-    if (rc) { ESP_LOGE(TAG, "[BLE] add_svcs err %d", rc); return; }
+    if (rc) { ESP_LOGE(TAG, "[BLE] GATT add_svcs FAILED, rc=%d", rc); return; }
+    ESP_LOGI(TAG, "[BLE] GATT service added, 1 primary svc + 1 char + CCCD");
     ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
 
     struct ble_gap_adv_params adv = { .conn_mode = BLE_GAP_CONN_MODE_UND, .disc_mode = BLE_GAP_DISC_MODE_GEN };
@@ -769,6 +835,11 @@ static void ble_init(void) {
     }
 
     if (nimble_port_init() != ESP_OK) { ESP_LOGE(TAG, "[BLE] port_init fail"); return; }
+
+    // Register GAP + GATT built-in services (REQUIRED or GATT DB is empty!)
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ESP_LOGI(TAG, "[BLE] GAP+GATT base services registered");
 
     ble_hs_cfg.reset_cb = ble_on_reset;
     ble_hs_cfg.sync_cb  = ble_on_sync;

@@ -391,7 +391,7 @@ def upload_imu():
 import urllib.request
 import urllib.error
 
-LLM_API_KEY = os.environ.get("LLM_API_KEY", os.environ.get("DEEPSEEK_API_KEY", ""))
+LLM_API_KEY = os.environ.get("MY_IMU_LLM_KEY", os.environ.get("LLM_API_KEY", os.environ.get("DEEPSEEK_API_KEY", "")))
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
 LLM_MODEL = os.environ.get("LLM_MODEL", "glm-4.7-flash")
 
@@ -414,28 +414,89 @@ CHAT_TOOLS = [
     },
 ]
 
-UNSUPPORTED_KEYWORDS = {"temperature", "humidity", "pressure", "light", "sound", "distance",
-                        "proximity", "gas", "co2", "voc"}
+UNSUPPORTED_KEYWORDS = {
+    # English (kept for international users)
+    "temperature", "humidity", "pressure", "light", "sound", "distance",
+    "proximity", "gas", "co2", "voc",
+    # Chinese — must cover all variants users actually type
+    "温度", "湿度", "气压", "光照", "声音", "噪声", "噪音", "距离",
+    "pm2.5", "PM2.5", "空气质量", "空气", "烟雾", "二氧化碳", "co2", "CO2",
+    "心率", "血氧", "gps", "GPS", "定位", "磁场", "陀螺仪", "声音强度",
+    "气压计", "气体", "voc", "VOC", "光线",
+    # meta: "what sensors do you support?"
+    "支持哪些传感器", "支持什么传感器", "有哪些传感器", "有什么传感器",
+}
+# Keyword-based tool pre‑matching: avoid extra LLM round‑trip for obvious intents
+STATUS_KEYWORDS = {"状态", "在线", "离线", "情况", "rssi", "信号", "ip", "设备状态",
+                   "当前状态", "任务状态", "最近一次", "最新照片"}
+PHOTO_KEYWORDS = {"拍照", "拍张", "拍张照", "拍个照", "拍一张", "拍一下", "拍一",
+                  "采集", "照相", "相机", "拍摄", "抓拍", "capture",
+                  "照片", "帮我拍", "帮拍", "来一张", "来张",
+                  "张照"}
+
+# ---- account-level rate limiter ----
+_last_llm_call_time = 0.0
+LLM_MIN_INTERVAL = 5  # seconds minimum between LLM calls (free tier QPS limit)
+
+
+def _call_llm_with_retry(messages, tools=None, retries=1):
+    """Call LLM with retry on 429, return (result, elapsed)."""
+    global _last_llm_call_time
+    # ---- account-level rate limiter (free tier QPS protection) ----
+    wait_needed = LLM_MIN_INTERVAL - (time.time() - _last_llm_call_time)
+    if wait_needed > 0:
+        print(f"【AI】Rate-limited: need {wait_needed:.1f}s cooldown")
+        return {"error": f"RATE_LIMIT:{wait_needed:.1f}"}, 0
+
+    last_error = None
+    for attempt in range(retries + 1):
+        t0 = time.time()
+        result = _call_llm(messages, tools)
+        elapsed = time.time() - t0
+        if "error" not in result:
+            _last_llm_call_time = time.time()
+            return result, elapsed
+        err = result["error"]
+        if "429" in err and attempt < retries:
+            print(f"【AI】429 rate-limit, retry in 3s (attempt {attempt+1}/{retries})")
+            time.sleep(3)
+            last_error = err
+            continue
+        # Non-retryable or last attempt
+        return result, elapsed
+    return {"error": last_error}, 0
 
 
 def _call_llm(messages, tools=None):
     if not LLM_API_KEY:
         return {"error": "LLM_API_KEY not configured. Set LLM_API_KEY environment variable (or DEEPSEEK_API_KEY as fallback)."}
-    body = {"model": LLM_MODEL, "messages": messages, "max_tokens": 512, "temperature": 0.3}
+    # strip whitespace from model and API key (env vars may have trailing spaces)
+    model = LLM_MODEL.strip()
+    key = LLM_API_KEY.strip()
+    body = {"model": model, "messages": messages, "max_tokens": 512, "temperature": 0.3}
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
     data = json.dumps(body).encode("utf-8")
+    url = f"{LLM_BASE_URL}/chat/completions"
+    key_masked = key[:4] + "****" + key[-4:] if len(key) >= 8 else "***"
+    print(f"【AI】POST {url}")
+    print(f"【AI】Authorization: Bearer {key_masked}")
+    print(f"【AI】Body keys: {list(body.keys())} | model={model} | msgs={len(messages)}")
     req = urllib.request.Request(
-        f"{LLM_BASE_URL}/chat/completions", data=data,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {LLM_API_KEY}"})
+        url, data=data,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
     try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            elapsed = time.time() - t0
+            print(f"【AI】Response HTTP {resp.status} ({elapsed:.1f}s)")
+            return result
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        print(f"【AI】LLM HTTP {e.code}: {body[:300]}")
-        return {"error": f"LLM API error {e.code}: {body[:200]}"}
+        body_text = e.read().decode("utf-8", errors="replace")
+        print(f"【AI】LLM HTTP {e.code}: {body_text[:300]}")
+        return {"error": f"LLM API error {e.code}: {body_text[:200]}"}
     except Exception as e:
         print(f"【AI】LLM request failed: {e}")
         return {"error": str(e)}
@@ -514,6 +575,16 @@ def _execute_tool(func_name):
 @app.route('/api/chat', methods=['POST'])
 def ai_chat():
     """Natural-language AI assistant: /api/chat {message: ...} -> {reply: ..., tool_used: ...}"""
+    try:
+        return _ai_chat_impl()
+    except Exception as e:
+        print(f"【AI】Unhandled error in /api/chat: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"reply": f"AI服务异常，请稍后重试。", "tool_used": None}), 200
+
+
+def _ai_chat_impl():
     d = request.get_json(silent=True) or {}
     user_msg = (d.get("message", "") or "").strip()
     if not user_msg:
@@ -523,17 +594,57 @@ def ai_chat():
 
     msg_lower = user_msg.lower()
     for kw in UNSUPPORTED_KEYWORDS:
-        if kw in msg_lower:
-            return jsonify({"reply": f"本系统不支持{kw}传感器。当前仅支持：摄像头拍照、IMU加速度计、WiFi状态查询。",
-                            "tool_used": None}), 200
+        if kw.lower() in msg_lower:
+            # Meta‑questions about sensor support
+            if kw in {"支持哪些传感器", "支持什么传感器", "有哪些传感器", "有什么传感器"}:
+                return jsonify({"reply": "本系统仅支持以下功能：\n📷 摄像头拍照\n📡 WiFi状态查询\n🔄 IMU加速度计\n\n不支持温度/湿度/气压/PM2.5/声音/GPS/心率等传感器。",
+                                "tool_used": None}), 200
+            # English keywords → Chinese display name
+            display_map = {
+                "temperature": "温度", "humidity": "湿度", "pressure": "气压",
+                "light": "光照", "sound": "声音", "distance": "距离",
+                "proximity": "接近", "gas": "气体", "co2": "CO₂", "voc": "VOC",
+                "pm2.5": "PM2.5", "gps": "GPS",
+            }
+            display = display_map.get(kw.lower(), kw)
+            return jsonify({
+                "reply": f"本系统不支持{display}传感器。当前仅支持：摄像头拍照、IMU加速度计、WiFi状态查询。",
+                "tool_used": None}), 200
 
+    # ---- Step 1: Keyword pre‑matching → call tool directly (saves 1 LLM round‑trip) ----
+    matched_tool = None
+    # Check status keywords FIRST, then photo (status keywords like "最新照片" contain "照片")
+    for kw in STATUS_KEYWORDS:
+        if kw in user_msg:
+            matched_tool = "get_device_status"
+            break
+    if not matched_tool:
+        for kw in PHOTO_KEYWORDS:
+            if kw in user_msg:
+                matched_tool = "take_photo"
+                break
+
+    if matched_tool:
+        print(f"【AI】Keyword matched: '{matched_tool}'")
+        tool_result_str = _execute_tool(matched_tool)
+        try:
+            tool_result = json.loads(tool_result_str)
+        except json.JSONDecodeError:
+            tool_result = {}
+        final_reply = _format_tool_reply(matched_tool, tool_result)
+        print(f"【AI】Keyword flow done (zero LLM)")
+        return jsonify({"reply": final_reply, "tool_used": matched_tool}), 200
+
+    # ---- Step 2: Fallback — full Function Calling flow (LLM decides tool) ----
     system_prompt = (
         "你是ESP32-S3-EYE开发板的AI助手。"
-        "\n\n【规则】1. 可用get_device_status查状态、take_photo拍照。"
-        "\n2. 只有take_photo返回success=true才说'已采集成功'。"
-        "\n3. 设备离线/超时必须如实说'设备未响应'或'任务超时'。"
-        "\n4. 不支持温度/湿度等传感器，问这些直接回复'本系统不支持该功能'。"
-        "\n5. 不编造数据，使用中文简洁回复。"
+        "\n\n【工具使用规则 - 必须遵守】"
+        "\n1. 用户问\"状态/在线/设备情况\"等 → 必须调用 get_device_status 工具"
+        "\n2. 用户问\"拍照/采集/拍一张\"等 → 必须调用 take_photo 工具"
+        "\n3. 只能从工具返回的数据中提取信息，不允许编造"
+        "\n4. 设备离线或任务超时，必须如实说\"设备未响应\"或\"任务超时\""
+        "\n5. 不允许猜测设备状态，一切以工具返回为准"
+        "\n6. 用中文简洁回复"
     )
 
     messages = [
@@ -541,9 +652,9 @@ def ai_chat():
         {"role": "user", "content": user_msg},
     ]
 
-    resp = _call_llm(messages, CHAT_TOOLS)
+    resp, elapsed1 = _call_llm_with_retry(messages, CHAT_TOOLS, retries=1)
     if "error" in resp:
-        return jsonify({"reply": f"AI服务暂不可用：{resp['error']}", "tool_used": None}), 200
+        return jsonify({"reply": _friendly_error(resp["error"]), "tool_used": None}), 200
 
     choice = (resp.get("choices") or [{}])[0]
     msg = choice.get("message", {})
@@ -563,19 +674,112 @@ def ai_chat():
 
         messages.append(msg)
         messages.extend(tool_results)
-        resp2 = _call_llm(messages)
+        resp2, elapsed2 = _call_llm_with_retry(messages, retries=1)
         if "error" in resp2:
-            final_reply = f"工具已执行，但AI回复生成失败：{resp2['error']}"
+            final_reply = f"工具已执行，但AI回复生成失败：{_friendly_error(resp2['error'])}"
         else:
             choice2 = (resp2.get("choices") or [{}])[0]
             final_reply = choice2.get("message", {}).get("content", "") or "操作已完成。"
+        print(f"【AI】FunctionCall flow done ({elapsed1:.1f}s + {elapsed2:.1f}s)")
         return jsonify({"reply": final_reply, "tool_used": tool_used}), 200
 
     content = msg.get("content", "")
     if not content:
         content = "抱歉，我没有理解您的问题。试试：'现在状态怎么样' 或 '帮我拍张照'。"
+    print(f"【AI】Direct reply ({elapsed1:.1f}s)")
     return jsonify({"reply": content, "tool_used": None}), 200
 
+
+def _format_tool_reply(tool_name, result):
+    """Generate a canned Chinese reply from tool result — zero LLM cost."""
+    if tool_name == "take_photo":
+        if result.get("success"):
+            return "已为您拍摄，图片已上传。刷新页面即可查看。"
+        reason = result.get("reason", "")
+        if "离线" in reason or "未响应" in reason or "OFFLINE" in reason:
+            return "设备未响应，请检查设备是否在线。"
+        if "繁忙" in reason or "忙" in reason:
+            return "设备正忙（上一个任务尚未完成），请稍后再试。"
+        if "超时" in reason or "TIMEOUT" in reason:
+            return "拍照指令已下发，但设备未在超时前完成采集，请重试。"
+        if "创建失败" in reason or "内部错误" in reason:
+            return "任务创建失败，服务器内部错误，请重试。"
+        # fallback
+        return f"拍照未成功（{reason}），请重试。"
+
+    elif tool_name == "get_device_status":
+        online = result.get("online", False)
+        if not online:
+            ago = result.get("last_seen_seconds_ago")
+            if ago is not None:
+                return f"设备离线，最后一次在线是 {ago} 秒前。请检查设备电源和网络。"
+            return "设备离线，暂无在线记录。请检查设备电源和网络。"
+
+        ip = result.get("device_ip", "未知")
+        rssi = result.get("rssi")
+        rssi_str = f"{rssi} dBm" if rssi is not None else "未知"
+        task = result.get("task_status", "IDLE")
+        task_map = {"IDLE": "空闲", "PENDING": "等待中", "ACCEPTED": "已接收",
+                    "COMPLETED": "已完成", "TIMEOUT": "已超时"}
+        task_display = task_map.get(task, task)
+        latest = result.get("latest_photo")
+        photo_str = latest if latest else "无"
+
+        lines = [
+            "📡 设备在线",
+            f"IP：{ip}",
+            f"信号：{rssi_str}",
+            f"任务状态：{task_display}",
+            f"最新照片：{photo_str}",
+        ]
+        return "\n".join(lines)
+
+    return "操作已完成。"
+
+
+def _friendly_error(err_str):
+    """Map raw LLM errors to user-friendly messages."""
+    if "429" in err_str:
+        return "当前AI服务繁忙（访问量过大），请稍后再试。"
+    if "1302" in err_str:
+        return "当前AI服务繁忙（访问量过大），请稍后再试。"
+    if err_str.startswith("RATE_LIMIT:"):
+        wait = err_str.split(":")[1]
+        return f"请求过于频繁，请 {wait} 秒后再试。"
+    if "401" in err_str:
+        return "AI服务认证失败，请检查API Key配置。"
+    if "timeout" in err_str.lower() or "timed out" in err_str.lower():
+        return "AI服务响应超时，请稍后再试。"
+    return f"AI服务暂不可用：{err_str}"
+
+
+@app.route('/api/chat/debug')
+def chat_debug():
+    """Return full request template that Flask would send to LLM (key masked)."""
+    key_ok = bool(LLM_API_KEY)
+    key_stripped = LLM_API_KEY.strip() if LLM_API_KEY else ""
+    key_masked = key_stripped[:4] + "****" + key_stripped[-4:] if len(key_stripped) >= 8 else ("***" if key_stripped else None)
+    model = LLM_MODEL.strip()
+    url = f"{LLM_BASE_URL}/chat/completions"
+    return jsonify({
+        "key_priority": "MY_IMU_LLM_KEY > LLM_API_KEY > DEEPSEEK_API_KEY",
+        "key_configured": key_ok,
+        "key_masked": key_masked,
+        "key_len": len(key_stripped) if key_stripped else 0,
+        "base_url": LLM_BASE_URL,
+        "model": model,
+        "url": url,
+        "headers": {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key_masked or '***MISSING***'}"
+        },
+        "sample_body": {
+            "model": model,
+            "messages": [{"role": "user", "content": "你好"}],
+            "max_tokens": 512,
+            "temperature": 0.3
+        }
+    })
 
 @app.route('/api/chat/health')
 def chat_health():
