@@ -387,9 +387,231 @@ def upload_imu():
     touch_device()
     return jsonify({"status": "ok"}), 200
 
+# ---------------- API: AI Chat with Function Calling ----------------
+import urllib.request
+import urllib.error
+
+LLM_API_KEY = os.environ.get("LLM_API_KEY", os.environ.get("DEEPSEEK_API_KEY", ""))
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+LLM_MODEL = os.environ.get("LLM_MODEL", "glm-4.7-flash")
+
+CHAT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_device_status",
+            "description": "查询ESP32-S3-EYE开发板的当前状态，包括设备IP、在线状态、WiFi RSSI信号强度、当前任务状态、最近一次拍照时间等。",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "take_photo",
+            "description": "向ESP32-S3-EYE开发板发送一次拍照指令。开发板会在下一次轮询时接收指令并拍照上传。注意：如果设备当前离线或任务超时，将如实告知用户。",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]
+
+UNSUPPORTED_KEYWORDS = {"temperature", "humidity", "pressure", "light", "sound", "distance",
+                        "proximity", "gas", "co2", "voc"}
+
+
+def _call_llm(messages, tools=None):
+    if not LLM_API_KEY:
+        return {"error": "LLM_API_KEY not configured. Set LLM_API_KEY environment variable (or DEEPSEEK_API_KEY as fallback)."}
+    body = {"model": LLM_MODEL, "messages": messages, "max_tokens": 512, "temperature": 0.3}
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        f"{LLM_BASE_URL}/chat/completions", data=data,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {LLM_API_KEY}"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"【AI】LLM HTTP {e.code}: {body[:300]}")
+        return {"error": f"LLM API error {e.code}: {body[:200]}"}
+    except Exception as e:
+        print(f"【AI】LLM request failed: {e}")
+        return {"error": str(e)}
+
+def _execute_tool(func_name):
+    """Execute a function call locally and return JSON result string."""
+    if func_name == "get_device_status":
+        check_timeout()
+        with lock:
+            data = dict(task_state)
+            data["device_ip"] = device_info["ip"]
+            data["device_last_seen"] = device_info["last_seen"]
+            data["rssi"] = device_info["rssi"]
+        online = bool(device_info["ip"] and device_info["last_seen"]
+                      and (time.time() - device_info["last_seen"] < 60))
+        result = {
+            "online": online,
+            "device_ip": data["device_ip"] or "未知",
+            "rssi": data["rssi"],
+            "task_status": data.get("status", "IDLE"),
+            "task_id": data.get("task_id"),
+            "latest_photo": data.get("latest_photo"),
+            "last_seen_seconds_ago": round(time.time() - (data["device_last_seen"] or 0), 1)
+                if data["device_last_seen"] else None,
+        }
+        return json.dumps(result, ensure_ascii=False)
+
+    elif func_name == "take_photo":
+        with lock:
+            ip = device_info["ip"]
+            last_seen = device_info["last_seen"]
+            busy = task_state["status"] in ("PENDING", "ACCEPTED")
+        online = bool(ip and last_seen and (time.time() - last_seen < 60))
+        if not online:
+            return json.dumps({"success": False, "reason": "设备离线",
+                "detail": "设备未连接到服务器，无法下发拍照指令。"}, ensure_ascii=False)
+        if busy:
+            return json.dumps({"success": False, "reason": "设备忙碌",
+                "detail": "设备正在处理上一个任务，请稍后再试。"}, ensure_ascii=False)
+
+        ok, tid = create_capture_task("ai_chat")
+        if not ok:
+            return json.dumps({"success": False, "reason": "任务创建失败",
+                "detail": "服务器内部错误，无法创建拍照任务。"}, ensure_ascii=False)
+
+        # Poll until COMPLETED/TIMEOUT/OFFLINE (max 35s)
+        deadline = time.time() + 35
+        result_status = None
+        result_photo = None
+        while time.time() < deadline:
+            time.sleep(1.0)
+            check_timeout()
+            with lock:
+                st = task_state["status"]
+                photo = task_state.get("latest_photo")
+            if st in ("COMPLETED", "TIMEOUT"):
+                result_status = st; result_photo = photo; break
+            with lock:
+                ip_now = device_info["ip"]
+                ls_now = device_info["last_seen"]
+            if not (ip_now and ls_now and (time.time() - ls_now < 60)):
+                result_status = "OFFLINE"; break
+
+        if result_status == "COMPLETED":
+            return json.dumps({"success": True, "photo": result_photo, "task_id": tid}, ensure_ascii=False)
+        elif result_status == "TIMEOUT":
+            return json.dumps({"success": False, "reason": "任务超时",
+                "detail": "拍照指令已下发，但设备在30秒内未完成采集。"}, ensure_ascii=False)
+        else:
+            return json.dumps({"success": False, "reason": "设备未响应",
+                "detail": "设备在接受任务后失去响应。"}, ensure_ascii=False)
+
+    return json.dumps({"error": f"Unknown tool: {func_name}"})
+
+
+@app.route('/api/chat', methods=['POST'])
+def ai_chat():
+    """Natural-language AI assistant: /api/chat {message: ...} -> {reply: ..., tool_used: ...}"""
+    d = request.get_json(silent=True) or {}
+    user_msg = (d.get("message", "") or "").strip()
+    if not user_msg:
+        return jsonify({"reply": "请输入您的问题。", "tool_used": None}), 200
+    if len(user_msg) > 500:
+        return jsonify({"reply": "输入内容过长，请控制在500字以内。", "tool_used": None}), 200
+
+    msg_lower = user_msg.lower()
+    for kw in UNSUPPORTED_KEYWORDS:
+        if kw in msg_lower:
+            return jsonify({"reply": f"本系统不支持{kw}传感器。当前仅支持：摄像头拍照、IMU加速度计、WiFi状态查询。",
+                            "tool_used": None}), 200
+
+    system_prompt = (
+        "你是ESP32-S3-EYE开发板的AI助手。"
+        "\n\n【规则】1. 可用get_device_status查状态、take_photo拍照。"
+        "\n2. 只有take_photo返回success=true才说'已采集成功'。"
+        "\n3. 设备离线/超时必须如实说'设备未响应'或'任务超时'。"
+        "\n4. 不支持温度/湿度等传感器，问这些直接回复'本系统不支持该功能'。"
+        "\n5. 不编造数据，使用中文简洁回复。"
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg},
+    ]
+
+    resp = _call_llm(messages, CHAT_TOOLS)
+    if "error" in resp:
+        return jsonify({"reply": f"AI服务暂不可用：{resp['error']}", "tool_used": None}), 200
+
+    choice = (resp.get("choices") or [{}])[0]
+    msg = choice.get("message", {})
+    tool_calls = msg.get("tool_calls") or []
+
+    if tool_calls:
+        tool_results = []
+        tool_used = None
+        for tc in tool_calls:
+            func_name = tc.get("function", {}).get("name", "")
+            if not func_name:
+                continue
+            print(f"【AI】Tool call: {func_name}")
+            tool_used = func_name
+            result_str = _execute_tool(func_name)
+            tool_results.append({"tool_call_id": tc.get("id", "call_1"), "role": "tool", "content": result_str})
+
+        messages.append(msg)
+        messages.extend(tool_results)
+        resp2 = _call_llm(messages)
+        if "error" in resp2:
+            final_reply = f"工具已执行，但AI回复生成失败：{resp2['error']}"
+        else:
+            choice2 = (resp2.get("choices") or [{}])[0]
+            final_reply = choice2.get("message", {}).get("content", "") or "操作已完成。"
+        return jsonify({"reply": final_reply, "tool_used": tool_used}), 200
+
+    content = msg.get("content", "")
+    if not content:
+        content = "抱歉，我没有理解您的问题。试试：'现在状态怎么样' 或 '帮我拍张照'。"
+    return jsonify({"reply": content, "tool_used": None}), 200
+
+
+@app.route('/api/chat/health')
+def chat_health():
+    """Return current LLM configuration status."""
+    key_ok = bool(LLM_API_KEY)
+    key_masked = ""
+    if LLM_API_KEY and len(LLM_API_KEY) >= 8:
+        key_masked = LLM_API_KEY[:4] + "****" + LLM_API_KEY[-4:]
+    elif LLM_API_KEY:
+        key_masked = "***"  # key too short to mask safely
+    return jsonify({
+        "llm_configured": key_ok,
+        "model": LLM_MODEL,
+        "base_url": LLM_BASE_URL,
+        "api_key_masked": key_masked if key_ok else None,
+        "endpoint": f"{LLM_BASE_URL}/chat/completions",
+    })
+
 @app.route('/')
 def index():
     return render_template('index.html')
 
+
 if __name__ == '__main__':
+    # Startup diagnostic: print LLM configuration
+    key_ok = bool(LLM_API_KEY)
+    key_display = "未设置 ❌"
+    if LLM_API_KEY and len(LLM_API_KEY) >= 8:
+        key_display = f"{LLM_API_KEY[:4]}****{LLM_API_KEY[-4:]}"
+    elif LLM_API_KEY:
+        key_display = "已设置(长度过短)"
+    print("=" * 55)
+    print("   LLM 配置")
+    print(f"   Model   : {LLM_MODEL}")
+    print(f"   Base URL: {LLM_BASE_URL}")
+    print(f"   API Key : {key_display}")
+    print(f"   Ready   : {'✅ 可用' if key_ok else '❌ 缺少 API Key'}")
+    print("=" * 55)
     app.run(host='0.0.0.0', port=5000, threaded=True)
