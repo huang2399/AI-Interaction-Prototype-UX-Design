@@ -665,10 +665,10 @@ static const ble_uuid128_t g_ble_svc_uuid =
     BLE_UUID128_INIT(0x4b,0x91,0x31,0xc3, 0xc9,0xc5,0xcc,0x8f,
                      0x9e,0x45,0xb5,0x1f, 0x01,0xc2,0xaf,0x4f);
 
-// Char UUID: beb5483e-1fb5-459e-8fcc-c5c9c331914b
+// Char UUID: beb5483e-36e1-4688-b7f5-ea07361b26a8
 static const ble_uuid128_t g_ble_char_uuid =
-    BLE_UUID128_INIT(0x4b,0x91,0x31,0xc3, 0xc9,0xc5,0xcc,0x8f,
-                     0x9e,0x45,0xb5,0x1f, 0x3e,0x48,0xb5,0xbe);
+    BLE_UUID128_INIT(0xa8, 0x26, 0x1b, 0x36, 0x07, 0xea, 0xf5, 0xb7,
+                     0x88, 0x46, 0xe1, 0x36, 0x3e, 0x48, 0xb5, 0xbe);
 
 static volatile bool     g_ble_capture_req = false;
 static volatile int      g_ble_capture_ok  = 0;   // 0=pending, 1=ok, -1=fail
@@ -737,41 +737,41 @@ static int ble_char_write_cb(uint16_t conn_handle, uint16_t attr_handle,
     return 0;
 }
 
-// ---------- GATT service definition (flat arrays — official NimBLE pattern) ----------
+// ---------- GATT service definition (EXACT bleprph gatt_svr.c pattern) ----------
 
-// CCCD UUID — static variable (compile-time constant) instead of BLE_UUID16_DECLARE compound literal
-static ble_uuid16_t g_ble_cccd_uuid = BLE_UUID16_INIT(BLE_GATT_DSC_CLT_CFG_UUID16);
+// CCCD UUID — 16-bit standard descriptor, static variable like bleprph uses
+static const ble_uuid16_t g_ble_cccd_uuid = BLE_UUID16_INIT(BLE_GATT_DSC_CLT_CFG_UUID16);
 
-// CCCD descriptor array (terminated by {0})
-static struct ble_gatt_dsc_def g_ble_dsc_defs[] = {
-    {
-        .uuid       = &g_ble_cccd_uuid.u,
-        .att_flags  = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
-        .access_cb  = NULL,
-    },
-    { 0 }   // sentinel: .uuid == NULL
-};
-
-// Characteristic array (terminated by {0})
-static struct ble_gatt_chr_def g_ble_chr_defs[] = {
-    {
-        .uuid         = &g_ble_char_uuid.u,
-        .access_cb    = ble_char_write_cb,
-        .flags        = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY,
-        .val_handle   = &g_ble_char_handle,
-        .descriptors  = g_ble_dsc_defs,
-    },
-    { 0 }   // sentinel: .uuid == NULL
-};
-
-// Service array (terminated by {0} — .type == 0 == BLE_GATT_SVC_TYPE_END)
+// Service definition: nested compound literals, EXACT structure copied from bleprph
 static const struct ble_gatt_svc_def g_ble_svcs[] = {
     {
-        .type            = BLE_GATT_SVC_TYPE_PRIMARY,
-        .uuid            = &g_ble_svc_uuid.u,
-        .characteristics = g_ble_chr_defs,
-    },
-    { 0 }   // sentinel
+        /*** Service ***/
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &g_ble_svc_uuid.u,
+        .characteristics = (struct ble_gatt_chr_def[])
+        { {
+            /*** Characteristic: write + notify ***/
+            .uuid = &g_ble_char_uuid.u,
+            .access_cb = ble_char_write_cb,
+            .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY,
+            .val_handle = &g_ble_char_handle,
+            .descriptors = (struct ble_gatt_dsc_def[])
+            { {
+                /*** CCCD descriptor for notifications ***/
+                .uuid = &g_ble_cccd_uuid.u,
+                .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
+                .access_cb = NULL,
+              }, {
+                0, /* No more descriptors */
+              }
+            },
+          }, {
+            0, /* No more characteristics */
+          }
+        },
+    }, {
+        0, /* No more services */
+    }
 };
 
 static void ble_on_reset(int reason) { ESP_LOGE(TAG, "[BLE] Reset: %d", reason); }
@@ -789,7 +789,7 @@ static void ble_on_sync(void) {
                  v[0],v[1],v[2],v[3], v[4],v[5], v[6],v[7], v[8],v[9], v[10],v[11],v[12],v[13],v[14],v[15]);
     }
 
-    const struct ble_gatt_chr_def *chr = g_ble_chr_defs;
+    const struct ble_gatt_chr_def *chr = g_ble_svcs[0].characteristics;
     ESP_LOGI(TAG, "[BLE] Chr[0].uuid=%p", (void*)chr->uuid);
     if (chr->uuid) {
         ESP_LOGI(TAG, "[BLE] Chr[0].uuid->type=%d, .flags=0x%02lx, .descriptors=%p",

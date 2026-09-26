@@ -127,3 +127,16 @@ Partition: SINGLE_APP_LARGE
 | 8 | BLE Unknown Cmd | Write "status" | Notify: "ERR" |
 | 9 | BLE+WiFi Concurrent | BLE capture during upload | Both succeed, no crash |
 | 10 | AI Capture via BLE trigger | Phone BLE + AI chat refresh | Gallery updates
+
+## BLE 蓝牙调试记录
+
+### 已完成
+- AI 自然语言控制：✅ 100% 跑通（智谱 GLM-4.7-Flash + Function Calling）
+- 防误报机制：✅ 验证通过（断网时 AI 如实回复"设备未响应"）
+- 歧义处理：✅ 验证通过（温度/湿度等不支持传感器被本地拦截）
+
+### 未完成：BLE 蓝牙
+- 状态：❌ 未跑通
+- 现象：BLE 广播正常（手机能扫到 MAC 94:A9:90:1C:70:52），但 GATT Service 注册失败（count_cfg rc=3），手机连接后 Services 页面空白。
+- 根因分析：NimBLE 的 BLE_UUID128_INIT 字节序与编译期常量初始化存在兼容性问题，多次调试未解决。
+- 后续计划：将参考 ESP-IDF 官方 bleprph 示例重构 BLE 初始化代码，或改用 ESP-IDF 的 Bluedroid 栈。
