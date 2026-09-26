@@ -20,6 +20,13 @@
                                 //  camera driver_ng -> check_i2c_driver_conflict abort at boot)
 #include <inttypes.h>
 
+// ================= BLE (NimBLE) =================
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+
 // ================= Config =================
 #define USE_STATIC_IP_ENV 1  // 0=教室网(DHCP)  1=手机热点(静态IP)
 
@@ -651,6 +658,130 @@ static void capture_and_upload(void) {
     strcpy(g_trigger_source, "web");
 }
 
+// ---------- BLE Service (NimBLE) ----------
+#define BLE_DEVICE_NAME    "ESP32-S3-EYE"
+#define BLE_UUID128_SVC    {0xfb,0x34,0x9b,0x5f,0x80,0x00,0x00,0x80,0x00,0x10,0x00,0x00,0x4f,0xaf,0xc2,0x01}
+#define BLE_UUID128_CHAR   {0xfb,0x34,0x9b,0x5f,0x80,0x00,0x00,0x80,0x00,0x10,0x00,0x00,0xbe,0xb5,0x48,0x3e}
+
+static ble_uuid128_t g_ble_svc_uuid  = {.u = {.type = BLE_UUID_TYPE_128}, .value = BLE_UUID128_SVC};
+static ble_uuid128_t g_ble_char_uuid = {.u = {.type = BLE_UUID_TYPE_128}, .value = BLE_UUID128_CHAR};
+
+static volatile bool     g_ble_capture_req = false;
+static volatile int      g_ble_capture_ok  = 0;   // 0=pending, 1=ok, -1=fail
+static SemaphoreHandle_t g_ble_done_sem    = NULL;
+static SemaphoreHandle_t g_capture_mutex   = NULL;
+static uint16_t          g_ble_char_handle = 0;
+static uint16_t          g_ble_conn_handle = 0;
+
+// BLE GAP event callback
+static int ble_gap_cb(struct ble_gap_event *event, void *arg) {
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status == 0) {
+            g_ble_conn_handle = event->connect.conn_handle;
+            ESP_LOGI(TAG, "[BLE] Client connected, conn=%d", g_ble_conn_handle);
+        } else { ESP_LOGW(TAG, "[BLE] Connect fail: %d", event->connect.status); }
+        return 0;
+    case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGI(TAG, "[BLE] Disconnected, reason=%d", event->disconnect.reason);
+        g_ble_conn_handle = 0;
+        return 0;
+    default: return 0;
+    }
+}
+
+// GATT characteristic write callback — triggers capture via semaphore
+static int ble_char_write_cb(uint16_t conn_handle, uint16_t attr_handle,
+                              struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && ctxt->om) {
+        uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        if (len > 0 && len < 32) {
+            char buf[32] = {0};
+            os_mbuf_copydata(ctxt->om, 0, len, buf);
+            buf[len] = '\0';
+            ESP_LOGI(TAG, "[BLE] Write: '%s'", buf);
+
+            if (strcmp(buf, "capture") == 0) {
+                g_ble_capture_req = true;
+                if (xSemaphoreTake(g_ble_done_sem, pdMS_TO_TICKS(15000))) {
+                    char notify[48];
+                    if (g_ble_capture_ok == 1)
+                        snprintf(notify, sizeof(notify), "OK");
+                    else
+                        snprintf(notify, sizeof(notify), "FAIL");
+                    ESP_LOGI(TAG, "[BLE] Notify: %s", notify);
+                    struct os_mbuf *om = ble_hs_mbuf_from_flat(notify, strlen(notify));
+                    if (om) ble_gattc_notify_custom(conn_handle, g_ble_char_handle, om);
+                }
+            } else {
+                const char *err = "ERR";
+                struct os_mbuf *om = ble_hs_mbuf_from_flat(err, strlen(err));
+                if (om) ble_gattc_notify_custom(conn_handle, g_ble_char_handle, om);
+            }
+        }
+    }
+    return 0;
+}
+
+// GATT service definition
+static const struct ble_gatt_svc_def g_ble_svcs[] = {
+    { .type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = (ble_uuid_t *)&g_ble_svc_uuid,
+      .characteristics = (struct ble_gatt_chr_def[]){
+          { .uuid = (ble_uuid_t *)&g_ble_char_uuid, .access_cb = ble_char_write_cb,
+            .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY, .val_handle = &g_ble_char_handle },
+          { 0 } } },
+    { 0 }
+};
+
+static void ble_on_reset(int reason) { ESP_LOGE(TAG, "[BLE] Reset: %d", reason); }
+
+static void ble_on_sync(void) {
+    ESP_LOGI(TAG, "[BLE] Synced, starting advertise...");
+    int rc;
+    rc = ble_gatts_count_cfg(g_ble_svcs);
+    if (rc) { ESP_LOGE(TAG, "[BLE] count_cfg err %d", rc); return; }
+    rc = ble_gatts_add_svcs(g_ble_svcs);
+    if (rc) { ESP_LOGE(TAG, "[BLE] add_svcs err %d", rc); return; }
+    ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
+
+    struct ble_gap_adv_params adv = { .conn_mode = BLE_GAP_CONN_MODE_UND, .disc_mode = BLE_GAP_DISC_MODE_GEN };
+    struct ble_hs_adv_fields fields = { .flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP };
+    rc = ble_gap_adv_set_fields(&fields);
+    if (rc) { ESP_LOGE(TAG, "[BLE] adv_fields err %d", rc); return; }
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv, ble_gap_cb, NULL);
+    if (rc) ESP_LOGE(TAG, "[BLE] adv_start err %d", rc);
+    else ESP_LOGI(TAG, "[BLE] Advertising as '%s'", BLE_DEVICE_NAME);
+}
+
+static void ble_host_task(void *arg) {
+    ESP_LOGI(TAG, "[BLE] Host task started");
+    nimble_port_run();
+}
+
+static void ble_init(void) {
+    uint32_t heap_before = esp_get_free_heap_size();
+    ESP_LOGI(TAG, "[BLE] Init. Free heap: %" PRIu32, heap_before);
+
+    g_ble_done_sem  = xSemaphoreCreateBinary();
+    g_capture_mutex = xSemaphoreCreateMutex();
+    if (!g_ble_done_sem || !g_capture_mutex) {
+        ESP_LOGE(TAG, "[BLE] Semaphore fail!"); return;
+    }
+
+    if (nimble_port_init() != ESP_OK) { ESP_LOGE(TAG, "[BLE] port_init fail"); return; }
+
+    ble_hs_cfg.reset_cb = ble_on_reset;
+    ble_hs_cfg.sync_cb  = ble_on_sync;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+
+    nimble_port_freertos_init(ble_host_task);
+    uint32_t heap_after = esp_get_free_heap_size();
+    ESP_LOGI(TAG, "[BLE] Ready. Free heap: %" PRIu32 " (used %" PRIu32 ")",
+             heap_after, heap_before - heap_after);
+    if (heap_after < 30000)
+        ESP_LOGW(TAG, "[BLE] Low heap! WiFi+BLE may be tight.");
+}
+
 // ---------- Main ----------
 void app_main(void) {
     // Init status LED
@@ -718,6 +849,9 @@ void app_main(void) {
         ESP_LOGI(TAG, "WiFi OK. Starting main loop...");
         led_flash_blue(2);  // 2 blue flashes = WiFi connected
         btn_init();
+        btn_init();
+        // ---- BLE: Bluetooth remote capture (phone) ----
+        ble_init();
         // ---- IMU upload task: 1 Hz, 1500ms HTTP cap, auto-pauses during captures ----
         xTaskCreate(imu_task, "imu_task", 4096, NULL, 4, NULL);
         ESP_LOGI(TAG, "[IMU] Task started: period=%dms http_timeout=%dms", IMU_PERIOD_MS, IMU_HTTP_TIMEOUT);
@@ -774,6 +908,24 @@ void app_main(void) {
                 }
                 continue;
             }
+        }
+
+        // ---- BLE capture request (phone remote trigger) ----
+        if (g_ble_capture_req) {
+            g_ble_capture_req = false;
+            ESP_LOGI(TAG, "[BLE] Handling capture request");
+            if (xSemaphoreTake(g_capture_mutex, pdMS_TO_TICKS(1000))) {
+                g_capture_busy = true;
+                strcpy(g_trigger_source, "ble");
+                capture_and_upload();
+                g_ble_capture_ok = 1;
+                g_capture_busy = false;
+                xSemaphoreGive(g_capture_mutex);
+                strcpy(g_trigger_source, "web");
+            } else {
+                g_ble_capture_ok = -1;
+            }
+            xSemaphoreGive(g_ble_done_sem);
         }
 
         if (poll_server_for_task()) {
