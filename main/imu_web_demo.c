@@ -24,6 +24,7 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
+#include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
@@ -676,6 +677,11 @@ static SemaphoreHandle_t g_ble_done_sem    = NULL;
 static SemaphoreHandle_t g_capture_mutex   = NULL;
 static uint16_t          g_ble_char_handle = 0;
 static uint16_t          g_ble_conn_handle = 0;
+#if CONFIG_EXAMPLE_RANDOM_ADDR
+static uint8_t           own_addr_type = BLE_OWN_ADDR_RANDOM;
+#else
+static uint8_t           own_addr_type;
+#endif
 
 // BLE GAP event callback
 static int ble_gap_cb(struct ble_gap_event *event, void *arg) {
@@ -693,7 +699,7 @@ static int ble_gap_cb(struct ble_gap_event *event, void *arg) {
         {
             struct ble_gap_adv_params adv = { .conn_mode = BLE_GAP_CONN_MODE_UND,
                                               .disc_mode = BLE_GAP_DISC_MODE_GEN };
-            int rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv, ble_gap_cb, NULL);
+            int rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &adv, ble_gap_cb, NULL);
             if (rc == 0)
                 ESP_LOGI(TAG, "[BLE] Re-advertising after disconnect");
             else
@@ -737,12 +743,34 @@ static int ble_char_write_cb(uint16_t conn_handle, uint16_t attr_handle,
     return 0;
 }
 
+// GATT register callback — matches official bleprph gatt_svr_register_cb
+static void ble_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg)
+{
+    char buf[BLE_UUID_STR_LEN];
+    switch (ctxt->op) {
+    case BLE_GATT_REGISTER_OP_SVC:
+        ESP_LOGI(TAG, "[BLE] registered service %s handle=%d",
+                 ble_uuid_to_str(ctxt->svc.svc_def->uuid, buf),
+                 ctxt->svc.handle);
+        break;
+    case BLE_GATT_REGISTER_OP_CHR:
+        ESP_LOGI(TAG, "[BLE] registered char %s def_handle=%d val_handle=%d",
+                 ble_uuid_to_str(ctxt->chr.chr_def->uuid, buf),
+                 ctxt->chr.def_handle, ctxt->chr.val_handle);
+        break;
+    case BLE_GATT_REGISTER_OP_DSC:
+        ESP_LOGI(TAG, "[BLE] registered dsc %s handle=%d",
+                 ble_uuid_to_str(ctxt->dsc.dsc_def->uuid, buf),
+                 ctxt->dsc.handle);
+        break;
+    default:
+        break;
+    }
+}
+
 // ---------- GATT service definition (EXACT bleprph gatt_svr.c pattern) ----------
+// NimBLE auto-adds CCCD when BLE_GATT_CHR_F_NOTIFY flag is set — no manual descriptor needed
 
-// CCCD UUID — 16-bit standard descriptor, static variable like bleprph uses
-static const ble_uuid16_t g_ble_cccd_uuid = BLE_UUID16_INIT(BLE_GATT_DSC_CLT_CFG_UUID16);
-
-// Service definition: nested compound literals, EXACT structure copied from bleprph
 static const struct ble_gatt_svc_def g_ble_svcs[] = {
     {
         /*** Service ***/
@@ -755,16 +783,6 @@ static const struct ble_gatt_svc_def g_ble_svcs[] = {
             .access_cb = ble_char_write_cb,
             .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY,
             .val_handle = &g_ble_char_handle,
-            .descriptors = (struct ble_gatt_dsc_def[])
-            { {
-                /*** CCCD descriptor for notifications ***/
-                .uuid = &g_ble_cccd_uuid.u,
-                .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
-                .access_cb = NULL,
-              }, {
-                0, /* No more descriptors */
-              }
-            },
           }, {
             0, /* No more characteristics */
           }
@@ -777,44 +795,49 @@ static const struct ble_gatt_svc_def g_ble_svcs[] = {
 static void ble_on_reset(int reason) { ESP_LOGE(TAG, "[BLE] Reset: %d", reason); }
 
 static void ble_on_sync(void) {
-    ESP_LOGI(TAG, "[BLE] Synced, registering GATT services...");
-
-    // Dump service definition for debug
-    const ble_uuid_t *svc_uuid = g_ble_svcs[0].uuid;
-    ESP_LOGI(TAG, "[BLE] Svc[0].type=%d, .uuid=%p, .uuid->type=%d",
-             g_ble_svcs[0].type, (void*)svc_uuid, svc_uuid ? svc_uuid->type : -1);
-    if (svc_uuid && svc_uuid->type == BLE_UUID_TYPE_128) {
-        const uint8_t *v = ((const ble_uuid128_t *)svc_uuid)->value;
-        ESP_LOGI(TAG, "[BLE] Svc UUID: %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                 v[0],v[1],v[2],v[3], v[4],v[5], v[6],v[7], v[8],v[9], v[10],v[11],v[12],v[13],v[14],v[15]);
-    }
-
-    const struct ble_gatt_chr_def *chr = g_ble_svcs[0].characteristics;
-    ESP_LOGI(TAG, "[BLE] Chr[0].uuid=%p", (void*)chr->uuid);
-    if (chr->uuid) {
-        ESP_LOGI(TAG, "[BLE] Chr[0].uuid->type=%d, .flags=0x%02lx, .descriptors=%p",
-                 chr->uuid->type, (unsigned long)chr->flags, (void*)chr->descriptors);
-        if (chr->uuid->type == BLE_UUID_TYPE_128) {
-            const uint8_t *v = ((const ble_uuid128_t *)chr->uuid)->value;
-            ESP_LOGI(TAG, "[BLE] Chr UUID: %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                     v[0],v[1],v[2],v[3], v[4],v[5], v[6],v[7], v[8],v[9], v[10],v[11],v[12],v[13],v[14],v[15]);
-        }
-    }
+    ESP_LOGI(TAG, "[BLE] Synced, starting advertising...");
 
     int rc;
-    rc = ble_gatts_count_cfg(g_ble_svcs);
-    if (rc) { ESP_LOGE(TAG, "[BLE] GATT count_cfg FAILED, rc=%d", rc); return; }
-    ESP_LOGI(TAG, "[BLE] GATT count_cfg OK, total_entries=%d", rc);
-    rc = ble_gatts_add_svcs(g_ble_svcs);
-    if (rc) { ESP_LOGE(TAG, "[BLE] GATT add_svcs FAILED, rc=%d", rc); return; }
-    ESP_LOGI(TAG, "[BLE] GATT service added, 1 primary svc + 1 char + CCCD");
-    ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
 
-    struct ble_gap_adv_params adv = { .conn_mode = BLE_GAP_CONN_MODE_UND, .disc_mode = BLE_GAP_DISC_MODE_GEN };
-    struct ble_hs_adv_fields fields = { .flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP };
+    /* Set static random address C4:BE:84:11:22:33 (top two bits = 11 → static random) */
+    static const uint8_t s_static_addr[6] = {0xC4, 0xBE, 0x84, 0x11, 0x22, 0x33};
+    rc = ble_hs_id_set_rnd(s_static_addr);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "[BLE] ble_hs_id_set_rnd failed, rc=%d", rc);
+        return;
+    }
+
+    /* Make sure we have proper identity address set (public preferred) */
+    rc = ble_hs_util_ensure_addr(0);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "[BLE] ble_hs_util_ensure_addr failed, rc=%d", rc);
+        return;
+    }
+
+    /* Figure out address to use while advertising (no privacy for now) */
+    rc = ble_hs_id_infer_auto(0, &own_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "[BLE] error determining address type; rc=%d", rc);
+        return;
+    }
+
+    /* Printing ADDR */
+    uint8_t addr_val[6] = {0};
+    rc = ble_hs_id_copy_addr(own_addr_type, addr_val, NULL);
+    ESP_LOGI(TAG, "[BLE] Device Address: %02x:%02x:%02x:%02x:%02x:%02x",
+             addr_val[0], addr_val[1], addr_val[2], addr_val[3], addr_val[4], addr_val[5]);
+
+    /* Begin advertising with device name in adv data */
+    struct ble_gap_adv_params adv = { .conn_mode = BLE_GAP_CONN_MODE_UND,
+                                      .disc_mode = BLE_GAP_DISC_MODE_GEN };
+    struct ble_hs_adv_fields fields = {0};
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.name = (uint8_t *)BLE_DEVICE_NAME;
+    fields.name_len = strlen(BLE_DEVICE_NAME);
+    fields.name_is_complete = 1;
     rc = ble_gap_adv_set_fields(&fields);
     if (rc) { ESP_LOGE(TAG, "[BLE] adv_fields err %d", rc); return; }
-    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv, ble_gap_cb, NULL);
+    rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &adv, ble_gap_cb, NULL);
     if (rc) ESP_LOGE(TAG, "[BLE] adv_start err %d", rc);
     else ESP_LOGI(TAG, "[BLE] Advertising as '%s'", BLE_DEVICE_NAME);
 }
@@ -843,7 +866,18 @@ static void ble_init(void) {
 
     ble_hs_cfg.reset_cb = ble_on_reset;
     ble_hs_cfg.sync_cb  = ble_on_sync;
+    ble_hs_cfg.gatts_register_cb = ble_register_cb;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+
+    // Register GATT services BEFORE host task starts (official bleprph pattern)
+    int rc = ble_gatts_count_cfg(g_ble_svcs);
+    if (rc != 0) { ESP_LOGE(TAG, "[BLE] GATT count_cfg FAILED rc=%d", rc); return; }
+    ESP_LOGI(TAG, "[BLE] GATT count_cfg OK, total_entries=%d", rc);
+    rc = ble_gatts_add_svcs(g_ble_svcs);
+    if (rc != 0) { ESP_LOGE(TAG, "[BLE] GATT add_svcs FAILED rc=%d", rc); return; }
+    ESP_LOGI(TAG, "[BLE] GATT services added OK");
+
+    ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
 
     nimble_port_freertos_init(ble_host_task);
     uint32_t heap_after = esp_get_free_heap_size();
