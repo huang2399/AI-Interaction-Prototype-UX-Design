@@ -40,11 +40,13 @@ def touch_device():
 imu_lock = threading.Lock()
 imu_history = deque(maxlen=60)   # keep last 60 points (course spec)
 imu_last_real = 0.0
+imu_last_seen = 0.0   # last time any IMU sample (real or simulated) was pushed
 IMU_SIM_START = time.time()
 
 def imu_simulator_loop():
     """1 Hz IMU source. Used until board firmware posts real samples
     to /api/device/upload_imu (then real data wins for 5 s windows)."""
+    global imu_last_seen
     while True:
         now = time.time()
         with imu_lock:
@@ -53,6 +55,7 @@ def imu_simulator_loop():
             el = now - IMU_SIM_START
             sample = {
                 "t": round(now, 3),
+                "received_at": round(now, 3),
                 "ax": round(0.35 * math.sin(el * 0.9) + 0.12 * math.sin(el * 3.1) + random.gauss(0, 0.05), 3),
                 "ay": round(0.30 * math.sin(el * 0.7 + 1.3) + 0.10 * math.sin(el * 2.3) + random.gauss(0, 0.05), 3),
                 "az": round(1.00 + 0.25 * math.sin(el * 0.5 + 0.4) + random.gauss(0, 0.04), 3),
@@ -60,6 +63,7 @@ def imu_simulator_loop():
             }
             with imu_lock:
                 imu_history.append(sample)
+                imu_last_seen = now
         time.sleep(1.0)
 
 threading.Thread(target=imu_simulator_loop, daemon=True).start()
@@ -356,17 +360,31 @@ def timer_stop():
 @app.route('/api/imu_data', methods=['GET'])
 def imu_data():
     with imu_lock:
-        hist = list(imu_history)[-60:]
+        # Only return real device samples (not simulated data)
+        hist = [s for s in imu_history if s.get("source") == "device"][-60:]
     latest = hist[-1] if hist else None
-    return jsonify({"latest": latest, "history": hist,
-                    "source": (latest or {}).get("source", "simulated")})
+    now = time.time()
+    latency = round(max(0, now - imu_last_real), 1) if imu_last_real > 0 else None
+    with lock:
+        dev_ip = device_info.get("ip")
+    if dev_ip == "-":
+        dev_ip = None
+    online = imu_last_real > 0 and (now - imu_last_real) < 10.0
+    return jsonify({
+        "samples": hist,
+        "status": "online" if online else "offline",
+        "device_ip": dev_ip if dev_ip else None,
+        "device_name": "ESP32-S3-EYE",
+        "last_imu_time": latest["t"] if latest else None,
+        "imu_latency": latency
+    })
 
 @app.route('/api/device/upload_imu', methods=['POST'])
 def upload_imu():
     """Real IMU samples from board firmware (QMA6100P, m/s^2).
     Accepts {"x","y","z"} (firmware v3 payload) or {"ax","ay","az"} (legacy).
     Real data wins for 5 s windows: /api/imu_data reports source='device'."""
-    global imu_last_real
+    global imu_last_real, imu_last_seen
     d = request.get_json(silent=True) or {}
     try:
         ax = float(d.get("ax", d.get("x", 0)))
@@ -379,11 +397,13 @@ def upload_imu():
     ay = min(max(ay, -30.0), 30.0)
     az = min(max(az, -30.0), 30.0)
     sample = {"t": round(time.time(), 3),
+              "received_at": round(time.time(), 3),
               "ax": round(ax, 3), "ay": round(ay, 3), "az": round(az, 3),
               "source": "device"}
     with imu_lock:
         imu_history.append(sample)
         imu_last_real = time.time()
+        imu_last_seen = time.time()
     touch_device()
     return jsonify({"status": "ok"}), 200
 
@@ -804,18 +824,18 @@ def index():
 
 
 if __name__ == '__main__':
-    # Startup diagnostic: print LLM configuration
-    key_ok = bool(LLM_API_KEY)
-    key_display = "未设置 ❌"
-    if LLM_API_KEY and len(LLM_API_KEY) >= 8:
-        key_display = f"{LLM_API_KEY[:4]}****{LLM_API_KEY[-4:]}"
-    elif LLM_API_KEY:
-        key_display = "已设置(长度过短)"
+    # Startup banner
     print("=" * 55)
-    print("   LLM 配置")
-    print(f"   Model   : {LLM_MODEL}")
-    print(f"   Base URL: {LLM_BASE_URL}")
-    print(f"   API Key : {key_display}")
-    print(f"   Ready   : {'✅ 可用' if key_ok else '❌ 缺少 API Key'}")
+    print("   IMU Web Demo · Week 1")
+    print("   http://127.0.0.1:5000")
     print("=" * 55)
+
+    if not LLM_API_KEY:
+        print("[WARN] LLM_API_KEY 未设置，AI 功能不可用")
+    else:
+        key_display = f"{LLM_API_KEY[:4]}****{LLM_API_KEY[-4:]}" if len(LLM_API_KEY) >= 8 else "***"
+        print(f"   LLM Model : {LLM_MODEL}")
+        print(f"   LLM Key   : {key_display}")
+
+    print()
     app.run(host='0.0.0.0', port=5000, threaded=True)
