@@ -116,6 +116,16 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
 .voice-status-row.processing{color:var(--yellow);}
 .voice-status-row.speaking{color:var(--cyan);}
 .voice-status-row.error{color:var(--red);}
+/* ---- Voice upload fallback + playback controls ---- */
+.voice-upload-row{display:flex; gap:8px; margin-top:8px;}
+.voice-upload-btn{flex:1; padding:10px; font-size:13px; font-weight:700; letter-spacing:.3px; border-radius:10px; cursor:pointer; background:rgba(34,211,238,.12); border:2px solid rgba(34,211,238,.35); color:var(--cyan); transition:all .15s;}
+.voice-upload-btn:hover{box-shadow:0 0 16px rgba(34,211,238,.3); border-color:rgba(34,211,238,.65);}
+.voice-upload-btn:disabled{opacity:.5; cursor:not-allowed; box-shadow:none;}
+.voice-playback-row{display:none; align-items:center; gap:12px; margin-top:8px;}
+.voice-play-btn{padding:8px 16px; font-size:13px; font-weight:700; border-radius:8px; cursor:pointer; background:linear-gradient(135deg,rgba(34,211,238,.25),rgba(167,139,250,.25)); border:1px solid rgba(34,211,238,.45); color:var(--txt); transition:filter .15s;}
+.voice-play-btn:hover{filter:brightness(1.3);}
+.voice-dl-link{font-size:12px; color:var(--cyan); text-decoration:none; border-bottom:1px dashed rgba(34,211,238,.5);}
+.voice-dl-link:hover{color:#fff;}
 </style>
 </head>
 <body>
@@ -214,6 +224,15 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
           ontouchend="voicePTTEnd(event)"
           ontouchcancel="voicePTTEnd(event)"
         >🎤 按住说话 (PTT)</button>
+      </div>
+      <div class="voice-upload-row">
+        <input type="file" id="voice_file_input" accept="audio/*,.wav,.mp3,.m4a,.webm,.ogg,.aac"
+               style="display:none" onchange="voiceFileSelected(event)">
+        <button class="voice-upload-btn" id="voice_upload_btn" onclick="voiceUploadClick()">📁 上传音频文件</button>
+      </div>
+      <div class="voice-playback-row" id="voice_playback_row">
+        <button class="voice-play-btn" onclick="voicePlayClick()">▶️ 播放</button>
+        <a class="voice-dl-link" id="voice_dl_link" href="#" download>⬇️ 下载音频</a>
       </div>
     </div>
   </section>
@@ -524,120 +543,183 @@ function voicePTTEnd(e){
     if (_voiceChunks.length === 0){
       $('voice_status').className = 'voice-status-row error';
       $('voice_status').innerText = '⚠️ 未捕获到声音';
+      chatAdd('⚠️ 未捕获到声音，请重试或使用文字输入。', 'ai');
       _voiceProcessing = false;
       btn.style.pointerEvents = '';
       return;
     }
 
     const webmBlob = new Blob(_voiceChunks, { type: 'audio/webm' });
-
-    // Convert webm → 16kHz mono WAV
-    $('voice_status').className = 'voice-status-row processing';
-    $('voice_status').innerText = '⏳ 识别中...';
-    $('chat_typing').style.display = 'block';
-    $('chat_typing').innerText = '⏳ 识别中...';
-
-    let wavBlob;
-    try {
-      wavBlob = await convertWebmToWav(webmBlob);
-    } catch(convErr){
-      console.error('Audio conversion error:', convErr);
-      chatAdd('⚠️ 音频转换失败，请用键盘输入。', 'ai');
-      $('voice_status').className = 'voice-status-row error';
-      $('voice_status').innerText = '⚠️ 音频转换失败';
-      $('chat_typing').style.display = 'none';
-      _voiceProcessing = false;
-      btn.style.pointerEvents = '';
-      return;
-    }
-
-    // Upload to server
-    $('voice_status').innerText = '🧠 任务处理中...';
-    $('chat_typing').innerText = '🧠 任务处理中...';
-
-    const formData = new FormData();
-    formData.append('audio', wavBlob, 'recording.wav');
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000);
-
-    try {
-      const resp = await fetch('/api/voice_chat', {
-        method: 'POST', body: formData, signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-      const data = await resp.json();
-
-      $('chat_typing').style.display = 'none';
-
-      if (data.error){
-        chatAdd(data.error, 'ai');
-        $('voice_status').className = 'voice-status-row error';
-        $('voice_status').innerText = '⚠️ ' + data.error;
-        _voiceProcessing = false;
-        btn.style.pointerEvents = '';
-        return;
-      }
-
-      // Show recognized text + AI reply
-      chatAdd('🎤 ' + (data.text || '(空)'), 'user');
-      chatAdd(data.reply || '(空)', 'ai');
-
-      // Play audio response
-      if (data.audio_url){
-        $('voice_status').className = 'voice-status-row speaking';
-        $('voice_status').innerText = '🔊 播报中...';
-        const audio = new Audio(data.audio_url);
-        audio.onended = function(){
-          $('voice_status').className = 'voice-status-row';
-          $('voice_status').innerText = '✅ 语音交互完成';
-          _voiceProcessing = false;
-          btn.style.pointerEvents = '';
-        };
-        audio.onerror = function(){
-          $('voice_status').className = 'voice-status-row error';
-          $('voice_status').innerText = '⚠️ 音频播放失败';
-          _voiceProcessing = false;
-          btn.style.pointerEvents = '';
-        };
-        audio.play().catch(() => {
-          $('voice_status').className = 'voice-status-row';
-          $('voice_status').innerText = '✅ 语音交互完成';
-          _voiceProcessing = false;
-          btn.style.pointerEvents = '';
-        });
-      } else {
-        $('voice_status').className = 'voice-status-row';
-        $('voice_status').innerText = data._tts_error
-          ? '⚠️ 语音合成失败，已显示文字回复' : '✅ 语音交互完成';
-        _voiceProcessing = false;
-        btn.style.pointerEvents = '';
-      }
-
-      if (data.reply && data.reply.indexOf('已为您拍摄') >= 0){ refresh(); }
-
-    } catch(fetchErr){
-      clearTimeout(timeoutId);
-      $('chat_typing').style.display = 'none';
-      if (fetchErr.name === 'AbortError'){
-        chatAdd('⏰ 语音服务超时，请重试。', 'ai');
-        $('voice_status').className = 'voice-status-row error';
-        $('voice_status').innerText = '⚠️ 服务超时';
-      } else {
-        chatAdd('网络错误，请检查服务器连接。', 'ai');
-        $('voice_status').className = 'voice-status-row error';
-        $('voice_status').innerText = '⚠️ 网络错误';
-      }
-      _voiceProcessing = false;
-      btn.style.pointerEvents = '';
-    }
+    await voiceSendBlob(webmBlob, 'recording.wav', function(){ btn.style.pointerEvents = ''; });
   };
 
   _voiceRecorder.stop();
 }
 
+// ============ Voice: shared pipeline (PTT + audio file upload) ============
+let _lastVoiceUrl = '';
+
+async function voiceSendBlob(blob, srcName, done){
+  _voiceProcessing = true;
+  $('voice_status').className = 'voice-status-row processing';
+  $('voice_status').innerText = '⏳ 识别中...';
+  $('chat_typing').style.display = 'block';
+  $('chat_typing').innerText = '⏳ 识别中...';
+
+  // Convert any browser-decodable audio (webm/opus, wav, mp3, m4a, ogg) → 16kHz mono WAV
+  let wavBlob;
+  try {
+    wavBlob = await convertAudioToWav(blob);
+  } catch(convErr){
+    console.error('Audio conversion error:', convErr);
+    chatAdd('⚠️ 音频转换失败，请重试或使用文字输入。', 'ai');
+    $('voice_status').className = 'voice-status-row error';
+    $('voice_status').innerText = '⚠️ 音频转换失败';
+    $('chat_typing').style.display = 'none';
+    _voiceProcessing = false;
+    if (done) done();
+    return;
+  }
+
+  $('voice_status').innerText = '🧠 任务处理中...';
+  $('chat_typing').innerText = '🧠 任务处理中...';
+
+  const formData = new FormData();
+  formData.append('audio', wavBlob, srcName || 'recording.wav');
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const resp = await fetch('/api/voice_chat', {
+      method: 'POST', body: formData, signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    const data = await resp.json();
+
+    $('chat_typing').style.display = 'none';
+
+    if (data.error){
+      chatAdd(data.error, 'ai');
+      $('voice_status').className = 'voice-status-row error';
+      $('voice_status').innerText = '⚠️ ' + data.error;
+      _voiceProcessing = false;
+      if (done) done();
+      return;
+    }
+
+    // Show recognized text + AI reply
+    chatAdd('🎤 ' + (data.text || '(空)'), 'user');
+    chatAdd(data.reply || '(空)', 'ai');
+
+    if (data.audio_url){
+      voicePlayResult(data.audio_url);
+    } else {
+      $('voice_status').className = 'voice-status-row';
+      $('voice_status').innerText = data._tts_error
+        ? '⚠️ 语音合成失败，已显示文字回复' : '✅ 语音交互完成';
+    }
+
+    if (data.reply && data.reply.indexOf('已为您拍摄') >= 0){ refresh(); }
+
+  } catch(fetchErr){
+    clearTimeout(timeoutId);
+    $('chat_typing').style.display = 'none';
+    if (fetchErr.name === 'AbortError'){
+      chatAdd('⏰ 语音服务超时，请重试。', 'ai');
+      $('voice_status').className = 'voice-status-row error';
+      $('voice_status').innerText = '⚠️ 服务超时';
+    } else {
+      chatAdd('网络错误，请检查服务器连接。', 'ai');
+      $('voice_status').className = 'voice-status-row error';
+      $('voice_status').innerText = '⚠️ 网络错误';
+    }
+    _voiceProcessing = false;
+  }
+  if (done) done();
+}
+
+// Show manual ▶️ play + ⬇️ download controls, then try autoplay
+function voicePlayResult(url){
+  _lastVoiceUrl = url;
+
+  const row = $('voice_playback_row');
+  if (row) row.style.display = 'flex';
+  const dl = $('voice_dl_link');
+  if (dl){ dl.href = url; dl.setAttribute('download', (url.split('/').pop() || 'voice.wav')); }
+
+  $('voice_status').className = 'voice-status-row speaking';
+  $('voice_status').innerText = '🔊 播报中...';
+
+  const audio = new Audio(url);
+  window._voiceAudio = audio;
+  audio.onended = function(){
+    $('voice_status').className = 'voice-status-row';
+    $('voice_status').innerText = '✅ 语音交互完成';
+    _voiceProcessing = false;
+  };
+  audio.onerror = function(){
+    $('voice_status').className = 'voice-status-row error';
+    $('voice_status').innerText = '⚠️ 音频加载失败，请点"▶️ 播放"或"⬇️ 下载音频"';
+    _voiceProcessing = false;
+  };
+  audio.play().then(function(){
+    _voiceProcessing = false;
+  }).catch(function(){
+    // Autoplay blocked by browser → user clicks ▶️
+    $('voice_status').className = 'voice-status-row';
+    $('voice_status').innerText = 'ℹ️ 自动播放被浏览器拦截，请点"▶️ 播放"';
+    _voiceProcessing = false;
+  });
+}
+
+function voicePlayClick(){
+  if (!_lastVoiceUrl) return;
+  const a = new Audio(_lastVoiceUrl);
+  window._voiceAudio = a;
+  $('voice_status').className = 'voice-status-row speaking';
+  $('voice_status').innerText = '🔊 播报中...';
+  a.onended = function(){
+    $('voice_status').className = 'voice-status-row';
+    $('voice_status').innerText = '✅ 语音交互完成';
+  };
+  a.onerror = function(){
+    $('voice_status').className = 'voice-status-row error';
+    $('voice_status').innerText = '⚠️ 播放失败，请用"⬇️ 下载音频"';
+  };
+  a.play().catch(function(){
+    $('voice_status').className = 'voice-status-row error';
+    $('voice_status').innerText = '⚠️ 播放失败，请用"⬇️ 下载音频"';
+  });
+}
+
+// ---- Audio file upload fallback (for machines without a microphone) ----
+function voiceUploadClick(){
+  if (_voiceProcessing) return;
+  const inp = $('voice_file_input');
+  if (inp) inp.click();
+}
+
+async function voiceFileSelected(ev){
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = '';   // reset so the same file can be chosen again
+  if (!file) return;
+  if (_voiceProcessing) return;
+
+  const ubtn = $('voice_upload_btn');
+  if (ubtn){ ubtn.disabled = true; ubtn.innerText = '📁 处理中...'; }
+
+  chatAdd('📁 已选择音频：' + file.name + ' (' + fmtSize(file.size) + ')', 'user');
+
+  // We always send a 16kHz mono WAV to the server, so force a .wav filename
+  const baseName = (file.name || 'upload').replace(/\.[^.]+$/, '') || 'upload';
+  await voiceSendBlob(file, baseName + '.wav', function(){
+    if (ubtn){ ubtn.disabled = false; ubtn.innerText = '📁 上传音频文件'; }
+  });
+}
+
 // ---- WAV conversion utilities ----
-function convertWebmToWav(webmBlob){
+function convertAudioToWav(webmBlob){
   return new Promise(function(resolve, reject){
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
