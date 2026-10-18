@@ -1,6 +1,27 @@
 from flask import Flask, request, jsonify, send_from_directory, render_template
-import time, threading, os, glob, json, math, random, re
+import time, threading, os, glob, json, math, random, re, tempfile, uuid
 from collections import deque
+
+# ---- DashScope (Aliyun Bailian) for ASR + TTS ----
+DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
+_dashscope_available = False
+try:
+    import dashscope
+    from dashscope.audio.asr import Recognition, RecognitionCallback
+    from dashscope.audio.tts_v2 import SpeechSynthesizer, AudioFormat
+    if DASHSCOPE_API_KEY:
+        dashscope.api_key = DASHSCOPE_API_KEY
+        _dashscope_available = True
+        print(f"【语音】DashScope SDK 已初始化 (key: {DASHSCOPE_API_KEY[:4]}****{DASHSCOPE_API_KEY[-4:] if len(DASHSCOPE_API_KEY)>=8 else '---'})")
+    else:
+        print("【语音】⚠ DASHSCOPE_API_KEY 未设置，语音功能不可用")
+except ImportError:
+    print("【语音】⚠ dashscope 未安装，请执行 pip install dashscope")
+except Exception as e:
+    print(f"【语音】⚠ DashScope 初始化失败: {e}")
+
+VOICE_DIR = os.path.join(os.path.dirname(__file__), 'static', 'voice')
+os.makedirs(VOICE_DIR, exist_ok=True)
 
 app = Flask(__name__)
 UPLOAD_FOLDER = r'D:\esp_project\imu_web_demo\photos'
@@ -576,7 +597,14 @@ def _execute_tool(func_name):
 def ai_chat():
     """Natural-language AI assistant: /api/chat {message: ...} -> {reply: ..., tool_used: ...}"""
     try:
-        return _ai_chat_impl()
+        d = request.get_json(silent=True) or {}
+        user_msg = (d.get("message", "") or "").strip()
+        if not user_msg:
+            return jsonify({"reply": "请输入您的问题。", "tool_used": None}), 200
+        if len(user_msg) > 500:
+            return jsonify({"reply": "输入内容过长，请控制在500字以内。", "tool_used": None}), 200
+        result = _do_ai_chat(user_msg)
+        return jsonify(result), 200
     except Exception as e:
         print(f"【AI】Unhandled error in /api/chat: {e}")
         import traceback
@@ -584,21 +612,175 @@ def ai_chat():
         return jsonify({"reply": f"AI服务异常，请稍后重试。", "tool_used": None}), 200
 
 
-def _ai_chat_impl():
-    d = request.get_json(silent=True) or {}
-    user_msg = (d.get("message", "") or "").strip()
-    if not user_msg:
-        return jsonify({"reply": "请输入您的问题。", "tool_used": None}), 200
-    if len(user_msg) > 500:
-        return jsonify({"reply": "输入内容过长，请控制在500字以内。", "tool_used": None}), 200
+# ============ Voice Chat Endpoint ============
+VOICE_TIMEOUT = 20  # seconds per the spec
 
+@app.route('/api/voice_chat', methods=['POST'])
+def voice_chat():
+    """PTT voice input → ASR → AI chat → TTS → audio response.
+    Accepts multipart/form-data with an 'audio' file field (WAV, 16kHz mono)."""
+    t_start = time.time()
+
+    # ---- Check DashScope availability ----
+    if not _dashscope_available:
+        return jsonify({"error": "语音服务未配置，请设置DASHSCOPE_API_KEY环境变量"}), 503
+
+    # ---- Get uploaded audio ----
+    if 'audio' not in request.files:
+        return jsonify({"error": "未收到音频文件"}), 400
+
+    audio_file = request.files['audio']
+    if not audio_file.filename or audio_file.filename == '':
+        return jsonify({"error": "听不到声音，请重试"}), 400
+
+    # Save uploaded audio to temp file
+    tmp_suffix = os.path.splitext(audio_file.filename)[1] or '.wav'
+    tmp_path = os.path.join(tempfile.gettempdir(), f'imu_voice_{uuid.uuid4().hex}{tmp_suffix}')
+    audio_file.save(tmp_path)
+    file_size = os.path.getsize(tmp_path)
+
+    # Check for too-short / silent audio (less than ~0.5 seconds of 16kHz mono PCM = 16000 bytes)
+    if file_size < 4000:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        return jsonify({"error": "听不到声音，请重试"}), 400
+
+    print(f"【语音】收到音频: {file_size} bytes → {tmp_path}")
+
+    try:
+        # ---- Step 1: ASR (paraformer-realtime-v2) ----
+        if time.time() - t_start > VOICE_TIMEOUT:
+            return _voice_error(tmp_path, "服务超时，请重试")
+
+        asr_text = _do_asr(tmp_path)
+        if asr_text is None:
+            return _voice_error(tmp_path, "识别失败，请用键盘输入")
+
+        print(f"【语音】ASR 结果: \"{asr_text}\"")
+
+        if not asr_text.strip():
+            return _voice_error(tmp_path, "听不到声音，请重试")
+
+        # ---- Step 2: AI Chat (reuse existing logic) ----
+        if time.time() - t_start > VOICE_TIMEOUT:
+            return _voice_error(tmp_path, "服务超时，请重试")
+
+        chat_result = _do_ai_chat(asr_text.strip())
+        reply_text = chat_result.get("reply", "操作已完成。")
+
+        print(f"【语音】AI 回复: \"{reply_text}\"")
+
+        # ---- Step 3: TTS (cosyvoice-v2) ----
+        if time.time() - t_start > VOICE_TIMEOUT:
+            return _voice_error(tmp_path, "服务超时，请重试")
+
+        audio_filename = f"voice_{uuid.uuid4().hex[:12]}.wav"
+        audio_path = os.path.join(VOICE_DIR, audio_filename)
+
+        tts_ok = _do_tts(reply_text, audio_path)
+        if not tts_ok:
+            # TTS failed — still return text result without audio
+            return jsonify({
+                "text": asr_text.strip(),
+                "reply": reply_text,
+                "audio_url": None,
+                "_tts_error": True
+            })
+
+        audio_url = f"/static/voice/{audio_filename}"
+        elapsed = time.time() - t_start
+        print(f"【语音】完成 ({elapsed:.1f}s): text=\"{asr_text}\" reply=\"{reply_text[:50]}...\" audio={audio_filename}")
+
+        return jsonify({
+            "text": asr_text.strip(),
+            "reply": reply_text,
+            "audio_url": audio_url
+        })
+
+    except Exception as e:
+        print(f"【语音】未预期异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return _voice_error(tmp_path, "服务超时，请重试")
+
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+def _voice_error(tmp_path, msg):
+    """Clean up temp file and return error JSON."""
+    try:
+        os.unlink(tmp_path)
+    except Exception:
+        pass
+    return jsonify({"error": msg}), 200
+
+
+def _do_asr(audio_path):
+    """Run ASR on a WAV file, return recognized text or None on failure."""
+    try:
+        callback = RecognitionCallback()
+        recognition = Recognition(
+            model='paraformer-realtime-v2',
+            format='wav',
+            sample_rate=16000,
+            callback=callback
+        )
+        result = recognition.call(audio_path)
+        sentence = result.get_sentence()
+        if sentence:
+            if isinstance(sentence, list):
+                text = "".join(s.get("text", "") if isinstance(s, dict) else str(s) for s in sentence)
+            elif isinstance(sentence, dict):
+                text = sentence.get("text", "")
+            else:
+                text = str(sentence)
+            if text:
+                return text
+        return None
+    except Exception as e:
+        print(f"【语音】ASR 失败: {e}")
+        return None
+
+
+def _do_tts(text, output_path):
+    """Run TTS (cosyvoice-v2) and save audio to output_path. Returns True on success."""
+    try:
+        synthesizer = SpeechSynthesizer(
+            model='cosyvoice-v2',
+            voice='longxiaochun',
+        )
+        audio_data = synthesizer.call(text)
+        if audio_data and isinstance(audio_data, bytes) and len(audio_data) > 0:
+            with open(output_path, 'wb') as f:
+                f.write(audio_data)
+            print(f"【语音】TTS 保存: {output_path} ({len(audio_data)} bytes)")
+            return True
+        else:
+            print(f"【语音】TTS 返回空数据")
+            return False
+    except Exception as e:
+        print(f"【语音】TTS 失败: {e}")
+        return False
+
+
+def _do_ai_chat(user_msg: str):
+    """Core chat logic: keyword matching → tool execution → LLM fallback → reply.
+    Returns dict with keys 'reply', 'tool_used'.
+    Callable from both text chat and voice chat endpoints."""
     msg_lower = user_msg.lower()
     for kw in UNSUPPORTED_KEYWORDS:
         if kw.lower() in msg_lower:
             # Meta‑questions about sensor support
             if kw in {"支持哪些传感器", "支持什么传感器", "有哪些传感器", "有什么传感器"}:
-                return jsonify({"reply": "本系统仅支持以下功能：\n📷 摄像头拍照\n📡 WiFi状态查询\n🔄 IMU加速度计\n\n不支持温度/湿度/气压/PM2.5/声音/GPS/心率等传感器。",
-                                "tool_used": None}), 200
+                return {"reply": "本系统仅支持以下功能：\n📷 摄像头拍照\n📡 WiFi状态查询\n🔄 IMU加速度计\n\n不支持温度/湿度/气压/PM2.5/声音/GPS/心率等传感器。",
+                        "tool_used": None}
             # English keywords → Chinese display name
             display_map = {
                 "temperature": "温度", "humidity": "湿度", "pressure": "气压",
@@ -607,9 +789,8 @@ def _ai_chat_impl():
                 "pm2.5": "PM2.5", "gps": "GPS",
             }
             display = display_map.get(kw.lower(), kw)
-            return jsonify({
-                "reply": f"本系统不支持{display}传感器。当前仅支持：摄像头拍照、IMU加速度计、WiFi状态查询。",
-                "tool_used": None}), 200
+            return {"reply": f"本系统不支持{display}传感器。当前仅支持：摄像头拍照、IMU加速度计、WiFi状态查询。",
+                    "tool_used": None}
 
     # ---- Step 1: Keyword pre‑matching → call tool directly (saves 1 LLM round‑trip) ----
     matched_tool = None
@@ -633,7 +814,7 @@ def _ai_chat_impl():
             tool_result = {}
         final_reply = _format_tool_reply(matched_tool, tool_result)
         print(f"【AI】Keyword flow done (zero LLM)")
-        return jsonify({"reply": final_reply, "tool_used": matched_tool}), 200
+        return {"reply": final_reply, "tool_used": matched_tool}
 
     # ---- Step 2: Fallback — full Function Calling flow (LLM decides tool) ----
     system_prompt = (
@@ -654,7 +835,7 @@ def _ai_chat_impl():
 
     resp, elapsed1 = _call_llm_with_retry(messages, CHAT_TOOLS, retries=1)
     if "error" in resp:
-        return jsonify({"reply": _friendly_error(resp["error"]), "tool_used": None}), 200
+        return {"reply": _friendly_error(resp["error"]), "tool_used": None}
 
     choice = (resp.get("choices") or [{}])[0]
     msg = choice.get("message", {})
@@ -681,13 +862,13 @@ def _ai_chat_impl():
             choice2 = (resp2.get("choices") or [{}])[0]
             final_reply = choice2.get("message", {}).get("content", "") or "操作已完成。"
         print(f"【AI】FunctionCall flow done ({elapsed1:.1f}s + {elapsed2:.1f}s)")
-        return jsonify({"reply": final_reply, "tool_used": tool_used}), 200
+        return {"reply": final_reply, "tool_used": tool_used}
 
     content = msg.get("content", "")
     if not content:
         content = "抱歉，我没有理解您的问题。试试：'现在状态怎么样' 或 '帮我拍张照'。"
     print(f"【AI】Direct reply ({elapsed1:.1f}s)")
-    return jsonify({"reply": content, "tool_used": None}), 200
+    return {"reply": content, "tool_used": None}
 
 
 def _format_tool_reply(tool_name, result):
