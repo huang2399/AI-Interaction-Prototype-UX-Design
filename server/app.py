@@ -24,8 +24,18 @@ VOICE_DIR = os.path.join(os.path.dirname(__file__), 'static', 'voice')
 os.makedirs(VOICE_DIR, exist_ok=True)
 
 app = Flask(__name__)
-UPLOAD_FOLDER = r'D:\esp_project\imu_web_demo\photos'
-LEDGER_FILE = r'D:\esp_project\imu_web_demo\server\photos_ledger.json'
+# Photo storage is resolved relative to this file so the app keeps working when
+# the project folder is moved/copied (these were absolute paths of one machine).
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))      # <repo>/server
+_PROJECT_DIR = os.path.dirname(_BASE_DIR)                   # <repo>
+_LEGACY_PHOTO_DIR = r'D:\esp_project\imu_web_demo\photos'
+_LEGACY_LEDGER_FILE = r'D:\esp_project\imu_web_demo\server\photos_ledger.json'
+UPLOAD_FOLDER = os.path.join(_PROJECT_DIR, 'photos')
+if not os.path.isdir(UPLOAD_FOLDER) and os.path.isdir(_LEGACY_PHOTO_DIR):
+    UPLOAD_FOLDER = _LEGACY_PHOTO_DIR                       # keep serving old data
+LEDGER_FILE = os.path.join(_BASE_DIR, 'photos_ledger.json')
+if not os.path.exists(LEDGER_FILE) and os.path.exists(_LEGACY_LEDGER_FILE):
+    LEDGER_FILE = _LEGACY_LEDGER_FILE
 MIN_PHOTO_SIZE = 500  # reject images smaller than 500 bytes (corrupt/empty)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -56,6 +66,97 @@ def touch_device():
     with lock:
         device_info["ip"] = request.remote_addr
         device_info["last_seen"] = time.time()
+
+# ---------------- Request isolation & cancellation (week 6) ----------------
+# Only ONE logical request (voice or text) may publish a result. Every new
+# request adopts a fresh id and invalidates all older ids, so a slow
+# ASR → GLM → TTS round-trip can never overwrite a newer answer nor fire a
+# hardware action after the user already started/stopped another task.
+current_request_id = None
+_request_lock = threading.Lock()
+_cancelled_request_ids = set()      # ids explicitly stopped by the user
+_request_events = {}                # request_id -> threading.Event (cooperative abort)
+
+
+def _mint_request_id():
+    return f"req_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+
+def begin_request(client_id=None):
+    """Adopt `client_id` (minted when absent) as THE active request id and
+    invalidate every older one. Returns the request id in use."""
+    global current_request_id
+    with _request_lock:
+        old = current_request_id
+        rid = (client_id or "").strip() or _mint_request_id()
+        if old and old != rid:
+            ev = _request_events.get(old)
+            if ev:
+                ev.set()                        # let the older task bail out fast
+            _cancelled_request_ids.add(old)     # its late result must be dropped
+        current_request_id = rid
+        _request_events[rid] = threading.Event()
+        if len(_request_events) > 64:           # keep the registry bounded
+            stale = [k for k in list(_request_events.keys()) if k != rid][:32]
+            for k in stale:
+                _request_events.pop(k, None)
+            _cancelled_request_ids.intersection_update(_request_events.keys())
+    print(f"[TASK] request_id={rid} 已受理（作废旧任务: {old or '-'}）")
+    return rid
+
+
+def is_current_request(request_id):
+    """True while `request_id` is still the active, non-cancelled request."""
+    if not request_id:
+        return True     # callers without an id (legacy/test) are never blocked
+    with _request_lock:
+        return (request_id == current_request_id
+                and request_id not in _cancelled_request_ids)
+
+
+def request_abort_event(request_id):
+    with _request_lock:
+        return _request_events.get(request_id)
+
+
+def cancel_request(request_id=None):
+    """Invalidate `request_id` (default: the active one) so its result is dropped."""
+    global current_request_id
+    with _request_lock:
+        target = (request_id or current_request_id)
+        if target:
+            _cancelled_request_ids.add(target)
+            ev = _request_events.get(target)
+            if ev:
+                ev.set()
+            if target == current_request_id:
+                current_request_id = None
+        return target
+
+
+@app.route('/api/cancel', methods=['POST'])
+def cancel_task():
+    """🛑 Stop button: invalidate the in-flight request (late results are
+    discarded by the ASR/GLM/TTS pipeline) and drop a not-yet-polled board task."""
+    d = request.get_json(silent=True) or {}
+    rid = (d.get("request_id") or "").strip() or None
+    cancelled = cancel_request(rid)
+
+    board_cancelled = False
+    with lock:
+        if task_state["status"] in ("PENDING", "ACCEPTED"):
+            # PENDING = the board has not polled it yet -> recall it before it fires
+            task_state["status"] = "IDLE"
+            task_state["task_id"] = None
+            task_state["ack_needed"] = False
+            task_state["last_update"] = time.time()
+            board_cancelled = True
+
+    print(f"[TASK] 用户按下停止: request_id={cancelled or '-'}, "
+          f"板端挂起任务={'已撤销' if board_cancelled else '无'}")
+    return jsonify({"status": "ok", "request_id": cancelled,
+                    "board_cancelled": board_cancelled}), 200
+
 
 # ---------------- IMU data source ----------------
 imu_lock = threading.Lock()
@@ -433,6 +534,20 @@ CHAT_TOOLS = [
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_clarify",
+            "description": "当用户指令含糊不清、无法确定是要拍照还是查询设备状态时调用（例如\"帮我打张照\"这类被听错/说得不清楚的话）。调用后系统会引导用户重新说明意图：没听清，你是想拍照还是查状态？不确定意图时必须调用本工具，不要猜。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "可选的追问内容，省略时使用默认引导语"}
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 UNSUPPORTED_KEYWORDS = {
@@ -454,6 +569,29 @@ PHOTO_KEYWORDS = {"拍照", "拍张", "拍张照", "拍个照", "拍一张", "�
                   "采集", "照相", "相机", "拍摄", "抓拍", "capture",
                   "照片", "帮我拍", "帮拍", "来一张", "来张",
                   "张照"}
+
+# ---- week6: clarification of unclear / garbled intents ----
+# Exact wording required by the spec: guide the user instead of guessing.
+CLARIFY_REPLY = "没听清，你是想拍照还是查状态？"
+
+# Garbled action wording (e.g. ASR turns "拍张照" into "打张照"). Checked BEFORE
+# the tool keywords so a broken sentence is clarified instead of guessed.
+CLARIFY_GARBLED = ("打张照", "打张照片", "打个照", "打照片", "打照", "打张",
+                   "弄张照", "找张照", "招张照", "拍个相", "拍相")
+
+# Vague filler that asks for "something" without naming a supported capability.
+# Checked AFTER the tool keywords, so "帮我看看状态" still matches get_device_status.
+CLARIFY_VAGUE = ("帮我弄", "帮我搞", "帮我整", "帮我做", "弄一下", "搞一下", "整一下",
+                 "看一下", "看看", "瞅瞅", "瞧瞧", "来一下", "那个东西", "这玩意儿")
+
+
+def _match_clarify_keyword(user_msg, words):
+    """Return the first vague/garbled keyword present in the message, else None."""
+    for w in words:
+        if w in user_msg:
+            return w
+    return None
+
 
 # ---- account-level rate limiter ----
 _last_llm_call_time = 0.0
@@ -522,8 +660,17 @@ def _call_llm(messages, tools=None):
         print(f"【AI】LLM request failed: {e}")
         return {"error": str(e)}
 
-def _execute_tool(func_name):
-    """Execute a function call locally and return JSON result string."""
+def _cancelled_tool_result():
+    """Tool result used when the owning request was superseded or stopped."""
+    return json.dumps({"success": False, "reason": "任务已取消",
+                       "detail": "用户已停止当前任务，拍照指令未执行或已被撤销。"},
+                      ensure_ascii=False)
+
+
+def _execute_tool(func_name, request_id=None):
+    """Execute a function call locally and return JSON result string.
+    `request_id` makes long-running tools abortable: a superseded/cancelled
+    request never fires a hardware action and stops polling immediately."""
     if func_name == "get_device_status":
         check_timeout()
         with lock:
@@ -546,6 +693,9 @@ def _execute_tool(func_name):
         return json.dumps(result, ensure_ascii=False)
 
     elif func_name == "take_photo":
+        # never fire a hardware action for a request that was already dropped
+        if not is_current_request(request_id):
+            return _cancelled_tool_result()
         with lock:
             ip = device_info["ip"]
             last_seen = device_info["last_seen"]
@@ -563,12 +713,18 @@ def _execute_tool(func_name):
             return json.dumps({"success": False, "reason": "任务创建失败",
                 "detail": "服务器内部错误，无法创建拍照任务。"}, ensure_ascii=False)
 
-        # Poll until COMPLETED/TIMEOUT/OFFLINE (max 35s)
+        # Poll until COMPLETED/TIMEOUT/OFFLINE/CANCELLED (max 35s)
         deadline = time.time() + 35
         result_status = None
         result_photo = None
+        abort_evt = request_abort_event(request_id)
         while time.time() < deadline:
-            time.sleep(1.0)
+            if abort_evt is not None:
+                abort_evt.wait(1.0)      # wakes up immediately when 🛑 is pressed
+            else:
+                time.sleep(1.0)
+            if not is_current_request(request_id):
+                result_status = "CANCELLED"; break
             check_timeout()
             with lock:
                 st = task_state["status"]
@@ -586,16 +742,25 @@ def _execute_tool(func_name):
         elif result_status == "TIMEOUT":
             return json.dumps({"success": False, "reason": "任务超时",
                 "detail": "拍照指令已下发，但设备在30秒内未完成采集。"}, ensure_ascii=False)
+        elif result_status == "CANCELLED":
+            return _cancelled_tool_result()
         else:
             return json.dumps({"success": False, "reason": "设备未响应",
                 "detail": "设备在接受任务后失去响应。"}, ensure_ascii=False)
+
+    elif func_name == "ask_clarify":
+        return json.dumps({"success": False, "reason": "意图不明确",
+            "detail": "指令含糊，无法确定是要拍照还是查询设备状态。"}, ensure_ascii=False)
 
     return json.dumps({"error": f"Unknown tool: {func_name}"})
 
 
 @app.route('/api/chat', methods=['POST'])
 def ai_chat():
-    """Natural-language AI assistant: /api/chat {message: ...} -> {reply: ..., tool_used: ...}"""
+    """Natural-language AI assistant.
+    POST /api/chat {message: str, request_id: str|None}
+      -> {reply, tool_used, request_id};  {cancelled: True} when a newer request
+         or the 🛑 button invalidated this one (late result is discarded)."""
     try:
         d = request.get_json(silent=True) or {}
         user_msg = (d.get("message", "") or "").strip()
@@ -603,7 +768,20 @@ def ai_chat():
             return jsonify({"reply": "请输入您的问题。", "tool_used": None}), 200
         if len(user_msg) > 500:
             return jsonify({"reply": "输入内容过长，请控制在500字以内。", "tool_used": None}), 200
-        result = _do_ai_chat(user_msg)
+
+        # week6: one live request id per task — a new request invalidates all older ids
+        request_id = begin_request(d.get("request_id"))
+        t0 = time.time()
+        result = _do_ai_chat(user_msg, request_id)
+        glm_elapsed = time.time() - t0
+
+        if result.get("cancelled"):
+            _task_log(request_id, 0.0, glm_elapsed, 0.0, "结果已作废（用户已停止/发起新任务）")
+            return jsonify({"cancelled": True, "request_id": request_id,
+                            "reply": "", "tool_used": None}), 200
+
+        _task_log(request_id, 0.0, glm_elapsed, 0.0, f"source=text tool={result.get('tool_used') or 'none'}")
+        result["request_id"] = request_id
         return jsonify(result), 200
     except Exception as e:
         print(f"【AI】Unhandled error in /api/chat: {e}")
@@ -617,20 +795,28 @@ VOICE_TIMEOUT = 20  # seconds per the spec
 
 @app.route('/api/voice_chat', methods=['POST'])
 def voice_chat():
-    """PTT voice input → ASR → AI chat → TTS → audio response.
-    Accepts multipart/form-data with an 'audio' file field (WAV, 16kHz mono)."""
+    """PTT / uploaded-audio voice input → ASR → AI chat → TTS → audio response.
+    Accepts multipart/form-data with an 'audio' file field (WAV, 16kHz mono)
+    plus an optional 'request_id' field used by 🛑 /api/cancel (week6)."""
     t_start = time.time()
+
+    # week6: this request adopts a fresh id — every older id becomes invalid
+    request_id = begin_request(request.form.get('request_id'))
+    asr_elapsed = glm_elapsed = tts_elapsed = 0.0
 
     # ---- Check DashScope availability ----
     if not _dashscope_available:
+        _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed, "DashScope 未配置")
         return jsonify({"error": "语音服务未配置，请设置DASHSCOPE_API_KEY环境变量"}), 503
 
     # ---- Get uploaded audio ----
     if 'audio' not in request.files:
+        _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed, "缺少 audio 字段")
         return jsonify({"error": "未收到音频文件"}), 400
 
     audio_file = request.files['audio']
     if not audio_file.filename or audio_file.filename == '':
+        _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed, "音频文件名为空")
         return jsonify({"error": "听不到声音，请重试"}), 400
 
     # Save uploaded audio to temp file
@@ -645,6 +831,7 @@ def voice_chat():
             os.unlink(tmp_path)
         except Exception:
             pass
+        _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed, "音频过短(疑似静音)")
         return jsonify({"error": "听不到声音，请重试"}), 400
 
     print(f"【语音】收到音频: {file_size} bytes → {tmp_path}")
@@ -652,57 +839,90 @@ def voice_chat():
     try:
         # ---- Step 1: ASR (paraformer-realtime-v2) ----
         if time.time() - t_start > VOICE_TIMEOUT:
+            _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed, "服务超时(ASR前)")
             return _voice_error(tmp_path, "服务超时，请重试")
 
+        t0 = time.time()
         asr_text = _do_asr(tmp_path)
+        asr_elapsed = time.time() - t0
         if asr_text is None:
+            _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed, "ASR 失败")
             return _voice_error(tmp_path, "识别失败，请用键盘输入")
 
         print(f"【语音】ASR 结果: \"{asr_text}\"")
 
         if not asr_text.strip():
+            _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed, "ASR 结果为空")
             return _voice_error(tmp_path, "听不到声音，请重试")
+
+        # 🛑 may have been pressed while ASR was running → drop the stale result
+        if not is_current_request(request_id):
+            return _voice_cancelled(request_id, asr_elapsed, glm_elapsed, tts_elapsed, tmp_path)
 
         # ---- Step 2: AI Chat (reuse existing logic) ----
         if time.time() - t_start > VOICE_TIMEOUT:
+            _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed, "服务超时(GLM前)")
             return _voice_error(tmp_path, "服务超时，请重试")
 
-        chat_result = _do_ai_chat(asr_text.strip())
-        reply_text = chat_result.get("reply", "操作已完成。")
+        stripped = asr_text.strip()
+        if len(stripped) < 2:
+            # too short to be a real command → low confidence → ask for clarification
+            reply_text = CLARIFY_REPLY
+            print(f"【语音】低置信度 ASR（{len(stripped)} 字）→ 引导用户澄清")
+        else:
+            t0 = time.time()
+            chat_result = _do_ai_chat(stripped, request_id)
+            glm_elapsed = time.time() - t0
+            if chat_result.get("cancelled"):
+                return _voice_cancelled(request_id, asr_elapsed, glm_elapsed, tts_elapsed, tmp_path)
+            reply_text = chat_result.get("reply", "操作已完成。")
 
         print(f"【语音】AI 回复: \"{reply_text}\"")
 
         # ---- Step 3: TTS (cosyvoice-v2) ----
         if time.time() - t_start > VOICE_TIMEOUT:
+            _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed, "服务超时(TTS前)")
             return _voice_error(tmp_path, "服务超时，请重试")
 
         audio_filename = f"voice_{uuid.uuid4().hex[:12]}.wav"
         audio_path = os.path.join(VOICE_DIR, audio_filename)
 
+        t0 = time.time()
         tts_ok = _do_tts(reply_text, audio_path)
+        tts_elapsed = time.time() - t0
+
+        # last late-result gate: the user may have stopped while TTS was running
+        if not is_current_request(request_id):
+            return _voice_cancelled(request_id, asr_elapsed, glm_elapsed, tts_elapsed,
+                                    tmp_path, audio_path)
+
         if not tts_ok:
             # TTS failed — still return text result without audio
+            _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed, "TTS 失败，仅返回文字")
             return jsonify({
-                "text": asr_text.strip(),
+                "text": stripped,
                 "reply": reply_text,
                 "audio_url": None,
+                "request_id": request_id,
                 "_tts_error": True
             })
 
         audio_url = f"/static/voice/{audio_filename}"
-        elapsed = time.time() - t_start
-        print(f"【语音】完成 ({elapsed:.1f}s): text=\"{asr_text}\" reply=\"{reply_text[:50]}...\" audio={audio_filename}")
+        _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed,
+                  f"text=\"{stripped[:30]}\" audio={audio_filename}")
 
         return jsonify({
-            "text": asr_text.strip(),
+            "text": stripped,
             "reply": reply_text,
-            "audio_url": audio_url
+            "audio_url": audio_url,
+            "request_id": request_id
         })
 
     except Exception as e:
         print(f"【语音】未预期异常: {e}")
         import traceback
         traceback.print_exc()
+        _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed, "未预期异常")
         return _voice_error(tmp_path, "服务超时，请重试")
 
     finally:
@@ -720,6 +940,32 @@ def _voice_error(tmp_path, msg):
     except Exception:
         pass
     return jsonify({"error": msg}), 200
+
+
+def _task_log(request_id, asr, glm, tts, note=""):
+    """week6 日志与测速: [TASK] request_id=xxx, 耗时: ASR=1.2s, GLM=2.1s, TTS=1.5s"""
+    line = (f"[TASK] request_id={request_id}, 耗时: "
+            f"ASR={asr:.1f}s, GLM={glm:.1f}s, TTS={tts:.1f}s")
+    if note:
+        line += f" | {note}"
+    print(line)
+
+
+def _voice_cancelled(request_id, asr_elapsed, glm_elapsed, tts_elapsed,
+                     tmp_path=None, audio_path=None):
+    """Late-result isolation: 🛑 invalidated this request while it was running,
+    so the result is discarded — it is never handed back to the frontend and no
+    TTS audio is kept behind."""
+    for p in (audio_path, tmp_path):
+        if p:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+    _task_log(request_id, asr_elapsed, glm_elapsed, tts_elapsed,
+              "结果已作废（用户已停止/发起新任务）")
+    return jsonify({"cancelled": True, "request_id": request_id,
+                    "text": "", "reply": "", "audio_url": None}), 200
 
 
 def _do_asr(audio_path):
@@ -749,13 +995,27 @@ def _do_asr(audio_path):
         return None
 
 
+# ---- TTS (week6 fix) ----
+# cosyvoice-v2 只支持其音色表中的 *_v2 音色，旧代码里的 'longxiaochun' 是 v1 时期的音色名，
+# 不在 v2 音色表中（音色与模型不匹配），会直接导致 TTS 失败。
+# 这里优先按“服务端默认音色”初始化（不传 voice）；若当前 SDK 要求 voice 必填
+# （dashscope 1.27.7 中 voice 是无默认值的必填位置参数），则回退到
+# cosyvoice-v2 自带的默认音色 longxiaochun_v2（龙小淳，知性积极女）。
+COSYVOICE_V2_DEFAULT_VOICE = 'longxiaochun_v2'
+
+
 def _do_tts(text, output_path):
     """Run TTS (cosyvoice-v2) and save audio to output_path. Returns True on success."""
     try:
-        synthesizer = SpeechSynthesizer(
-            model='cosyvoice-v2',
-            voice='longxiaochun',
-        )
+        # 优先不传 voice，交由服务端使用默认最兼容音色
+        try:
+            synthesizer = SpeechSynthesizer(model='cosyvoice-v2')
+        except TypeError:
+            # dashscope 1.27.7: SpeechSynthesizer.__init__() missing 1
+            # required positional argument: 'voice'
+            # → 该版本无法省略 voice，退回 cosyvoice-v2 的默认音色
+            synthesizer = SpeechSynthesizer(model='cosyvoice-v2',
+                                            voice=COSYVOICE_V2_DEFAULT_VOICE)
         audio_data = synthesizer.call(text)
         if audio_data and isinstance(audio_data, bytes) and len(audio_data) > 0:
             with open(output_path, 'wb') as f:
@@ -770,10 +1030,22 @@ def _do_tts(text, output_path):
         return False
 
 
-def _do_ai_chat(user_msg: str):
-    """Core chat logic: keyword matching → tool execution → LLM fallback → reply.
-    Returns dict with keys 'reply', 'tool_used'.
+def _do_ai_chat(user_msg: str, request_id=None):
+    """Core chat logic: clarification → keyword matching → tool execution →
+    LLM fallback → reply.
+    Returns dict with keys 'reply', 'tool_used'; when a newer request has
+    superseded this one it returns {'cancelled': True} instead of a late answer.
+    `request_id` (week6) makes the whole flow abortable: a dropped request never
+    fires a board action and never publishes its result to the frontend.
     Callable from both text chat and voice chat endpoints."""
+    def _stale():
+        """Late-result isolation: superseded or cancelled by the user."""
+        return not is_current_request(request_id)
+
+    def _stale_result():
+        print(f"[TASK] request_id={request_id} 结果已作废（用户已停止或发起了新任务），丢弃不返回")
+        return {"reply": "", "tool_used": None, "cancelled": True}
+
     msg_lower = user_msg.lower()
     for kw in UNSUPPORTED_KEYWORDS:
         if kw.lower() in msg_lower:
@@ -793,6 +1065,12 @@ def _do_ai_chat(user_msg: str):
                     "tool_used": None}
 
     # ---- Step 1: Keyword pre‑matching → call tool directly (saves 1 LLM round‑trip) ----
+    # ---- Step 0 (week6): unclear / garbled intent must be clarified, not guessed ----
+    garbled = _match_clarify_keyword(user_msg, CLARIFY_GARBLED)
+    if garbled:
+        print(f"[TASK] request_id={request_id} 意图不明确（命中 '{garbled}'）→ 引导用户澄清")
+        return {"reply": CLARIFY_REPLY, "tool_used": None}
+
     matched_tool = None
     # Check status keywords FIRST, then photo (status keywords like "最新照片" contain "照片")
     for kw in STATUS_KEYWORDS:
@@ -805,13 +1083,24 @@ def _do_ai_chat(user_msg: str):
                 matched_tool = "take_photo"
                 break
 
+    # ---- Step 1b (week6): nothing matched a clear tool → ask the user ----
+    if not matched_tool:
+        vague = _match_clarify_keyword(user_msg, CLARIFY_VAGUE)
+        if vague:
+            print(f"[TASK] request_id={request_id} 未匹配到明确工具（命中 '{vague}'）→ 引导用户澄清")
+            return {"reply": CLARIFY_REPLY, "tool_used": None}
+
     if matched_tool:
+        if _stale():
+            return _stale_result()
         print(f"【AI】Keyword matched: '{matched_tool}'")
-        tool_result_str = _execute_tool(matched_tool)
+        tool_result_str = _execute_tool(matched_tool, request_id)
         try:
             tool_result = json.loads(tool_result_str)
         except json.JSONDecodeError:
             tool_result = {}
+        if _stale():
+            return _stale_result()
         final_reply = _format_tool_reply(matched_tool, tool_result)
         print(f"【AI】Keyword flow done (zero LLM)")
         return {"reply": final_reply, "tool_used": matched_tool}
@@ -826,6 +1115,7 @@ def _do_ai_chat(user_msg: str):
         "\n4. 设备离线或任务超时，必须如实说\"设备未响应\"或\"任务超时\""
         "\n5. 不允许猜测设备状态，一切以工具返回为准"
         "\n6. 用中文简洁回复"
+        "\n7. 如果用户的指令含糊不清、无法确定是要拍照还是查询状态，必须调用 ask_clarify 工具，绝对不要猜测意图"
     )
 
     messages = [
@@ -837,25 +1127,38 @@ def _do_ai_chat(user_msg: str):
     if "error" in resp:
         return {"reply": _friendly_error(resp["error"]), "tool_used": None}
 
+    if _stale():
+        return _stale_result()
+
     choice = (resp.get("choices") or [{}])[0]
     msg = choice.get("message", {})
     tool_calls = msg.get("tool_calls") or []
 
     if tool_calls:
+        # week6: GLM reported a low-confidence intent → guide the user instead
+        if any(tc.get("function", {}).get("name", "") == "ask_clarify" for tc in tool_calls):
+            print(f"[TASK] request_id={request_id} GLM 置信度低 → 引导用户澄清")
+            return {"reply": CLARIFY_REPLY, "tool_used": "ask_clarify"}
+        if _stale():
+            return _stale_result()
         tool_results = []
         tool_used = None
         for tc in tool_calls:
             func_name = tc.get("function", {}).get("name", "")
             if not func_name:
                 continue
+            if _stale():
+                return _stale_result()
             print(f"【AI】Tool call: {func_name}")
             tool_used = func_name
-            result_str = _execute_tool(func_name)
+            result_str = _execute_tool(func_name, request_id)
             tool_results.append({"tool_call_id": tc.get("id", "call_1"), "role": "tool", "content": result_str})
 
         messages.append(msg)
         messages.extend(tool_results)
         resp2, elapsed2 = _call_llm_with_retry(messages, retries=1)
+        if _stale():
+            return _stale_result()
         if "error" in resp2:
             final_reply = f"工具已执行，但AI回复生成失败：{_friendly_error(resp2['error'])}"
         else:
@@ -866,7 +1169,10 @@ def _do_ai_chat(user_msg: str):
 
     content = msg.get("content", "")
     if not content:
-        content = "抱歉，我没有理解您的问题。试试：'现在状态怎么样' 或 '帮我拍张照'。"
+        # week6: no clear tool matched and no usable answer → guide the user
+        content = CLARIFY_REPLY
+    if _stale():
+        return _stale_result()
     print(f"【AI】Direct reply ({elapsed1:.1f}s)")
     return {"reply": content, "tool_used": None}
 
@@ -874,6 +1180,8 @@ def _do_ai_chat(user_msg: str):
 def _format_tool_reply(tool_name, result):
     """Generate a canned Chinese reply from tool result — zero LLM cost."""
     if tool_name == "take_photo":
+        if "取消" in str(result.get("reason", "")) or "CANCELLED" in str(result.get("reason", "")):
+            return "🛑 任务已停止。"
         if result.get("success"):
             return "已为您拍摄，图片已上传。刷新页面即可查看。"
         reason = result.get("reason", "")

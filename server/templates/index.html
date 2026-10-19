@@ -126,6 +126,12 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
 .voice-play-btn:hover{filter:brightness(1.3);}
 .voice-dl-link{font-size:12px; color:var(--cyan); text-decoration:none; border-bottom:1px dashed rgba(34,211,238,.5);}
 .voice-dl-link:hover{color:#fff;}
+/* ---- Week6: 🛑 task stop ---- */
+.voice-stop-row{display:flex; align-items:center; gap:10px; margin-top:8px;}
+.voice-stop-btn{flex:0 0 auto; padding:10px 16px; font-size:13px; font-weight:800; letter-spacing:.5px; border-radius:10px; cursor:pointer; color:var(--red); background:rgba(248,113,113,.12); border:2px solid rgba(248,113,113,.4); transition:all .15s; white-space:nowrap;}
+.voice-stop-btn:hover{background:rgba(248,113,113,.2); border-color:rgba(248,113,113,.75); box-shadow:0 0 16px rgba(248,113,113,.35);}
+.voice-stop-btn:active{transform:scale(.97);}
+.voice-stop-note{color:var(--dim2); font-size:11px; line-height:1.5;}
 </style>
 </head>
 <body>
@@ -229,6 +235,10 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
         <input type="file" id="voice_file_input" accept="audio/*,.wav,.mp3,.m4a,.webm,.ogg,.aac"
                style="display:none" onchange="voiceFileSelected(event)">
         <button class="voice-upload-btn" id="voice_upload_btn" onclick="voiceUploadClick()">📁 上传音频文件</button>
+      </div>
+      <div class="voice-stop-row">
+        <button class="voice-stop-btn" id="voice_stop_btn" onclick="stopTask()">🛑 停止任务</button>
+        <span class="voice-stop-note">立即停止播报 / 录音，并通过 request_id 取消挂起的任务</span>
       </div>
       <div class="voice-playback-row" id="voice_playback_row">
         <button class="voice-play-btn" onclick="voicePlayClick()">▶️ 播放</button>
@@ -427,6 +437,95 @@ initChart(); updateImu(); refresh();
 setInterval(updateImu, 1000);
 setInterval(refresh, 2000);
 
+// ============ Week6: request-id isolation, clarification & stop ============
+let _currentRequestId = null;    // id of the live task (text or voice)
+let _currentAbort = null;        // AbortController of the in-flight fetch
+let _voiceSpeaking = false;      // TTS audio is currently playing
+
+function newRequestId(){
+  return 'web_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+}
+// Every new task adopts a fresh id and invalidates all older ones, so a late
+// ASR/GLM/TTS result can never overwrite a newer answer (front + server side).
+function beginTask(){
+  if (_currentAbort){ try{ _currentAbort.abort(); }catch(e){} }
+  const ctrl = new AbortController();
+  _currentAbort = ctrl;
+  _currentRequestId = newRequestId();
+  return { id: _currentRequestId, ctrl: ctrl, signal: ctrl.signal };
+}
+function isTaskCurrent(id){ return !!id && id === _currentRequestId; }
+function endTask(id){
+  if (isTaskCurrent(id)){ _currentRequestId = null; _currentAbort = null; }
+}
+// Status row only (never fights with an ongoing TTS playback)
+function voiceUiIdle(text, cls){
+  const vs = $('voice_status');
+  if (!vs) return;
+  vs.className = 'voice-status-row' + (cls ? ' ' + cls : '');
+  vs.innerText = text || '💤 IDLE — 空闲中';
+}
+// Full reset: status row + buttons + 任务仪表盘 re-sync (状态栏回到 IDLE)
+function resetTaskUi(text, cls){
+  _voiceProcessing = false;
+  _voiceSpeaking = false;
+  $('chat_typing').style.display = 'none';
+  $('chat_typing').innerText = '⏳ AI 思考中...';
+  voiceUiIdle(text || '💤 IDLE — 空闲中', cls);
+  const ptt = $('voice_ptt_btn');
+  if (ptt){ ptt.className = 'voice-ptt-btn idle'; ptt.innerHTML = '🎤 按住说话 (PTT)'; ptt.style.pointerEvents = ''; }
+  const ub = $('voice_upload_btn');
+  if (ub){ ub.disabled = false; ub.innerText = '📁 上传音频文件'; }
+  const cb = $('chat_btn');
+  if (cb) cb.disabled = false;
+  refresh();   // the badge must show IDLE again
+}
+
+// 🛑 Stop task: pause TTS → stop recording → abort fetch → /api/cancel
+function stopTask(){
+  const rid = _currentRequestId;
+
+  // 1) stop TTS playback immediately
+  if (window._voiceAudio){
+    try{ window._voiceAudio.pause(); window._voiceAudio.currentTime = 0; }catch(e){}
+    window._voiceAudio = null;
+  }
+
+  // 2) stop an ongoing recording (never upload the aborted take)
+  const wasRecording = _voiceRecording;
+  if (_voiceRecorder && _voiceRecorder.state !== 'inactive'){
+    _voiceRecorder.onstop = null;          // discard this take
+    try{ _voiceRecorder.stop(); }catch(e){}
+  }
+  if (_voiceMediaStream){
+    try{ _voiceMediaStream.getTracks().forEach(t => t.stop()); }catch(e){}
+    _voiceMediaStream = null;
+  }
+  _voiceRecorder = null;
+  _voiceChunks = [];
+  _voiceRecording = false;
+
+  // 3) drop the in-flight request locally, then cancel it on the server
+  if (_currentAbort){ try{ _currentAbort.abort(); }catch(e){} }
+  _currentAbort = null;
+  _currentRequestId = null;   // any late result for `rid` is now stale
+
+  chatAdd('🛑 已停止当前任务。', 'ai');
+  resetTaskUi('🛑 已停止 · 状态已回到 IDLE');
+
+  fetch('/api/cancel', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({request_id: rid}),
+    keepalive: true
+  }).then(r => r.json()).then(d => {
+    showToast('ok', d && d.board_cancelled ? '任务已停止（挂起指令已撤销）' : '任务已停止');
+  }).catch(() => showToast('err', '停止请求发送失败，请重试'));
+
+  console.log('[TASK] stop pressed, request_id=' + (rid || '(none)') +
+              ', wasRecording=' + wasRecording);
+}
+
 // ---- AI Chat ----
 function chatAdd(text, role, tool){
   const d=document.createElement('div');
@@ -443,16 +542,22 @@ function chatSend(){
   $('chat_typing').style.display='block';
   $('chat_tool_pill').style.display='none';
 
-  const controller = new AbortController();
+  const task = beginTask();                 // week6: new id invalidates older tasks
+  const controller = task.ctrl;
   const timeoutId = setTimeout(() => controller.abort(), 60000);
 
   fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({message:txt}), signal: controller.signal})
+    body:JSON.stringify({message:txt, request_id: task.id}), signal: controller.signal})
     .then(r=>r.json()).then(d=>{
       clearTimeout(timeoutId);
       $('chat_typing').style.display='none';
+      // week6: late-result isolation — a newer task or 🛑已经作废了本次请求
+      if (d.cancelled || !isTaskCurrent(task.id)){
+        if (d.cancelled) voiceUiIdle('🛑 已停止 · 状态已回到 IDLE');
+        return;
+      }
       if (d.tool_used){
-        const map={get_device_status:'查询状态',take_photo:'触发拍照'};
+        const map={get_device_status:'查询状态',take_photo:'触发拍照',ask_clarify:'请用户澄清'};
         $('chat_tool_pill').innerText='🔧 '+(map[d.tool_used]||d.tool_used);
         $('chat_tool_pill').style.display='inline-block';
       }
@@ -476,12 +581,18 @@ function chatSend(){
     }).catch(e=>{
       clearTimeout(timeoutId);
       $('chat_typing').style.display='none';
+      if (!isTaskCurrent(task.id)) return;   // superseded/stopped → stay silent
       if (e.name === 'AbortError') {
         chatAdd('⏰ AI 响应超时（60秒），请重试。', 'ai');
       } else {
         chatAdd('网络错误，请检查服务器连接。', 'ai');
       }
-    }).finally(()=>{ btn.disabled=false; inp.focus(); });
+    }).finally(()=>{
+      endTask(task.id);
+      btn.disabled=false; inp.focus();
+      // week6: 回到空闲 —— status row must settle back to IDLE
+      if (!_voiceProcessing && !_voiceSpeaking) voiceUiIdle('💤 IDLE — 空闲中');
+    });
 }
 
 // ============ Voice PTT (Push-To-Talk) ============
@@ -584,10 +695,12 @@ async function voiceSendBlob(blob, srcName, done){
   $('voice_status').innerText = '🧠 任务处理中...';
   $('chat_typing').innerText = '🧠 任务处理中...';
 
+  const task = beginTask();          // week6: fresh request_id for this voice task
   const formData = new FormData();
   formData.append('audio', wavBlob, srcName || 'recording.wav');
+  formData.append('request_id', task.id);
 
-  const controller = new AbortController();
+  const controller = task.ctrl;
   const timeoutId = setTimeout(() => controller.abort(), 30000);
 
   try {
@@ -599,11 +712,24 @@ async function voiceSendBlob(blob, srcName, done){
 
     $('chat_typing').style.display = 'none';
 
+    // week6: late-result isolation — 🛑 or a newer task already invalidated this one
+    if (data.cancelled || !isTaskCurrent(task.id)){
+      if (data.cancelled){
+        chatAdd('🛑 已停止当前任务。', 'ai');
+        resetTaskUi('🛑 已停止 · 状态已回到 IDLE');
+      }
+      _voiceProcessing = false;
+      endTask(task.id);
+      if (done) done();
+      return;
+    }
+
     if (data.error){
       chatAdd(data.error, 'ai');
       $('voice_status').className = 'voice-status-row error';
       $('voice_status').innerText = '⚠️ ' + data.error;
       _voiceProcessing = false;
+      endTask(task.id);
       if (done) done();
       return;
     }
@@ -617,7 +743,7 @@ async function voiceSendBlob(blob, srcName, done){
     } else {
       $('voice_status').className = 'voice-status-row';
       $('voice_status').innerText = data._tts_error
-        ? '⚠️ 语音合成失败，已显示文字回复' : '✅ 语音交互完成';
+        ? '⚠️ 语音合成失败，已显示文字回复 · IDLE' : '✅ 语音交互完成 · IDLE';
     }
 
     if (data.reply && data.reply.indexOf('已为您拍摄') >= 0){ refresh(); }
@@ -625,17 +751,24 @@ async function voiceSendBlob(blob, srcName, done){
   } catch(fetchErr){
     clearTimeout(timeoutId);
     $('chat_typing').style.display = 'none';
+    // stopped / superseded → the 🛑 handler already updated the UI, stay silent
+    if (!isTaskCurrent(task.id)){
+      _voiceProcessing = false;
+      if (done) done();
+      return;
+    }
     if (fetchErr.name === 'AbortError'){
       chatAdd('⏰ 语音服务超时，请重试。', 'ai');
       $('voice_status').className = 'voice-status-row error';
-      $('voice_status').innerText = '⚠️ 服务超时';
+      $('voice_status').innerText = '⚠️ 服务超时 · IDLE';
     } else {
       chatAdd('网络错误，请检查服务器连接。', 'ai');
       $('voice_status').className = 'voice-status-row error';
-      $('voice_status').innerText = '⚠️ 网络错误';
+      $('voice_status').innerText = '⚠️ 网络错误 · IDLE';
     }
     _voiceProcessing = false;
   }
+  endTask(task.id);
   if (done) done();
 }
 
@@ -649,26 +782,33 @@ function voicePlayResult(url){
   if (dl){ dl.href = url; dl.setAttribute('download', (url.split('/').pop() || 'voice.wav')); }
 
   $('voice_status').className = 'voice-status-row speaking';
-  $('voice_status').innerText = '🔊 播报中...';
+  $('voice_status').innerText = '🔊 播报中...（可点 🛑 停止任务）';
+  _voiceSpeaking = true;
 
   const audio = new Audio(url);
   window._voiceAudio = audio;
   audio.onended = function(){
+    window._voiceAudio = null;
     $('voice_status').className = 'voice-status-row';
-    $('voice_status').innerText = '✅ 语音交互完成';
+    $('voice_status').innerText = '✅ 语音交互完成 · IDLE';
+    _voiceSpeaking = false;
     _voiceProcessing = false;
   };
   audio.onerror = function(){
+    window._voiceAudio = null;
     $('voice_status').className = 'voice-status-row error';
     $('voice_status').innerText = '⚠️ 音频加载失败，请点"▶️ 播放"或"⬇️ 下载音频"';
+    _voiceSpeaking = false;
     _voiceProcessing = false;
   };
   audio.play().then(function(){
     _voiceProcessing = false;
   }).catch(function(){
     // Autoplay blocked by browser → user clicks ▶️
+    window._voiceAudio = null;
+    _voiceSpeaking = false;
     $('voice_status').className = 'voice-status-row';
-    $('voice_status').innerText = 'ℹ️ 自动播放被浏览器拦截，请点"▶️ 播放"';
+    $('voice_status').innerText = 'ℹ️ 自动播放被浏览器拦截，请点"▶️ 播放" · IDLE';
     _voiceProcessing = false;
   });
 }
@@ -677,17 +817,24 @@ function voicePlayClick(){
   if (!_lastVoiceUrl) return;
   const a = new Audio(_lastVoiceUrl);
   window._voiceAudio = a;
+  _voiceSpeaking = true;
   $('voice_status').className = 'voice-status-row speaking';
-  $('voice_status').innerText = '🔊 播报中...';
+  $('voice_status').innerText = '🔊 播报中...（可点 🛑 停止任务）';
   a.onended = function(){
+    window._voiceAudio = null;
+    _voiceSpeaking = false;
     $('voice_status').className = 'voice-status-row';
-    $('voice_status').innerText = '✅ 语音交互完成';
+    $('voice_status').innerText = '✅ 语音交互完成 · IDLE';
   };
   a.onerror = function(){
+    window._voiceAudio = null;
+    _voiceSpeaking = false;
     $('voice_status').className = 'voice-status-row error';
     $('voice_status').innerText = '⚠️ 播放失败，请用"⬇️ 下载音频"';
   };
   a.play().catch(function(){
+    window._voiceAudio = null;
+    _voiceSpeaking = false;
     $('voice_status').className = 'voice-status-row error';
     $('voice_status').innerText = '⚠️ 播放失败，请用"⬇️ 下载音频"';
   });
