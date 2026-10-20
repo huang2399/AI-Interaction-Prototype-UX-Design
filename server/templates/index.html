@@ -25,6 +25,12 @@ body{background:radial-gradient(1200px 600px at 80% -10%, rgba(34,211,238,.08), 
 .pill-info{color:var(--cyan); border-color:rgba(34,211,238,.35);}
 .pill-live{color:var(--green); border-color:rgba(52,211,153,.4);}
 .pill-dim{color:var(--dim2);}
+/* week7 fix: 离线/告警态胶囊（黄色）+ IMU 离线冻结遮罩 */
+.pill-err{color:var(--yellow); border-color:rgba(251,191,36,.55); background:rgba(251,191,36,.12);}
+.imu-wrap{position:relative;}
+.imu-offline-tip{position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  color:var(--yellow); font-weight:800; font-size:16px; letter-spacing:.5px; border-radius:10px;
+  background:rgba(2,6,23,.38); border:1px dashed rgba(251,191,36,.45); pointer-events:none;}
 .layout{display:grid; grid-template-columns:380px 1fr; gap:18px; padding:18px 26px;}
 .col{display:flex; flex-direction:column; gap:18px;}
 .card{background:linear-gradient(180deg, rgba(30,41,59,.92), rgba(30,41,59,.78)); border:1px solid var(--line); border-radius:14px; box-shadow:0 0 0 1px rgba(56,189,248,.05), 0 10px 30px rgba(2,6,23,.45); padding:16px 18px;}
@@ -132,6 +138,28 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
 .voice-stop-btn:hover{background:rgba(248,113,113,.2); border-color:rgba(248,113,113,.75); box-shadow:0 0 16px rgba(248,113,113,.35);}
 .voice-stop-btn:active{transform:scale(.97);}
 .voice-stop-note{color:var(--dim2); font-size:11px; line-height:1.5;}
+/* ---- Week7: 按需单张采集状态机（PENDING → ACCEPTED → 采集中... → ✅/❌） ---- */
+.cap-state-row{display:flex; align-items:center; gap:8px; margin-top:12px; flex-wrap:wrap;}
+.cap-state-text{font-size:12px; color:var(--dim); line-height:1.5;}
+.cap-flow{display:flex; align-items:center; gap:6px; margin-top:9px; font-size:11px; color:var(--dim2); flex-wrap:wrap;}
+.cap-flow .step{padding:2px 8px; border-radius:6px; border:1px solid var(--line); background:var(--card2); white-space:nowrap;}
+.cap-flow .step.done{color:var(--green); border-color:rgba(52,211,153,.45); background:rgba(52,211,153,.12);}
+.cap-flow .step.active{color:var(--cyan); border-color:rgba(34,211,238,.55); background:rgba(34,211,238,.14); animation:pulse-step 1.2s ease-in-out infinite;}
+.cap-flow .step.failed{color:var(--red); border-color:rgba(248,113,113,.55); background:rgba(248,113,113,.14);}
+.cap-flow .arrow{color:var(--dim2);}
+@keyframes pulse-step{0%,100%{opacity:.6;} 50%{opacity:1;}}
+.cap-preview{margin-top:10px; border:1px dashed var(--line); border-radius:10px; min-height:66px; display:flex; align-items:center; justify-content:center; text-align:center; color:var(--dim2); font-size:12px; background:#0b1220; overflow:hidden; position:relative; padding:8px;}
+.cap-preview img{width:100%; max-height:190px; object-fit:cover; display:block; border-radius:6px;}
+.cap-preview .cap-tag{position:absolute; right:8px; top:8px; font-size:10px; padding:2px 7px; border-radius:5px; background:rgba(2,6,23,.8); color:var(--cyan);}
+.cap-preview .cap-tag.warn{background:rgba(251,191,36,.9); color:#3a2606; left:8px; right:auto; font-weight:700;}
+.cap-warn{margin-top:10px; padding:9px 11px; border-radius:9px; font-size:12.5px; font-weight:700; color:var(--yellow); background:rgba(251,191,36,.12); border:1px solid rgba(251,191,36,.45);}
+.cap-err{margin-top:10px; padding:9px 11px; border-radius:9px; font-size:12.5px; font-weight:700; color:var(--red); background:rgba(248,113,113,.12); border:1px solid rgba(248,113,113,.45);}
+.btn-capture.locked{background:linear-gradient(135deg,#475569,#334155); color:var(--dim); cursor:not-allowed; box-shadow:none; opacity:.85;}
+.btn-capture.locked:hover{transform:none; box-shadow:none;}
+.tag-fail{background:rgba(248,113,113,.15); color:var(--red); border:1px solid rgba(248,113,113,.45);}
+.pcard-fail{border-color:rgba(248,113,113,.3);}
+.pcard-warn{border-color:rgba(251,191,36,.45);}
+.placeholder.fail{color:var(--red); background:repeating-linear-gradient(45deg,#1a0f12,#1a0f12 12px,#22141a 12px,#22141a 24px);}
 </style>
 </head>
 <body>
@@ -147,10 +175,28 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
 <main class="layout">
   <section class="col">
     <div class="card">
-      <div class="card-h"><span class="card-t">📷 相机远程抓拍控制台</span></div>
-      <button class="btn-capture" onclick="triggerCapture()">📷 立即抓拍 <small>(One-Shot)</small></button>
+      <div class="card-h"><span class="card-t">📷 相机远程抓拍控制台</span>
+        <span class="pill pill-dim mono" id="capture_rid_pill" title="本次采集的 request_id">--</span>
+        <span class="pill pill-dim" id="capture_lock_pill" style="display:none">🔒 已锁定</span>
+      </div>
+      <button class="btn-capture" id="capture_btn" onclick="triggerCapture()">📷 立即抓拍 <small>(One-Shot)</small></button>
       <button id="ack_btn" class="btn-ack" onclick="sendAck()">📷 确认收到照片 (ACK)</button>
-      <div class="hint">提示：下发后指令进入云端队列，单板模组在下一次轮询（约 2s）抓拍，拍摄完成后自动上传并刷新画廊。</div>
+      <div class="cap-state-row">
+        <span class="badge badge-dim" id="capture_badge">IDLE</span>
+        <span class="cap-state-text" id="capture_state_text">💤 空闲中 — 点击按钮触发一次真实硬件采集</span>
+      </div>
+      <div class="cap-flow mono" id="capture_flow">
+        <span class="step" id="cap_step_pending">PENDING</span><span class="arrow">→</span>
+        <span class="step" id="cap_step_accepted">ACCEPTED</span><span class="arrow">→</span>
+        <span class="step" id="cap_step_collecting">采集中...</span><span class="arrow">→</span>
+        <span class="step" id="cap_step_result">结果</span>
+      </div>
+      <div class="cap-preview" id="capture_preview">📥 待命：尚未发起本次采集</div>
+      <div class="cap-warn" id="capture_warn" style="display:none">⚠️ 画面可能被遮挡或采集失败，请检查</div>
+      <div class="cap-err" id="capture_error" style="display:none">❌ 采集失败：设备超时/错误</div>
+      <div class="hint mono" id="capture_meta">触发来源 -- · 时间 -- · request_id --</div>
+      <div class="hint">提示：下发后指令进入云端队列，单板模组在下一次轮询（约 2s）抓拍；状态会依次走到 <b>PENDING → ACCEPTED → 采集中...</b>，
+        <b>10 秒</b>内未收到图片即如实报“采集失败”（不会显示上一张旧图）；连续 2 次失败会锁定抓拍 30 秒。</div>
     </div>
     <div class="card">
       <div class="card-h"><span class="card-t">🧭 任务仪表盘</span><span class="pill pill-dim" id="task_age">--</span></div>
@@ -179,7 +225,10 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
       <div class="card-h"><span class="card-t">📈 IMU 实时波形 (Acc X/Y/Z)</span>
         <span class="legend"><span><i style="background:#22d3ee"></i>Acc X</span><span><i style="background:#a78bfa"></i>Acc Y</span><span><i style="background:#34d399"></i>Acc Z</span></span>
         <span class="pill pill-live" id="imu_src" style="margin-left:auto">● LIVE 1Hz</span></div>
-      <div id="imu_chart"></div>
+      <div class="imu-wrap">
+        <div id="imu_chart"></div>
+        <div class="imu-offline-tip" id="imu_offline_tip" style="display:none">❌ 设备离线，无实时数据 · 波形已冻结</div>
+      </div>
       <div class="imu-readout mono" id="imu_readout">AX: -- &nbsp; AY: -- &nbsp; AZ: --</div>
     </div>
     <div class="card">
@@ -187,7 +236,7 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
       <div class="dash four">
         <div class="dash-item"><div class="dash-k">开发板 IP</div><div class="dash-v mono" id="dev_ip">--</div></div>
         <div class="dash-item"><div class="dash-k">RSSI 信号强度</div><div class="dash-v mono" id="dev_rssi">32</div><div class="bars"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></div></div>
-        <div class="dash-item"><div class="dash-k">链路</div><div class="dash-v" style="font-size:13px">HTTP 轮询 2s</div></div>
+        <div class="dash-item"><div class="dash-k">链路</div><div class="dash-v" style="font-size:13px" id="dev_link">HTTP 轮询 2s</div></div>
         <div class="dash-item"><div class="dash-k">最近上传</div><div class="dash-v small mono" id="dev_last">--</div></div>
       </div>
     </div>
@@ -264,7 +313,287 @@ function imgFail(el){ el.outerHTML = '<div class="placeholder"><div class="icon"
 
 function showToast(type, msg){ const t = $('toast'); t.className = 'toast ' + (type==='ok'?'toast-ok':'toast-err'); t.innerText = msg; t.style.display='block'; setTimeout(()=>t.style.display='none', 2500); }
 
-function triggerCapture(){ fetch('/api/trigger_capture',{method:'POST'}).then(r=>r.json()).then(d=>showToast('ok','拍照指令已下发 #'+d.task_id)).catch(()=>showToast('err','指令发送失败')); }
+// ============ Week7: 按需获取一张环境图像（单张采集状态机） ============
+// 前端与后端共用同一套状态机：PENDING → ACCEPTED → 采集中... → ✅/❌。
+// 关键约束：本面板只显示【本次 request_id】对应的图片，绝不复用上一张旧图。
+const CAPTURE_TIMEOUT_MS = 10000;     // 与后端 CAPTURE_TIMEOUT_SECONDS(10s) 对齐
+const TRIGGER_LABEL = {web:'网页按钮', timer:'定时调度', ai_chat:'AI 对话',
+                       physical_button:'物理按键', ble:'BLE 手机'};
+const CAP_TERMINAL = {COMPLETED:1, TIMEOUT:1, FAIL:1};
+const CAP_STATE_TEXT = {
+  IDLE:'💤 空闲中 — 点击按钮触发一次真实硬件采集',
+  PENDING:'⏳ PENDING — 指令已下发，等待设备轮询取走',
+  ACCEPTED:'📡 ACCEPTED — 设备已接收指令，准备抓帧',
+  COLLECTING:'📥 采集中... — 设备正在抓取并上传画面',
+  COMPLETED:'✅ 采集成功 — 本次图片已入库',
+  TIMEOUT:'❌ 采集失败：设备超时/错误',
+  FAIL:'❌ 采集失败：设备超时/错误'
+};
+const CAP_STATE_BADGE = {IDLE:'badge badge-dim', PENDING:'badge badge-warn',
+  ACCEPTED:'badge badge-warn', COLLECTING:'badge badge-info', COMPLETED:'badge badge-ok',
+  TIMEOUT:'badge badge-err', FAIL:'badge badge-err'};
+
+let _capRid = null;            // 本次采集的 request_id（与台账/画廊逐条对应）
+let _capState = 'IDLE';        // IDLE/PENDING/ACCEPTED/COLLECTING/COMPLETED/TIMEOUT/FAIL
+let _capDeadline = 0;          // 本次采集的 10s 硬截止（本地兜底）
+let _capWatchdog = null;       // 客户端兜底定时器：后端失联也要如实报失败
+let _capFailDetail = '';       // 失败细节（超时/设备错误/未联机）
+let _capBlocked = false;       // 后端遮挡初判结果（黄色告警）
+let _capAvgGray = null;        // 本次采集的平均灰度（用于告警文案说明“为什么判遮挡”）
+let _capResult = null;         // 本次采集的图片条目（照片名/灰度/毫秒时间）
+let _capLockTimer = null;      // 连续失败 30s 锁定倒计时
+let _capLockRemaining = 0;
+
+function newCaptureId(){ return 'cap_web_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8); }
+function labelTrigger(t){ return TRIGGER_LABEL[t] || t || '--'; }
+function fmtMs(ms){ if (!ms) return '--'; return fmtTime(ms / 1000) + '.' + String(ms % 1000).padStart(3, '0'); }
+function shortDetail(s){ return String(s || '').replace(/^❌\s*采集失败[：:]\s*/, '').slice(0, 80); }
+
+// 状态流高亮：已走过的阶段变绿，当前阶段闪烁，终态为 ✅/❌
+function capSetSteps(state){
+  const ids = {PENDING:'cap_step_pending', ACCEPTED:'cap_step_accepted', COLLECTING:'cap_step_collecting'};
+  const order = ['PENDING', 'ACCEPTED', 'COLLECTING'];
+  const terminal = !!CAP_TERMINAL[state];
+  const idx = order.indexOf(state);
+  order.forEach(function(s, i){
+    const el = $(ids[s]); if (!el) return;
+    if (state === 'COMPLETED') el.className = 'step done';
+    else if (state === s) el.className = 'step active';
+    else if (terminal || idx > i) el.className = 'step done';
+    else el.className = 'step';
+  });
+  const res = $('cap_step_result'); if (!res) return;
+  if (state === 'COMPLETED') res.className = 'step done';
+  else if (state === 'TIMEOUT' || state === 'FAIL') res.className = 'step failed';
+  else if (state === 'COLLECTING') res.className = 'step active';
+  else res.className = 'step';
+}
+function renderCaptureMeta(){
+  const m = $('capture_meta'); if (!m) return;
+  const src = (_capResult && _capResult.trigger) || 'web';
+  const ms = _capResult && _capResult.ts_ms;
+  const gray = (_capResult && _capResult.avg_gray != null) ? (' · 灰度 ' + _capResult.avg_gray) : '';
+  m.innerHTML = '触发来源 <b>' + esc(labelTrigger(src)) + '</b> · 时间 <span class="mono">'
+    + fmtMs(ms) + '</span>' + gray + ' · request_id <span class="mono">' + esc(_capRid || '--') + '</span>';
+}
+
+function renderCaptureState(){
+  const st = _capState || 'IDLE';
+  const badge = $('capture_badge');
+  if (badge){ badge.className = CAP_STATE_BADGE[st] || 'badge badge-dim'; badge.innerText = st; }
+  const txt = $('capture_state_text');
+  if (txt){
+    let t = CAP_STATE_TEXT[st] || st;
+    if (!CAP_TERMINAL[st] && st !== 'IDLE' && _capDeadline){
+      t += '　剩余 ' + Math.max(0, Math.ceil((_capDeadline - Date.now()) / 1000)) + 's';
+    }
+    if (st === 'TIMEOUT') t += '（超过 ' + (CAPTURE_TIMEOUT_MS / 1000) + ' 秒未收到图片）';
+    if (st === 'FAIL' && _capFailDetail) t += '（' + _capFailDetail + '）';
+    txt.innerText = t;
+  }
+  const ridPill = $('capture_rid_pill');
+  if (ridPill) ridPill.innerText = _capRid ? ('#' + _capRid) : '--';
+  capSetSteps(st);
+  const errBox = $('capture_error');
+  if (errBox){
+    if (st === 'TIMEOUT' || st === 'FAIL'){
+      errBox.style.display = 'block';
+      errBox.innerText = CAP_STATE_TEXT[st] + (_capFailDetail ? '（' + _capFailDetail + '）' : '');
+    } else errBox.style.display = 'none';
+  }
+  const warn = $('capture_warn');
+  if (warn){
+    if (_capBlocked){
+      // week7 fix(Bug1): 遮挡/偏黑告警必须显式渲染，并附上判定依据（平均灰度 vs 阈值）
+      const g = (_capResult && _capResult.avg_gray != null) ? _capResult.avg_gray : _capAvgGray;
+      warn.innerHTML = '⚠️ 画面可能被遮挡或采集失败，请检查'
+        + (g != null ? '<span class="mono" style="font-weight:400">（平均灰度 ' + g + '/255 ＜ 阈值 40）</span>' : '');
+      warn.style.display = 'block';
+    } else {
+      warn.style.display = 'none';
+    }
+  }
+  renderCaptureMeta();
+}
+
+function clearCaptureWatchdog(){ if (_capWatchdog){ clearTimeout(_capWatchdog); _capWatchdog = null; } }
+
+// 10s 兜底：即使 /api/status 轮询拿不到结果，也必须如实显示“采集失败”
+function startCaptureWatchdog(){
+  clearCaptureWatchdog();
+  _capWatchdog = setTimeout(function(){
+    if (!CAP_TERMINAL[_capState] && _capState !== 'IDLE'){
+      console.warn('[CAPTURE] 10s 未收到图片 → 前端兜底判定采集失败（不显示任何旧图）');
+      capFail('超过 ' + (CAPTURE_TIMEOUT_MS / 1000) + ' 秒未收到图片');
+    }
+  }, CAPTURE_TIMEOUT_MS + 300);
+}
+
+// 失败：明确显示 ❌ 采集失败：设备超时/错误，并清空本次预览（绝不残留旧图）
+function capFail(detail){
+  clearCaptureWatchdog();
+  _capState = 'TIMEOUT';
+  _capFailDetail = detail || '设备超时/错误';
+  _capResult = null;
+  _capBlocked = false;
+  _capAvgGray = null;
+  const box = $('capture_preview');
+  if (box) box.innerHTML = '❌ 本次采集未收到图片（request_id <span class="mono">'
+    + esc(_capRid || '--') + '</span>）';
+  renderCaptureState();
+}
+
+// ---- 连续 2 次失败 → 锁定 30s（提示：设备离线，抓拍已锁定）----
+function updateCaptureLockText(msg){
+  const el = $('capture_state_text');
+  if (el) el.innerText = '🔒 ' + (msg || '设备离线，抓拍已锁定') + '（' + _capLockRemaining + 's 后自动解锁）';
+  const btn = $('capture_btn');
+  if (btn) btn.innerHTML = '🔒 设备离线，抓拍已锁定 (' + _capLockRemaining + 's)';
+}
+function applyCaptureLock(seconds, msg){
+  const secs = Math.max(1, Math.ceil(seconds || 30));
+  const btn = $('capture_btn');
+  if (btn){ btn.disabled = true; btn.classList.add('locked'); }
+  const pill = $('capture_lock_pill'); if (pill) pill.style.display = 'inline-block';
+  if (_capLockRemaining > 0){          // 已在锁定中：只刷新剩余秒数，不重复弹提示
+    if (secs > _capLockRemaining) _capLockRemaining = secs;
+    updateCaptureLockText(msg);
+    return;
+  }
+  _capLockRemaining = secs;
+  updateCaptureLockText(msg);
+  showToast('err', (msg || '设备离线，抓拍已锁定') + ' · ' + secs + 's');
+  if (_capLockTimer) clearInterval(_capLockTimer);
+  _capLockTimer = setInterval(function(){
+    _capLockRemaining--;
+    if (_capLockRemaining <= 0) clearCaptureLock();
+    else updateCaptureLockText(msg);
+  }, 1000);
+}
+function clearCaptureLock(){
+  if (_capLockTimer){ clearInterval(_capLockTimer); _capLockTimer = null; }
+  _capLockRemaining = 0;
+  const btn = $('capture_btn');
+  if (btn){ btn.disabled = false; btn.classList.remove('locked'); btn.innerHTML = '📷 立即抓拍 <small>(One-Shot)</small>'; }
+  const pill = $('capture_lock_pill'); if (pill) pill.style.display = 'none';
+  renderCaptureState();
+}
+
+// ---- 立即抓拍：每次点击 = 一次真实硬件采集（带 request_id 与 10s 兜底）----
+function triggerCapture(){
+  if (_capLockRemaining > 0){ showToast('err', '设备离线，抓拍已锁定 · ' + _capLockRemaining + 's'); return; }
+  const btn = $('capture_btn');
+  if (btn && btn.disabled) return;
+
+  const rid = newCaptureId();          // 本次采集的 request_id（落到台账/画廊，可逐条溯源）
+  _capRid = rid;
+  _capState = 'PENDING';
+  _capFailDetail = '';
+  _capBlocked = false;
+  _capAvgGray = null;
+  _capResult = null;
+  _capDeadline = Date.now() + CAPTURE_TIMEOUT_MS;
+  updateCapturePreview([]);            // 清空预览：面板只认 rid 对应的图片
+  startCaptureWatchdog();
+  renderCaptureState();
+  console.log('[CAPTURE] dispatch request_id=' + rid);
+
+  fetch('/api/trigger_capture', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({request_id: rid, source: 'web'})})
+    .then(r => r.json().then(j => ({code: r.status, j: j})))
+    .then(res => {
+      const d = res.j || {};
+      if (d.request_id && !_capRid) _capRid = d.request_id;
+      if (d.locked){                     // 423：连续 2 次失败触发的 30s 锁定
+        if (d.error_msg){ _capFailDetail = shortDetail(d.error_msg); _capState = 'FAIL'; renderCaptureState(); }
+        applyCaptureLock(d.retry_after || d.lock_seconds || 30, d.msg);
+        return;
+      }
+      if (d.status === 'busy'){          // 上一次采集尚未结束：不覆盖，跟随服务端真实任务
+        clearCaptureWatchdog();
+        const live = d.capture || {};
+        if (live.request_id) _capRid = live.request_id;
+        _capState = live.state || 'PENDING';
+        showToast('err', d.msg || '上一次采集尚未结束');
+        refresh();
+        return;
+      }
+      if (d.ok === false){               // 未联机等情况：如实报“采集失败”
+        capFail(shortDetail(d.msg));
+        return;
+      }
+      _capState = 'PENDING';
+      renderCaptureState();
+      showToast('ok', '拍照指令已下发 · ' + _capRid);
+    })
+    .catch(() => { capFail('指令下发失败（网络错误）'); showToast('err', '指令发送失败'); });
+}
+
+// /api/status 是状态机的权威：只有【本次 request_id】的结果才会更新本面板
+function renderCaptureFromStatus(cap){
+  if (!cap) return;
+  if (cap.locked) applyCaptureLock(cap.lock_remaining, '设备离线，抓拍已锁定');
+  else if (_capLockRemaining > 0 && cap.locked === false) clearCaptureLock();
+
+  const st = cap.state || 'IDLE';
+  const adopt = cap.request_id && cap.request_id !== _capRid
+    && (_capRid === null || !!CAP_TERMINAL[_capState] || _capState === 'IDLE');
+  if (adopt){    // 定时/AI/按键等新采集接管面板（信息不陈旧）
+    _capRid = cap.request_id; _capResult = null; _capFailDetail = '';
+    _capBlocked = false; _capAvgGray = null;
+  }
+  if (cap.request_id !== _capRid) return;
+
+  const was = _capState;
+  _capState = st;
+  // week7 fix(Bug1): blocked / unusable 任一为真都要亮黄色遮挡告警（<500B 空帧走 unusable 分支）
+  _capBlocked = !!(cap.blocked || cap.unusable);
+  if (cap.avg_gray != null) _capAvgGray = cap.avg_gray;
+  if (st === 'TIMEOUT' || st === 'FAIL'){
+    _capFailDetail = cap.detail || (st === 'TIMEOUT' ? '超过 10 秒未收到图片' : '设备返回错误');
+    _capResult = null;
+  }
+  if (CAP_TERMINAL[st]) clearCaptureWatchdog();
+  else if (st !== 'IDLE' && !_capDeadline) _capDeadline = Date.now() + CAPTURE_TIMEOUT_MS;
+  renderCaptureState();
+  if (was !== st) console.log('[CAPTURE] ' + (_capRid || '-') + ' ' + was + ' → ' + st);
+}
+
+// 画廊数据里只认【本次 request_id】的条目 → 面板永不显示上一张旧图
+function updateCapturePreview(photos){
+  const box = $('capture_preview'); if (!box) return;
+  if (!_capRid){ _capResult = null; box.innerHTML = '📥 待命：尚未发起本次采集'; return; }
+  const mine = (photos || []).find(p => p.request_id === _capRid);
+  if (!mine){
+    if (!_capResult && !CAP_TERMINAL[_capState]){
+      box.innerHTML = '📥 等待本次图片…<br><span class="mono">request_id ' + esc(_capRid) + '</span>';
+    }
+    return;
+  }
+  if (mine.status === 'stored' && mine.url){
+    const bad = !!(mine.blocked || mine.unusable);   // week7 fix(Bug1): 遮挡/空帧都要标黄
+    if (!_capResult || _capResult.name !== mine.name){
+      box.innerHTML = '<img src="' + mine.url + '" alt="本次采集">'
+        + '<span class="cap-tag' + (bad ? ' warn' : '') + '">'
+        + (bad ? '⚠️ 画面不可用 · ' : '') + esc(mine.name) + '</span>';
+    }
+    _capResult = mine;
+    _capBlocked = bad;
+    if (mine.avg_gray != null) _capAvgGray = mine.avg_gray;
+    _capState = 'COMPLETED';
+    clearCaptureWatchdog();
+  } else if (mine.status === 'failed'){
+    _capResult = mine;
+    _capBlocked = !!(mine.unusable || mine.blocked);   // <500B/空帧 → 黄色遮挡告警
+    if (mine.avg_gray != null) _capAvgGray = mine.avg_gray;
+    _capFailDetail = mine.detail || mine.reason || '采集失败';
+    _capState = 'FAIL';
+    clearCaptureWatchdog();
+    box.innerHTML = '❌ 本次采集未产生图片（request_id <span class="mono">' + esc(_capRid) + '</span>）';
+  }
+  renderCaptureState();
+}
+
 function sendAck(){ fetch('/api/device/ack',{method:'POST'}).then(r=>r.json()).then(()=>{ $('ack_btn').style.display='none'; showToast('ok','已确认收到'); }).catch(()=>showToast('err','ACK发送失败')); }
 function timerEnable(){
   const p = parseFloat($('timer_period').value) || 60;
@@ -374,66 +703,190 @@ function drawFallback(hist){
     ctx.stroke();
   });
 }
+// ---- week7 fix(Bug2): 设备离线时冻结波形，绝不用模拟(SIM)数据掩盖掉线 ----
+let _imuOffline = false;       // 设备是否离线（/api/imu_data、/api/status 双源判定）
+let _imuLastReal = [];         // 最后一帧数据（冻结时停在这一帧，不再写入新点）
+const IMU_COLORS = ['#22d3ee', '#a78bfa', '#34d399'];
+const IMU_COLORS_OFF = ['#475569', '#64748b', '#334155'];
+
+function renderImuReadout(hist, offline){
+  const ro = $('imu_readout'); if (!ro) return;
+  if (!hist || !hist.length){
+    if (offline) ro.innerHTML = '❌ 设备离线，无实时数据';
+    return;
+  }
+  const l = hist[hist.length - 1];
+  ro.innerHTML = 'AX: ' + l.ax + ' &nbsp; AY: ' + l.ay + ' &nbsp; AZ: ' + l.az
+    + ' &nbsp; @ ' + fmtClock(l.t)
+    + (offline ? ' &nbsp; <span style="color:var(--yellow)">· 波形已冻结（设备离线）</span>' : '');
+}
+
+// 返回 true 表示在线状态发生了变化（用于“只在切换瞬间重绘最后一帧，之后彻底不刷新”）
+function setImuOffline(off){
+  off = !!off;
+  if (off === _imuOffline) return false;
+  _imuOffline = off;
+  const box = $('imu_chart');
+  if (box) box.style.opacity = off ? '0.45' : '1';
+  const tip = $('imu_offline_tip');
+  if (tip) tip.style.display = off ? 'flex' : 'none';
+  const pill = $('imu_src');
+  if (off){
+    if (pill){ pill.innerText = '❌ OFFLINE · 无实时数据'; pill.className = 'pill pill-err'; }
+    if (useEcharts && chart){
+      chart.setOption({ series: [
+        {lineStyle:{color:IMU_COLORS_OFF[0]}, itemStyle:{color:IMU_COLORS_OFF[0]}},
+        {lineStyle:{color:IMU_COLORS_OFF[1]}, itemStyle:{color:IMU_COLORS_OFF[1]}},
+        {lineStyle:{color:IMU_COLORS_OFF[2]}, itemStyle:{color:IMU_COLORS_OFF[2]}}
+      ]});
+    }
+    console.warn('[IMU] 设备离线 → 已停止刷新并冻结波形在最后一帧真实数据（不再显示模拟数据）');
+  } else if (useEcharts && chart){
+    chart.setOption({ series: [
+      {lineStyle:{color:IMU_COLORS[0]}, itemStyle:{color:IMU_COLORS[0]}},
+      {lineStyle:{color:IMU_COLORS[1]}, itemStyle:{color:IMU_COLORS[1]}},
+      {lineStyle:{color:IMU_COLORS[2]}, itemStyle:{color:IMU_COLORS[2]}}
+    ]});
+    console.log('[IMU] 设备恢复在线 → 波形恢复实时刷新');
+  }
+  return true;
+}
+
 function updateImu(){
   fetch('/api/imu_data').then(r=>r.json()).then(d=>{
-    const h = d.history||[];
+    const offline = (d.offline === true) || (d.device_online === false);
+    // 离线时后端已剥离模拟点；这里再加一道防线，避免任何来源的 SIM 数据被画进曲线
+    const h = (d.history || []).filter(s => s.source === 'device' || !offline);
+    const changed = setImuOffline(offline);
     const srcPill = $('imu_src');
-    if (d.source==='device'){ srcPill.innerText='● DEVICE'; srcPill.className='pill pill-live'; }
-    else { srcPill.innerText='● SIM 1Hz'; srcPill.className='pill pill-dim'; }
-    if (h.length){ const l=h[h.length-1]; $('imu_readout').innerHTML='AX: '+l.ax+' &nbsp; AY: '+l.ay+' &nbsp; AZ: '+l.az+' &nbsp; @ '+fmtClock(l.t); }
+    if (offline){
+      if (changed){                     // 只在“刚刚掉线”这一拍冻结在最后一帧真实数据
+        _imuLastReal = h.slice(-60);
+        renderImuReadout(_imuLastReal, true);
+        if (useEcharts && chart){
+          chart.setOption({ xAxis:{data:_imuLastReal.map(s=>fmtClock(s.t))},
+            series:[{data:_imuLastReal.map(s=>s.ax)},
+                    {data:_imuLastReal.map(s=>s.ay)},
+                    {data:_imuLastReal.map(s=>s.az)}] });
+        } else drawFallback(_imuLastReal);
+      }
+      return;                           // 离线期间不写任何新点、不重绘 → 曲线是“冻结”的
+    }
+    if (srcPill){
+      if (d.source === 'device'){ srcPill.innerText = '● LIVE 1Hz (DEVICE)'; srcPill.className = 'pill pill-live'; }
+      else { srcPill.innerText = '● SIM 1Hz（设备在线，待真实数据）'; srcPill.className = 'pill pill-dim'; }
+    }
+    _imuLastReal = h.slice(-60);
+    renderImuReadout(h, false);
     if (useEcharts && chart){ chart.setOption({ xAxis:{data:h.map(s=>fmtClock(s.t))}, series:[{data:h.map(s=>s.ax)},{data:h.map(s=>s.ay)},{data:h.map(s=>s.az)}] }); }
     else drawFallback(h);
-  }).catch(()=>{});
+  }).catch(()=>{ setImuOffline(true); });   // 后端都连不上 → 按离线处理，冻结波形
 }
 function updateStatus(st){
   const badge=$('status');
   let cls='badge badge-ok';
   if (st.status==='PENDING'||st.status==='ACCEPTED') cls='badge badge-warn';
+  else if (st.status==='COLLECTING') cls='badge badge-info';
   else if (st.status==='TIMEOUT'||st.status==='FAIL'||st.status==='OFFLINE'||!st.status) cls='badge badge-err';
   else if (st.status==='IDLE') cls='badge badge-dim';
   badge.className=cls; badge.innerText=st.status||'OFFLINE';
+  // week7: 单张采集面板跟随同一套状态机（PENDING → ACCEPTED → 采集中... → ✅/❌）
+  renderCaptureFromStatus(st.capture);
   $('task_id').innerText=st.task_id||'--';
   const src=$('trigger_src'); src.innerText=st.trigger_source||'--';
   src.className='badge '+(st.trigger_source==='physical_button'?'badge-warn':'badge-info');
   $('ack_btn').style.display = st.ack_needed ? 'block' : 'none';
   $('dev_ip').innerText=st.device_ip||'--';
   if (st.rssi!=null) $('dev_rssi').innerText=st.rssi;
+  // week7 fix(Bug2): 在线状态以【板端心跳】为准（device_online / device_seen_age），不再只看任务状态
+  const devOffline = (st.device_online === false) || st.status === 'OFFLINE'
+                     || (st.status === 'TIMEOUT' && st.device_online !== true);
   const op=$('online_pill');
-  if (st.status==='OFFLINE'){ op.innerText='● 离线'; op.className='pill pill-dim'; }
+  if (devOffline){ op.innerText='● 离线（无心跳）'; op.className='pill pill-err'; }
   else { op.innerText='● 在线 (LAN)'; op.className='pill pill-live'; }
+  setImuOffline(devOffline);        // 离线 → 立即冻结 IMU 波形并停止刷新模拟数据
+  const link=$('dev_link');
+  if (link){
+    if (devOffline){
+      link.innerText='❌ 离线' + (st.device_seen_age != null ? '（心跳 ' + Math.round(st.device_seen_age) + 's 前）' : '（无心跳）');
+      link.style.color='var(--yellow)';
+    } else {
+      link.innerText='在线 · 心跳 ' + (st.device_seen_age != null ? Math.round(st.device_seen_age) + 's 前' : '正常');
+      link.style.color='';
+    }
+  }
   if (st.last_update){ const age=Math.max(0,Math.round(Date.now()/1000-st.last_update)); $('task_age').innerText='更新于 '+age+'s 前'; }
 }
 function renderGallery(photos){
   const g=$('gallery'), empty=$('empty_state');
-  const valid=photos.filter(p=>VALID_PHOTO_RE.test(p.name));
-  $('photo_count').innerText=valid.filter(p=>p.status==='stored').length+' 在库 / '+valid.length+' 总计';
+  // week7: 成功图片 + 采集失败记录都进画廊（失败记录无图，但保留了请求/时间/原因）
+  const valid=photos.filter(p=>(p.name && VALID_PHOTO_RE.test(p.name)) || p.status==='failed');
+  const stored=valid.filter(p=>p.status==='stored').length;
+  $('photo_count').innerText=stored+' 在库 / '+valid.length+' 条采集记录';
   if (!valid.length){ g.innerHTML=''; empty.style.display='block'; return; }
   empty.style.display='none';
   g.innerHTML=valid.map(p=>{
+    // week7: 每条记录都清晰展示【触发来源】【确切时间(毫秒)】【request_id】
+    const trig = labelTrigger(p.trigger);
+    const rid = p.request_id ? esc(p.request_id) : '--';
+    const when = p.time_ms_str || p.time_str || '--';
+    if (p.status==='failed'){
+      const reason = p.reason==='timeout' ? '设备超时（10s 内未收到图片）'
+                   : p.reason==='offline' ? '设备未联机（指令未下发）'
+                   : (p.detail || p.reason || '采集失败');
+      return '<div class="pcard pcard-fail">'+
+        '<div class="placeholder fail"><div class="icon">❌</div><div>采集失败 · 未产生图片</div><div>'+esc(reason)+'</div></div>'+
+        '<div class="pmeta">'+
+          '<div class="prow"><span class="pname">'+esc(when.slice(0,10))+' 采集失败</span><span class="tag tag-fail">失败</span></div>'+
+          '<div class="prow psub"><span>🕒 '+esc(when)+'</span></div>'+
+          '<div class="prow psub"><span>🎯 '+esc(trig)+'</span></div>'+
+          '<div class="prow psub"><span class="mono" title="request_id">🔗 '+rid+'</span></div>'+
+        '</div></div>';
+    }
     const tag = p.status==='stored' ? '<span class="tag tag-stored">已入库</span>' : '<span class="tag tag-cleaned">已清理</span>';
     const thumb = p.status==='stored'
-      ? '<div class="thumb"><img src="/photos/'+p.name+'" loading="lazy" onerror="imgFail(this)"></div>'
+      ? '<div class="thumb"><img src="/photos/'+p.name+'" loading="lazy" onerror="imgFail(this)">'
+        +(p.blocked ? '<span class="cap-tag warn">⚠️ 画面不可用</span>' : '')+'</div>'
       : '<div class="placeholder"><div class="icon">📦</div><div>配额到期已清除原图</div><div>元数据与哈希完整保留</div></div>';
     const sizeTxt = p.status==='stored' ? fmtSize(p.size) : '已清理';
-    return '<div class="pcard">'+thumb+
+    const grayTxt = (p.avg_gray != null) ? ('灰度 '+p.avg_gray) : '';
+    return '<div class="pcard'+(p.blocked?' pcard-warn':'')+'">'+thumb+
       '<div class="pmeta"><div class="prow"><span class="pname" title="'+esc(p.name)+'">'+esc(p.name)+'</span>'+tag+'</div>'+
-      '<div class="prow psub"><span>🕒 '+p.time_str+'</span><span>'+sizeTxt+'</span></div></div></div>';
+      '<div class="prow psub"><span>🕒 '+esc(when)+'</span><span>'+sizeTxt+'</span></div>'+
+      '<div class="prow psub"><span>🎯 '+esc(trig)+'</span>'+(grayTxt?'<span>'+grayTxt+'</span>':'')+'</div>'+
+      '<div class="prow psub"><span class="mono" title="request_id">🔗 '+rid+'</span></div></div></div>';
   }).join('');
 }
 function refresh(){
   fetch('/api/status').then(r=>r.json()).then(st=>{
     updateStatus(st);
     updateTimerUI(st);
-    if (st.status!==lastStatus){ lastStatus=st.status; if (st.status==='COMPLETED') showToast('ok','新照片已上传!'); }
+    if (st.status!==lastStatus){
+      const mine = st.capture && st.capture.request_id && st.capture.request_id===_capRid;
+      lastStatus=st.status;
+      if (st.status==='COMPLETED' && mine){
+        const cap = st.capture || {};
+        if (cap.blocked || cap.unusable){
+          // week7 fix(Bug1): 成功入库但初判“遮挡/偏黑” → 必须弹出黄色遮挡告警（不是绿色成功提示）
+          _capBlocked = true;
+          if (cap.avg_gray != null) _capAvgGray = cap.avg_gray;
+          renderCaptureState();
+          showToast('err', '⚠️ 画面可能被遮挡或采集失败，请检查');
+        } else showToast('ok','✅ 本次采集完成 · 图片已入库');
+      }
+      else if (st.status==='TIMEOUT'||st.status==='FAIL') showToast('err','❌ 采集失败：设备超时/错误');
+    }
   }).catch(()=>updateStatus({status:'OFFLINE'}));
   fetch('/api/photos').then(r=>r.json()).then(d=>{
-    renderGallery(d.photos||[]);
-    const first=(d.photos||[])[0];
-    $('dev_last').innerText = first ? first.time_str.slice(5) : '--';
+    const all=d.photos||[];
+    renderGallery(all);
+    updateCapturePreview(all);        // week7: 只认本次 request_id 的图片
+    const first=all[0];
+    $('dev_last').innerText = first ? (first.time_ms_str||first.time_str||'--').slice(5) : '--';
   }).catch(()=>{});
 }
 setInterval(()=>{ $('clock').innerText=fmtClock(Date.now()/1000); }, 1000);
-initChart(); updateImu(); refresh();
+initChart(); updateImu(); refresh(); renderCaptureState();   // week7: 采集面板初始化
 setInterval(updateImu, 1000);
 setInterval(refresh, 2000);
 

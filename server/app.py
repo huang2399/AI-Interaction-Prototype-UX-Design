@@ -39,13 +39,50 @@ if not os.path.exists(LEDGER_FILE) and os.path.exists(_LEGACY_LEDGER_FILE):
 MIN_PHOTO_SIZE = 500  # reject images smaller than 500 bytes (corrupt/empty)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# ---------------- week7: 按需单张采集（One-Shot Capture）门限 ----------------
+# 任务书要求：
+#   1) 点击抓拍后状态必须精确到 PENDING → ACCEPTED → “采集中...”，超过 10s 未收到
+#      图片或板端报错必须如实显示“采集失败”，绝不刷新上一张旧图糊弄；
+#   2) 每次采集成败都要在 photos_ledger.json 记录 request_id 与毫秒级时间戳；
+#   3) <500B 或纯黑（平均灰度极低）→ 遮挡/画面不可用（黄色告警）；
+#   4) 连续 2 次无有效采集 → 锁定抓拍按钮 30s。
+#   5) week7 Bug1 修复：遮挡/偏黑阈值放宽到平均灰度 < 40（原 <12 会漏判“遮住镜头”的黑图）。
+CAPTURE_TIMEOUT_SECONDS = 10.0   # 下发后 10s 内未收到图片 → 采集失败
+COLLECTING_AFTER_SECONDS = 2.5   # 板端 poll 后固定 2s 冷却才开始抓帧 → 之后进入“采集中...”
+COLLECT_LOCK_FAILS = 2           # 连续 2 次采集失败/无响应 → 锁定抓拍按钮
+COLLECT_LOCK_SECONDS = 30.0      # 锁定 30 秒后自动解锁
+BLOCKED_MIN_SIZE = 500           # < 500B → 空帧，判定画面不可用（镜头遮挡）
+# week7 fix(Bug1): 阈值由 12 放宽到 40。实测“遮住镜头”的黑图平均灰度 13.5 / 16.97（AGC+噪声
+# 不可能压到 <12），而正常室内画面 76~162，40 与两者都有足够安全裕量，既不漏报也不误报。
+BLOCKED_MAX_GRAY = 40.0          # 平均灰度 < 40/255 → 偏黑，判定画面不可用（镜头遮挡）
+DARK_LEVEL = 64                  # dark_ratio 统计级别（灰度 < 64 视为“暗像素”，仅诊断用）
+GRAY_SAMPLE = 64                 # 灰度统计前缩放到 64×64，足够快也足够准
+# week7 fix(Bug2): 设备“在线”以【板端心跳】为准（板端 2s 轮询 + 1Hz IMU 上传），
+# 而不是任务状态；超过该窗口没有任何板端请求 → 判定离线 → 前端必须冻结波形、绝不注入模拟数据。
+DEVICE_ONLINE_WINDOW = 6.0       # 秒；>6s 无心跳 = 离线（抓拍入口另用 60s 宽松窗口，见 trigger_capture）
+
+try:
+    from PIL import Image as _PILImage   # 仅用于“遮挡初判”的灰度统计（缺失时自动降级）
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PILImage = None
+    _PIL_AVAILABLE = False
+    print("【告警】未安装 Pillow，遮挡初判仅按文件大小判定（pip install pillow 可启用灰度判定）")
+
 task_state = {
     "task_id": None,
-    "status": "IDLE",  # IDLE, PENDING, ACCEPTED, COMPLETED, TIMEOUT
+    "status": "IDLE",  # IDLE, PENDING, ACCEPTED, COLLECTING, COMPLETED, TIMEOUT, FAIL
     "last_update": time.time(),
     "latest_photo": None,
     "trigger_source": "web",
-    "ack_needed": False
+    "ack_needed": False,
+    # ---- week7: 本次采集与 request_id / 毫秒时间戳的强关联 ----
+    "request_id": None,       # 本次采集的 request_id（cap_* 云端下发 / hw_* 板端主动/BLE）
+    "created_at_ms": None,    # 指令下发时刻（毫秒 epoch）
+    "accepted_at": None,      # 板端拉走指令的时刻
+    "deadline": None,         # 采集硬截止时刻（created_at + CAPTURE_TIMEOUT_SECONDS）
+    "fail_reason": None,      # timeout / offline / device_error
+    "result": None,           # 成功时的元数据（大小 / 平均灰度 / 是否遮挡）
 }
 device_info = {
     "ip": None,        # learned from device poll/upload requests (remote_addr)
@@ -53,19 +90,184 @@ device_info = {
     "rssi": 32,        # board firmware does not report RSSI yet -> hard-coded per requirement
 }
 lock = threading.Lock()
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = CAPTURE_TIMEOUT_SECONDS   # week7: 由 30s 收紧为 10s（任务书硬性要求）
+
+# ---------------- week7: 抓拍门控（连续失败 → 30s 锁定） ----------------
+capture_lock = threading.Lock()
+capture_gate = {
+    "consecutive_fails": 0,   # 连续失败次数（第 1 次仅计数，第 2 次锁定）
+    "locked_until": 0.0,      # 锁定截止时刻（time.time() 基准，便于前端倒计时）
+    "last_fail": None,        # {"reason": ..., "detail": ..., "ts_ms": ...}
+}
 
 def check_timeout():
+    """推进 week7 单张采集状态机（/api/status 与设备/AI 路径都会调用）。
+      ACCEPTED --(板端 2s 冷却结束)--> COLLECTING（“采集中...”）
+      PENDING/ACCEPTED/COLLECTING --(超过 10s 未收到图片)--> TIMEOUT（采集失败）
+    超时只记账一次：进入终态后 fail_reason 已写入，后续轮询直接跳过。
+    """
+    expired = None
     with lock:
-        if task_state["status"] in ["PENDING", "ACCEPTED"]:
-            if time.time() - task_state["last_update"] > TIMEOUT_SECONDS:
+        st = task_state["status"]
+        now = time.time()
+        if (st == "ACCEPTED" and task_state.get("accepted_at")
+                and now - task_state["accepted_at"] >= COLLECTING_AFTER_SECONDS):
+            task_state["status"] = "COLLECTING"
+            task_state["last_update"] = now
+            print("【状态变更】板端已取走指令并开始抓帧 → COLLECTING（采集中...）")
+            st = "COLLECTING"
+        if st in ("PENDING", "ACCEPTED", "COLLECTING") and not task_state.get("fail_reason"):
+            deadline = task_state.get("deadline") or (task_state["last_update"] + TIMEOUT_SECONDS)
+            if now > deadline:
                 task_state["status"] = "TIMEOUT"
-                print("【状态变更】任务超时！")
+                task_state["fail_reason"] = "timeout"
+                task_state["last_update"] = now
+                expired = dict(task_state)
+    if expired:
+        print(f"【状态变更】任务超时！超过 {CAPTURE_TIMEOUT_SECONDS:.0f}s 未收到图片 → 采集失败")
+        _capture_failure("timeout",
+                         f"设备超时：{CAPTURE_TIMEOUT_SECONDS:.0f} 秒内未收到图片",
+                         expired.get("request_id"), expired.get("task_id"),
+                         expired.get("trigger_source") or "web",
+                         expired.get("created_at_ms"))
 
 def touch_device():
     with lock:
         device_info["ip"] = request.remote_addr
         device_info["last_seen"] = time.time()
+
+# ---------------- week7 fix(Bug2): 设备在线判定（以板端心跳为准） ----------------
+def device_seen_age():
+    """距最近一次板端请求（2s 轮询 / 1Hz IMU 上传 / 抓拍上报）的秒数；从未上线返回 None。"""
+    with lock:
+        seen = device_info.get("last_seen")
+    if not seen:
+        return None
+    return round(max(0.0, time.time() - seen), 1)
+
+def device_online():
+    """板端是否在线：DEVICE_ONLINE_WINDOW 秒内收到过任意板端心跳即视为在线。
+    离线时后端必须停止注入模拟 IMU 数据、前端必须冻结波形（week7 Bug2）。"""
+    age = device_seen_age()
+    return age is not None and age < DEVICE_ONLINE_WINDOW
+
+# ---------------- week7: 采集 request_id / 门控 / 失败记账 ----------------
+def _mint_capture_id(kind="cap"):
+    """每次真实硬件采集的唯一 id（毫秒时间 + 随机后缀，便于与台账逐条对应）。"""
+    return f"{kind}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+def _capture_gate_state():
+    """抓拍按钮门控状态：锁定到期后自动解锁（惰性判定，不需要后台线程）。"""
+    with capture_lock:
+        now = time.time()
+        if capture_gate["locked_until"] and now >= capture_gate["locked_until"]:
+            capture_gate["locked_until"] = 0.0
+            capture_gate["consecutive_fails"] = 0
+            print("【抓拍解锁】锁定时间已到 → 抓拍按钮自动解锁")
+        remaining = max(0.0, capture_gate["locked_until"] - now)
+        return {
+            "locked": remaining > 0,
+            "locked_remaining": round(remaining, 1),
+            "consecutive_fails": capture_gate["consecutive_fails"],
+            "lock_seconds": COLLECT_LOCK_SECONDS,
+            "lock_fails": COLLECT_LOCK_FAILS,
+            "last_fail": capture_gate["last_fail"],
+        }
+
+def _capture_failure(reason, detail, request_id=None, task_id=None, trigger="web",
+                     ts_ms=None, unusable=False):
+    """记一次失败的采集：写台账（含 request_id + 毫秒时间戳）→ 连续失败计数 →
+    连续 2 次失败即锁定抓拍 30s。返回台账条目。"""
+    entry = ledger_add_attempt(request_id, task_id, trigger, ok=False, reason=reason,
+                               detail=detail, unusable=unusable, ts_ms=ts_ms,
+                               state="FAIL")
+    # 板端报错（含 <500B 空帧）也要立即结束本次采集：否则 10s 到点后还会再记一次
+    # 超时失败 → 同一次采集被计两次失败（也会把按钮误锁）。
+    with lock:
+        if (request_id and task_state.get("request_id") == request_id
+                and task_state["status"] not in ("IDLE", "COMPLETED", "TIMEOUT", "FAIL")):
+            task_state["status"] = "FAIL"
+            task_state["fail_reason"] = reason
+            task_state["last_update"] = time.time()
+            # week7 fix(Bug1 补强)：板端报错/空帧（<500B、非 JPEG）同样是“本次采集作废”，
+            # /api/status.capture 必须带上 unusable/blocked/detail，前端黄色遮挡告警
+            # 才能与 photos_ledger.json 里的判定完全一致地显式渲染出来。
+            task_state["result"] = {
+                "photo": None, "size": 0,
+                "blocked": bool(unusable), "unusable": bool(unusable),
+                "avg_gray": None, "dark_ratio": None,
+                "detail": detail, "ts_ms": ts_ms, "reason": reason,
+            }
+            task_state["latest_photo"] = None      # 本次无有效画面 → 绝不显示旧图
+            print(f"【状态变更】板端上报错误 → FAIL（{reason}），本次采集立即终止")
+    fails, locked = 0, 0.0
+    with capture_lock:
+        capture_gate["consecutive_fails"] += 1
+        capture_gate["last_fail"] = {"reason": reason, "detail": detail,
+                                     "ts_ms": entry["ts_ms"]}
+        fails = capture_gate["consecutive_fails"]
+        if fails >= COLLECT_LOCK_FAILS:
+            capture_gate["locked_until"] = time.time() + COLLECT_LOCK_SECONDS
+            capture_gate["consecutive_fails"] = 0
+            locked = COLLECT_LOCK_SECONDS
+    print(f"【采集失败】request_id={request_id or '-'} 原因={reason} | {detail} | 连续失败={fails}")
+    if locked:
+        print(f"【抓拍锁定】连续 {COLLECT_LOCK_FAILS} 次未取得有效采集 → "
+              f"锁定抓拍按钮 {COLLECT_LOCK_SECONDS:.0f}s（前端提示：设备离线，抓拍已锁定）")
+    return entry
+
+def _capture_public():
+    """给前端的采集状态快照（/api/status -> capture 字段）。"""
+    with lock:
+        ts = dict(task_state)
+    gate = _capture_gate_state()
+    res = ts.get("result") or {}
+    now = time.time()
+    remaining = None
+    if ts["status"] in ("PENDING", "ACCEPTED", "COLLECTING") and ts.get("deadline"):
+        remaining = max(0.0, round(ts["deadline"] - now, 1))
+    return {
+        "state": ts["status"],
+        "request_id": ts.get("request_id"),
+        "task_id": ts.get("task_id"),
+        "trigger": ts.get("trigger_source"),
+        "photo": ts.get("latest_photo"),
+        "ok": ts["status"] == "COMPLETED",
+        "fail_reason": ts.get("fail_reason"),
+        "detail": res.get("detail"),
+        "blocked": bool(res.get("blocked")),
+        # week7 fix(Bug1): 前端除了 blocked 还要能识别 unusable（板端上报 <500B 空帧时为 True）
+        "unusable": bool(res.get("blocked") or res.get("unusable")),
+        "avg_gray": res.get("avg_gray"),
+        "dark_ratio": res.get("dark_ratio"),
+        "size": res.get("size"),
+        "ts_ms": res.get("ts_ms"),
+        "remaining_s": remaining,
+        "timeout_s": CAPTURE_TIMEOUT_SECONDS,
+        "locked": gate["locked"],
+        "lock_remaining": gate["locked_remaining"],
+        "lock_seconds": gate["lock_seconds"],
+        "consecutive_fails": gate["consecutive_fails"],
+    }
+
+def photo_avg_gray(path):
+    """平均灰度（0-255）与暗像素占比 —— 用于“镜头遮挡/画面不可用”初判。
+    用 256-bin 直方图求均值，无需解码整张大图，开销极小。
+    Pillow 缺失时返回 (None, None)，遮挡初判自动降级为“仅按文件大小”。"""
+    if not _PIL_AVAILABLE:
+        return None, None
+    try:
+        with _PILImage.open(path) as im:
+            gray = im.convert("L").resize((GRAY_SAMPLE, GRAY_SAMPLE))
+            hist = gray.histogram()          # 256 个 bin，稳定 API
+        total = sum(hist) or 1
+        mean = sum(i * c for i, c in enumerate(hist)) / total
+        dark = sum(hist[:DARK_LEVEL]) / total    # week7 fix: 灰度 <64 视为“暗像素”（诊断用）
+        return round(mean, 2), round(dark, 4)
+    except Exception as e:
+        print(f"【告警】灰度分析失败（遮挡初判跳过）: {e}")
+        return None, None
+
 
 # ---------------- Request isolation & cancellation (week 6) ----------------
 # Only ONE logical request (voice or text) may publish a result. Every new
@@ -144,13 +346,20 @@ def cancel_task():
 
     board_cancelled = False
     with lock:
-        if task_state["status"] in ("PENDING", "ACCEPTED"):
+        if task_state["status"] in ("PENDING", "ACCEPTED", "COLLECTING"):
             # PENDING = the board has not polled it yet -> recall it before it fires
-            task_state["status"] = "IDLE"
-            task_state["task_id"] = None
-            task_state["ack_needed"] = False
-            task_state["last_update"] = time.time()
-            board_cancelled = True
+            # （ACCEPTED/COLLECTING 时板端已在抓帧，无法撤回，只能让本次上传自然结束）
+            board_cancelled = task_state["status"] == "PENDING"
+            if board_cancelled:
+                task_state["status"] = "IDLE"
+                task_state["task_id"] = None
+                task_state["ack_needed"] = False
+                task_state["request_id"] = None
+                task_state["deadline"] = None
+                task_state["fail_reason"] = None
+                task_state["last_update"] = time.time()
+            else:
+                print("【取消】板端已取走指令并开始抓帧，本次采集无法撤回（不写失败台账）")
 
     print(f"[TASK] 用户按下停止: request_id={cancelled or '-'}, "
           f"板端挂起任务={'已撤销' if board_cancelled else '无'}")
@@ -166,12 +375,19 @@ IMU_SIM_START = time.time()
 
 def imu_simulator_loop():
     """1 Hz IMU source. Used until board firmware posts real samples
-    to /api/device/upload_imu (then real data wins for 5 s windows)."""
+    to /api/device/upload_imu (then real data wins for 5 s windows).
+
+    week7 fix(Bug2): 只有【设备在线但还没有真实数据】(开机预热/固件没在传) 时才允许注入模拟点；
+    一旦板端心跳消失（离线/掉线/TIMEOUT）就彻底停止模拟，并清空历史里残留的模拟点，
+    让前端冻结在“最后一帧真实数据”，杜绝用 SIM 数据掩盖掉线。"""
     while True:
         now = time.time()
+        online = device_online()                      # 心跳判定（板端 2s 轮询 + 1Hz 上传）
         with imu_lock:
             real_recent = (now - imu_last_real) < 5.0
-        if not real_recent:
+        if not online:
+            _imu_purge_simulated()                    # 离线 → 不注入任何模拟数据，并清掉残留 SIM 点
+        elif not real_recent:
             el = now - IMU_SIM_START
             sample = {
                 "t": round(now, 3),
@@ -183,6 +399,15 @@ def imu_simulator_loop():
             with imu_lock:
                 imu_history.append(sample)
         time.sleep(1.0)
+
+def _imu_purge_simulated():
+    """丢掉历史里混入的模拟点，只保留板端真实采样（离线冻结时用）。"""
+    global imu_history
+    with imu_lock:
+        if any(s.get("source") != "device" for s in imu_history):
+            imu_history = deque((s for s in imu_history if s.get("source") == "device"),
+                                maxlen=imu_history.maxlen or 60)
+            print("【IMU】设备离线 → 已清除历史中的模拟(SIM)数据，波形冻结在最后一帧真实采样")
 
 threading.Thread(target=imu_simulator_loop, daemon=True).start()
 
@@ -210,20 +435,64 @@ def ledger_load():
         if fn.endswith('.jpg') and fn not in known:
             p = os.path.join(UPLOAD_FOLDER, fn)
             ledger.append({"name": fn, "ts": os.path.getmtime(p),
-                           "size": os.path.getsize(p), "status": "stored"})
+                           "ts_ms": int(os.path.getmtime(p) * 1000),
+                           "size": os.path.getsize(p), "status": "stored", "kind": "photo"})
     for e in ledger:
-        if e.get("status") == "stored" and not os.path.exists(os.path.join(UPLOAD_FOLDER, e.get("name", ""))):
+        if not e.get("name"):
+            continue        # week7 失败记录（无图片文件）：保留元数据，不做文件校验
+        e.setdefault("kind", "photo")
+        e.setdefault("ts_ms", int(float(e.get("ts") or 0) * 1000))   # 旧记录补齐毫秒字段
+        if e.get("status") == "stored" and not os.path.exists(os.path.join(UPLOAD_FOLDER, e["name"])):
             e["status"] = "cleaned"
     ledger_save()
 
 ledger_load()
 
-def ledger_add(name, size):
+def ledger_add(name, size, **extra):
+    """Legacy helper (kept for backwards compatibility) — appends a stored photo."""
     with ledger_lock:
-        ledger.append({"name": name, "ts": time.time(), "size": size, "status": "stored"})
+        entry = {"name": name, "ts": time.time(), "ts_ms": int(time.time() * 1000),
+                 "size": size, "status": "stored", "kind": "photo", "ok": True}
+        entry.update(extra)
+        ledger.append(entry)
         if len(ledger) > 200:
             ledger[:] = ledger[-200:]
         ledger_save()
+        return entry
+
+def ledger_add_attempt(request_id, task_id, trigger, ok, reason=None, detail=None,
+                       name=None, size=0, blocked=False, avg_gray=None, dark_ratio=None,
+                       unusable=False, ts_ms=None, state=None):
+    """week7: 记录一次【真实硬件采集】的成败。
+    成功 → status=stored（有图片文件）；失败 → status=failed（无图片文件，元数据保留）。
+    两种记录都带 request_id 与毫秒级时间戳，满足“图像与请求强关联”的溯源要求。
+    失败的记录同样进入画廊（前端渲染成 ❌ 采集失败卡片），不会被软删除。"""
+    ms = int(ts_ms if ts_ms is not None else time.time() * 1000)
+    entry = {
+        "name": name,                                   # 失败时无文件（None）
+        "ts": ms / 1000.0,                              # 兼容旧字段（秒，浮点）
+        "ts_ms": ms,                                    # week7: 毫秒级精确时间戳
+        "size": size,
+        "status": "stored" if ok else "failed",
+        "kind": "photo" if ok else "failed",
+        "ok": bool(ok),
+        "state": state or ("COMPLETED" if ok else "FAIL"),
+        "request_id": request_id,                       # 本次采集的 request_id
+        "task_id": task_id,
+        "trigger": trigger,                             # web / timer / ai_chat / physical_button / ble
+        "blocked": bool(blocked),                       # 遮挡/画面不可用初判
+        "unusable": bool(unusable),
+        "avg_gray": avg_gray,                           # 平均灰度（0-255）
+        "dark_ratio": dark_ratio,                       # 近黑像素占比（诊断用）
+        "reason": reason,
+        "detail": detail,
+    }
+    with ledger_lock:
+        ledger.append(entry)
+        if len(ledger) > 200:
+            ledger[:] = ledger[-200:]
+        ledger_save()
+    return entry
 
 def ledger_mark_cleaned(names):
     with ledger_lock:
@@ -235,15 +504,60 @@ def ledger_mark_cleaned(names):
 # ---------------- API: control plane ----------------
 @app.route('/api/trigger_capture', methods=['POST'])
 def trigger_capture():
-    source = request.args.get('source', 'web')
+    """week7 单张采集入口（网页“立即抓拍”按钮）。
+      1) 被锁定（连续 2 次未取得有效采集）→ 423 + 剩余秒数，前端提示“设备离线，抓拍已锁定”；
+      2) 设备未联机 → 如实报失败并计入连续失败（绝不下发一个假任务让界面糊弄过去）；
+      3) 上一次采集还没结束 → 409 busy，保证“每次抓拍 = 一次真实硬件采集”；
+    每次下发都生成/采用一个 request_id，并与板端回传图片在台账里逐条对应。
+    """
+    d = request.get_json(silent=True) or {}
+    source = (d.get("source") or request.args.get('source') or 'web').strip() or 'web'
+    rid = (d.get("request_id") or "").strip() or _mint_capture_id()
+
+    gate = _capture_gate_state()
+    if gate["locked"]:
+        print(f"【抓拍锁定】拒绝下发（剩余 {gate['locked_remaining']:.0f}s）request_id={rid}")
+        return jsonify({"status": "locked", "ok": False, "request_id": rid,
+                        "locked": True, "retry_after": gate["locked_remaining"],
+                        "lock_seconds": gate["lock_seconds"],
+                        "msg": "设备离线，抓拍已锁定",
+                        "capture": _capture_public()}), 423
+
     with lock:
-        task_state["task_id"] = str(int(time.time()))
-        task_state["status"] = "PENDING"
-        task_state["trigger_source"] = source
-        task_state["ack_needed"] = False
-        task_state["last_update"] = time.time()
-        print(f"【服务器受理】下发拍照指令，任务ID: {task_state['task_id']}，触发源: {source}")
-    return jsonify({"status": "ok", "task_id": task_state["task_id"]})
+        ip, seen = device_info["ip"], device_info["last_seen"]
+    online = bool(ip and seen and (time.time() - seen) < 60)
+    if not online:
+        detail = "设备未联机（最近一次心跳超过 60s 或从未连接），未下发指令"
+        with lock:
+            task_state.update({"task_id": None, "status": "FAIL", "fail_reason": "offline",
+                               "request_id": rid, "trigger_source": source,
+                               "latest_photo": None, "deadline": None,
+                               "result": None, "last_update": time.time()})
+        _capture_failure("offline", detail, rid, None, source,
+                         int(time.time() * 1000), unusable=True)
+        fail_msg = f"❌ 采集失败：设备未联机（{detail}）"
+        gate2 = _capture_gate_state()
+        if gate2["locked"]:
+            # 本次失败刚好触发第 2 次连续失败 → 同一条响应里就把锁定状态交给前端
+            print(f"【抓拍锁定】失败次数达 {COLLECT_LOCK_FAILS} → 立即锁定并通知前端")
+            return jsonify({"status": "locked", "ok": False, "request_id": rid,
+                            "locked": True, "retry_after": gate2["locked_remaining"],
+                            "lock_seconds": gate2["lock_seconds"],
+                            "msg": "设备离线，抓拍已锁定", "error_msg": fail_msg,
+                            "capture": _capture_public()}), 423
+        return jsonify({"status": "error", "ok": False, "request_id": rid,
+                        "msg": fail_msg,
+                        "capture": _capture_public()}), 200
+
+    ok, tid = create_capture_task(source, rid)
+    if not ok:
+        return jsonify({"status": "busy", "ok": False, "request_id": rid,
+                        "msg": "⏳ 上一次采集尚未结束，请稍候",
+                        "capture": _capture_public()}), 409
+
+    return jsonify({"status": "ok", "ok": True, "task_id": tid, "request_id": rid,
+                    "state": "PENDING", "timeout_s": CAPTURE_TIMEOUT_SECONDS,
+                    "capture": _capture_public()}), 200
 
 @app.route('/api/device/ack', methods=['POST'])
 def device_ack():
@@ -258,18 +572,45 @@ def device_poll():
     with lock:
         if task_state["status"] == "PENDING":
             task_state["status"] = "ACCEPTED"
+            task_state["accepted_at"] = time.time()
             task_state["last_update"] = time.time()
-            print("【设备接收】ESP32 拉取到拍照指令")
-            return jsonify({"has_task": True, "task_id": task_state["task_id"]}), 200
+            print(f"【设备接收】ESP32 拉取到拍照指令 (ACCEPTED) "
+                  f"request_id={task_state.get('request_id') or '-'}")
+            return jsonify({"has_task": True, "task_id": task_state["task_id"],
+                            "request_id": task_state.get("request_id")}), 200
         return jsonify({"has_task": False}), 200
 
 @app.route('/api/device/upload_photo', methods=['POST'])
 def upload_photo():
+    """板端采集回传入口。week7：把图片与本次 request_id 强关联后写台账（毫秒时间戳），
+    并做“镜头遮挡/画面不可用”初判；任何异常分支都记一次失败（同样带 request_id），
+    绝不把上一张旧图当成这一次的采集结果。"""
+    touch_device()          # 先更新心跳：即使本次上传无效，在线状态也是真实的
+    now = time.time()
+    with lock:
+        active = task_state["status"] in ("PENDING", "ACCEPTED", "COLLECTING")
+        active_request_id = task_state.get("request_id")
+        active_task_id = task_state.get("task_id")
+        active_trigger = task_state.get("trigger_source") or "web"
+
+    trigger = request.form.get('trigger', 'web') or 'web'
+    if trigger == 'web' and active and active_trigger in ('timer', 'ai_chat'):
+        trigger = active_trigger        # 板端回显默认值时不丢失调度归因
+    # 板端主动上传（物理按键 / BLE，无云端任务）也要有可溯源的 request_id
+    rid = active_request_id if active else _mint_capture_id("hw")
+    tid = active_task_id if active else None
+
     if 'image' not in request.files:
-        return jsonify({"error": "No image part"}), 400
+        _capture_failure("device_error", "设备返回错误：缺少 image 分片", rid, tid, trigger,
+                         int(now * 1000), unusable=True)
+        return jsonify({"error": "No image part", "request_id": rid, "blocked": True,
+                        "unusable": True}), 400
     file = request.files['image']
     if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
+        _capture_failure("device_error", "设备返回错误：文件名称为空", rid, tid, trigger,
+                         int(now * 1000), unusable=True)
+        return jsonify({"error": "No selected file", "request_id": rid, "blocked": True,
+                        "unusable": True}), 400
 
     # Read and validate file size BEFORE saving
     file.seek(0, os.SEEK_END)
@@ -277,41 +618,82 @@ def upload_photo():
     file.seek(0)
 
     if file_size < MIN_PHOTO_SIZE:
+        detail = f"设备返回错误：图像仅 {file_size} 字节（<{MIN_PHOTO_SIZE}B，空帧/镜头遮挡）"
         print(f"【告警】拒绝保存无效文件: {file.filename}, 大小仅 {file_size} 字节 (阈值 {MIN_PHOTO_SIZE})")
-        return jsonify({"error": f"File too small ({file_size} bytes), likely corrupt"}), 400
+        _capture_failure("empty_image", detail, rid, tid, trigger, int(now * 1000),
+                         unusable=True)
+        return jsonify({"error": f"File too small ({file_size} bytes), likely corrupt",
+                        "request_id": rid, "blocked": True, "unusable": True,
+                        "detail": detail}), 400
 
     # Validate JPEG magic bytes (FF D8 FF)
     header = file.read(3)
     file.seek(0)
     if header[:2] != b'\xff\xd8':
+        detail = f"设备返回错误：非 JPEG 数据（头部 {header.hex()}）"
         print(f"【告警】非JPEG文件，拒绝保存: {file.filename}, 头部: {header.hex()}")
-        return jsonify({"error": "Not a valid JPEG image"}), 400
+        _capture_failure("device_error", detail, rid, tid, trigger, int(now * 1000),
+                         unusable=True)
+        return jsonify({"error": "Not a valid JPEG image",
+                        "request_id": rid, "blocked": True, "unusable": True,
+                        "detail": detail}), 400
 
-    trigger = request.form.get('trigger', 'web')
-    # keep scheduler attribution: board echoes default 'web' for polled tasks
-    with lock:
-        if trigger == 'web' and task_state.get('trigger_source') == 'timer':
-            trigger = 'timer'
-
-    filename = f"photo_{int(time.time())}.jpg"
+    # 毫秒级文件名：同一秒内连续两次采集不会互相覆盖（旧命名 photo_<秒>.jpg 会撞名）
+    ms = int(time.time() * 1000)
+    filename = f"photo_{ms}.jpg"
     filepath = os.path.join(UPLOAD_FOLDER, filename)
     file.save(filepath)
     actual_size = os.path.getsize(filepath)
 
+    # ---- week7 要求 3：遮挡/画面不可用初判（<500B 或 偏黑=平均灰度 < 40）----
+    # 小于 500B 已在上面拦下（unusable=True，前端显示黄色遮挡告警）；这里补“偏黑/遮挡”判定。
+    # Bug1 fix: 原阈值 12 会漏判“遮住镜头”的黑图（实测 13.5 / 16.97），现放宽到 40。
+    avg_gray, dark_ratio = photo_avg_gray(filepath)
+    blocked = (actual_size < BLOCKED_MIN_SIZE) or (avg_gray is not None
+                                                   and avg_gray < BLOCKED_MAX_GRAY)
+    detail = None
+    if blocked:
+        detail = (f"画面可能被遮挡：平均灰度仅 {avg_gray}/255（阈值 {BLOCKED_MAX_GRAY:.0f}）"
+                  if avg_gray is not None else f"画面可能被遮挡：文件仅 {actual_size} 字节")
+        print(f"【遮挡告警】{filename} 判定画面不可用（{detail}，暗像素占比={dark_ratio}）")
+
     with lock:
-        task_state["latest_photo"] = filename
-        task_state["status"] = "COMPLETED"
-        task_state["trigger_source"] = trigger
-        task_state["ack_needed"] = (trigger == "physical_button")
-        task_state["last_update"] = time.time()
-        print(f"【任务完成】收到设备照片: {filename} ({actual_size} bytes, 触发源: {trigger})")
-    touch_device()
-    ledger_add(filename, actual_size)
+        task_state.update({
+            "latest_photo": filename,
+            "status": "COMPLETED",
+            "trigger_source": trigger,
+            "ack_needed": (trigger == "physical_button"),
+            "last_update": time.time(),
+            "request_id": rid,
+            "fail_reason": None,
+            "result": {"photo": filename, "size": actual_size, "blocked": blocked,
+                       "avg_gray": avg_gray, "dark_ratio": dark_ratio,
+                       "ts_ms": ms, "detail": detail},
+        })
+        print(f"【任务完成】收到设备照片: {filename} ({actual_size} bytes, "
+              f"触发源: {trigger}, request_id: {rid})")
+
+    # 图片与请求强关联落台账（含毫秒时间戳 + 遮挡判定）
+    ledger_add_attempt(rid, tid, trigger, ok=True, name=filename, size=actual_size,
+                       blocked=blocked, avg_gray=avg_gray, dark_ratio=dark_ratio,
+                       detail=detail, ts_ms=ms, state="COMPLETED")
+
+    # 一次有效采集 → 连续失败计数清零（不会误触发 30s 锁定）
+    with capture_lock:
+        if capture_gate["consecutive_fails"]:
+            print(f"【采集恢复】有效采集成功 → 连续失败计数清零"
+                  f"（原 {capture_gate['consecutive_fails']} 次）")
+        capture_gate["consecutive_fails"] = 0
 
     # Clean up old files: keep only last 50 photos
     cleanup_old_photos(50)
 
-    return jsonify({"status": "ok", "filename": filename}), 200
+    return jsonify({"status": "ok", "filename": filename, "request_id": rid,
+                    "ts_ms": ms, "blocked": blocked,
+                    # week7 fix(Bug1): blocked / unusable 两个字段都给出，前端任一命中即弹黄色遮挡告警
+                    "unusable": blocked, "avg_gray": avg_gray,
+                    "dark_ratio": dark_ratio, "detail": detail,
+                    "threshold": BLOCKED_MAX_GRAY}), 200
 
 def cleanup_old_photos(max_keep=50):
     """Remove oldest photos beyond max_keep and mark them cleaned in ledger."""
@@ -332,18 +714,40 @@ VALID_PHOTO_RE = re.compile(r'^photo_\d+\.jpg$')
 
 @app.route('/api/photos', methods=['GET'])
 def list_photos():
-    """Rich photo list (stored + cleaned) for gallery cards."""
+    """Rich photo list (stored + cleaned + week7 采集失败记录) for gallery cards."""
     out = []
     with ledger_lock:
-        entries = [e for e in ledger if VALID_PHOTO_RE.match(e.get("name", ""))]
+        entries = [e for e in ledger
+                   if VALID_PHOTO_RE.match(e.get("name") or "")
+                   or e.get("status") == "failed"]
     for e in reversed(entries):
+        ms = e.get("ts_ms")
+        if ms is None:                          # 兼容 week7 之前的台账条目
+            ms = int(float(e.get("ts") or 0) * 1000)
+        status = e.get("status")
+        has_file = bool(e.get("name")) and status == "stored"
+        stamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ms / 1000.0))
         out.append({
-            "name": e["name"],
-            "ts": e["ts"],
-            "time_str": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e["ts"])),
-            "size": e["size"],
-            "status": e["status"],
-            "url": f"/photos/{e['name']}" if e["status"] == "stored" else None,
+            "name": e.get("name"),
+            "ts": e.get("ts"),
+            "ts_ms": ms,                        # 毫秒级时间戳（溯源用）
+            "time_str": stamp,
+            "time_ms_str": f"{stamp}.{ms % 1000:03d}",   # week7: 画廊显示到毫秒
+            "size": e.get("size", 0),
+            "status": status,
+            "kind": e.get("kind") or ("photo" if status in ("stored", "cleaned") else "failed"),
+            "ok": bool(e.get("ok", status in ("stored", "cleaned"))),
+            "request_id": e.get("request_id"),   # week7: 本次采集的 request_id
+            "task_id": e.get("task_id"),
+            "trigger": e.get("trigger") or "web",     # week7: 触发来源
+            "blocked": bool(e.get("blocked")),        # week7: 遮挡/画面不可用初判
+            "unusable": bool(e.get("unusable")),
+            "avg_gray": e.get("avg_gray"),
+            "dark_ratio": e.get("dark_ratio"),
+            "reason": e.get("reason"),
+            "detail": e.get("detail"),
+            "state": e.get("state"),
+            "url": f"/photos/{e['name']}" if has_file else None,
         })
     return jsonify({"photos": out[:60]})
 
@@ -355,6 +759,21 @@ def get_status():
         data["device_ip"] = device_info["ip"]
         data["device_last_seen"] = device_info["last_seen"]
         data["rssi"] = device_info["rssi"]
+    # week7: 单张采集状态机快照（request_id / 剩余超时 / 遮挡判定 / 30s 锁定）
+    cap = _capture_public()
+    data["capture"] = cap
+    data["capture_request_id"] = cap["request_id"]
+    data["capture_locked"] = cap["locked"]
+    data["capture_lock_remaining"] = cap["lock_remaining"]
+    data["capture_blocked"] = cap["blocked"]
+    data["capture_unusable"] = cap["unusable"]
+    data["capture_photo"] = cap["photo"]
+    # week7 fix(Bug2): 设备在线判定（以板端心跳为准）→ 前端离线时冻结 IMU 曲线、停抓拍提示
+    online = device_online()
+    data["device_online"] = online
+    data["device_offline"] = (not online)
+    data["device_seen_age"] = device_seen_age()
+    data["device_online_window"] = DEVICE_ONLINE_WINDOW
     with timer_lock:
         data["timer_running"] = timer_state["running"]
         data["timer_current_batch"] = timer_state["current_batch"]
@@ -378,19 +797,33 @@ timer_state = {
 }
 _timer_stop_evt = None
 
-def create_capture_task(source):
-    """Shared task creation (web button / timer scheduler).
-    Refuses when board is still busy so a task id is never overwritten."""
+def create_capture_task(source, request_id=None):
+    """Shared task creation (web button / timer scheduler / AI chat).
+    Refuses when board is still busy so a task id is never overwritten.
+    week7: 每次下发绑定 request_id + 毫秒时间戳 + 10s 硬截止；先把 latest_photo 清空，
+    避免上一张旧图被误当成这一次的采集结果。"""
     with lock:
-        if task_state["status"] in ("PENDING", "ACCEPTED"):
+        if task_state["status"] in ("PENDING", "ACCEPTED", "COLLECTING"):
             return False, "busy"
-        tid = str(int(time.time()))
-        task_state["task_id"] = tid
-        task_state["status"] = "PENDING"
-        task_state["trigger_source"] = source
-        task_state["ack_needed"] = False
-        task_state["last_update"] = time.time()
-        print(f"【任务创建】下发拍照指令，任务ID: {tid}，触发源: {source}")
+        now = time.time()
+        tid = str(int(now))
+        rid = (request_id or "").strip() or _mint_capture_id()
+        task_state.update({
+            "task_id": tid,
+            "status": "PENDING",
+            "trigger_source": source,
+            "ack_needed": False,
+            "last_update": now,
+            "request_id": rid,                 # week7: 本次采集与 request_id 强关联
+            "created_at_ms": int(now * 1000),  # week7: 毫秒级下发时间戳
+            "accepted_at": None,
+            "deadline": now + CAPTURE_TIMEOUT_SECONDS,
+            "fail_reason": None,
+            "result": None,
+            "latest_photo": None,              # 清空旧图 → 前端不可能拿到上一张糊弄
+        })
+        print(f"【任务创建】下发拍照指令，任务ID: {tid}，触发源: {source}，"
+              f"request_id: {rid}（{CAPTURE_TIMEOUT_SECONDS:.0f}s 内必须收到图片）")
     return True, tid
 
 def timer_scheduler_loop(interval, max_batches, stop_evt):
@@ -403,7 +836,7 @@ def timer_scheduler_loop(interval, max_batches, stop_evt):
                 break  # stopped by user
             with lock:
                 st = task_state["status"]
-            if st in ("PENDING", "ACCEPTED"):
+            if st in ("PENDING", "ACCEPTED", "COLLECTING"):
                 print("【定时器】板端仍在处理上一任务，本轮跳过（不覆盖任务ID）")
                 continue
             ok, tid = create_capture_task("timer")
@@ -415,11 +848,11 @@ def timer_scheduler_loop(interval, max_batches, stop_evt):
             print(f"【定时器】第 {batch}/{max_batches} 批次已下发, task {tid}")
             if batch >= max_batches:
                 # wait for the final task to finish before declaring completion
-                deadline = time.time() + TIMEOUT_SECONDS + 10
+                deadline = time.time() + CAPTURE_TIMEOUT_SECONDS + 5
                 while not stop_evt.is_set() and time.time() < deadline:
                     with lock:
                         st = task_state["status"]
-                    if st in ("COMPLETED", "TIMEOUT"):
+                    if st in ("COMPLETED", "TIMEOUT", "FAIL"):
                         break
                     stop_evt.wait(0.5)
                 result = "stopped" if stop_evt.is_set() else "completed"
@@ -477,11 +910,23 @@ def timer_stop():
 # ---------------- API: IMU ----------------
 @app.route('/api/imu_data', methods=['GET'])
 def imu_data():
+    """实时 IMU 曲线数据。
+    week7 fix(Bug2): 附带在线判定字段；设备离线时只返回板端真实采样（不含任何模拟点），
+    前端据此把波形冻结在最后一帧并显示“设备离线，无实时数据”。"""
+    online = device_online()
     with imu_lock:
         hist = list(imu_history)[-60:]
+    if not online:
+        hist = [s for s in hist if s.get("source") == "device"]   # 离线：剥离模拟点，避免“假实时”
     latest = hist[-1] if hist else None
     return jsonify({"latest": latest, "history": hist,
-                    "source": (latest or {}).get("source", "simulated")})
+                    "source": (latest or {}).get("source", "device" if not online else "simulated"),
+                    "device_online": online,
+                    "offline": (not online),
+                    "stale": (not online),
+                    "frozen": (not online) and latest is not None,   # 有最后一帧真实数据 → 前端冻结
+                    "frozen_at": (latest or {}).get("t"),
+                    "device_seen_age": device_seen_age()})
 
 @app.route('/api/device/upload_imu', methods=['POST'])
 def upload_imu():
@@ -699,7 +1144,7 @@ def _execute_tool(func_name, request_id=None):
         with lock:
             ip = device_info["ip"]
             last_seen = device_info["last_seen"]
-            busy = task_state["status"] in ("PENDING", "ACCEPTED")
+            busy = task_state["status"] in ("PENDING", "ACCEPTED", "COLLECTING")
         online = bool(ip and last_seen and (time.time() - last_seen < 60))
         if not online:
             return json.dumps({"success": False, "reason": "设备离线",
@@ -713,8 +1158,8 @@ def _execute_tool(func_name, request_id=None):
             return json.dumps({"success": False, "reason": "任务创建失败",
                 "detail": "服务器内部错误，无法创建拍照任务。"}, ensure_ascii=False)
 
-        # Poll until COMPLETED/TIMEOUT/OFFLINE/CANCELLED (max 35s)
-        deadline = time.time() + 35
+        # Poll until COMPLETED/TIMEOUT/FAIL/OFFLINE/CANCELLED (week7: 采集硬超时 10s)
+        deadline = time.time() + CAPTURE_TIMEOUT_SECONDS + 5
         result_status = None
         result_photo = None
         abort_evt = request_abort_event(request_id)
@@ -729,7 +1174,7 @@ def _execute_tool(func_name, request_id=None):
             with lock:
                 st = task_state["status"]
                 photo = task_state.get("latest_photo")
-            if st in ("COMPLETED", "TIMEOUT"):
+            if st in ("COMPLETED", "TIMEOUT", "FAIL"):
                 result_status = st; result_photo = photo; break
             with lock:
                 ip_now = device_info["ip"]
@@ -738,10 +1183,22 @@ def _execute_tool(func_name, request_id=None):
                 result_status = "OFFLINE"; break
 
         if result_status == "COMPLETED":
-            return json.dumps({"success": True, "photo": result_photo, "task_id": tid}, ensure_ascii=False)
+            with lock:
+                meta = dict(task_state.get("result") or {})
+                rid_now = task_state.get("request_id")
+            return json.dumps({"success": True, "photo": result_photo, "task_id": tid,
+                               "request_id": rid_now,
+                               "blocked": bool(meta.get("blocked")),      # week7: 遮挡初判
+                               "avg_gray": meta.get("avg_gray"),
+                               "ts_ms": meta.get("ts_ms")}, ensure_ascii=False)
         elif result_status == "TIMEOUT":
             return json.dumps({"success": False, "reason": "任务超时",
-                "detail": "拍照指令已下发，但设备在30秒内未完成采集。"}, ensure_ascii=False)
+                "detail": f"拍照指令已下发，但设备在{CAPTURE_TIMEOUT_SECONDS:.0f}秒内未完成采集。"}, ensure_ascii=False)
+        elif result_status == "FAIL":
+            with lock:
+                why = task_state.get("fail_reason")
+            return json.dumps({"success": False, "reason": "设备返回错误",
+                "detail": f"设备上报错误（{why or '未知'}），本次采集未取得有效图像。"}, ensure_ascii=False)
         elif result_status == "CANCELLED":
             return _cancelled_tool_result()
         else:
@@ -1183,6 +1640,9 @@ def _format_tool_reply(tool_name, result):
         if "取消" in str(result.get("reason", "")) or "CANCELLED" in str(result.get("reason", "")):
             return "🛑 任务已停止。"
         if result.get("success"):
+            if result.get("blocked"):
+                return ("已为您拍摄，但⚠️ 画面可能被遮挡或采集失败，请检查镜头"
+                        "（平均灰度偏低）。")
             return "已为您拍摄，图片已上传。刷新页面即可查看。"
         reason = result.get("reason", "")
         if "离线" in reason or "未响应" in reason or "OFFLINE" in reason:
@@ -1190,9 +1650,12 @@ def _format_tool_reply(tool_name, result):
         if "繁忙" in reason or "忙" in reason:
             return "设备正忙（上一个任务尚未完成），请稍后再试。"
         if "超时" in reason or "TIMEOUT" in reason:
-            return "拍照指令已下发，但设备未在超时前完成采集，请重试。"
+            return (f"拍照指令已下发，但设备未在 {CAPTURE_TIMEOUT_SECONDS:.0f} 秒内完成采集"
+                    f"（❌ 采集失败：设备超时/错误），请重试。")
         if "创建失败" in reason or "内部错误" in reason:
             return "任务创建失败，服务器内部错误，请重试。"
+        if "错误" in reason or "FAIL" in reason:
+            return f"❌ 采集失败：设备返回错误（{result.get('detail') or reason}）。"
         # fallback
         return f"拍照未成功（{reason}），请重试。"
 
@@ -1209,7 +1672,8 @@ def _format_tool_reply(tool_name, result):
         rssi_str = f"{rssi} dBm" if rssi is not None else "未知"
         task = result.get("task_status", "IDLE")
         task_map = {"IDLE": "空闲", "PENDING": "等待中", "ACCEPTED": "已接收",
-                    "COMPLETED": "已完成", "TIMEOUT": "已超时"}
+                    "COLLECTING": "采集中", "COMPLETED": "已完成",
+                    "TIMEOUT": "已超时", "FAIL": "采集失败"}
         task_display = task_map.get(task, task)
         latest = result.get("latest_photo")
         photo_str = latest if latest else "无"
