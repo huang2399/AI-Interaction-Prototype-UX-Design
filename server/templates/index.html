@@ -215,6 +215,54 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
 .pcard-fail{border-color:rgba(248,113,113,.3);}
 .pcard-warn{border-color:rgba(251,191,36,.45);}
 .placeholder.fail{color:var(--red); background:repeating-linear-gradient(45deg,#1a0f12,#1a0f12 12px,#22141a 12px,#22141a 24px);}
+/* ---- week10: 多源观测状态 / 数据新鲜度(Stale) / 采集-接收-展示 三时间对照 ---- */
+.fresh-sep{margin-top:14px; padding-top:12px; border-top:1px dashed var(--line);}
+.fresh-title{display:flex; align-items:center; gap:8px; font-size:13px; font-weight:700; margin-bottom:9px; flex-wrap:wrap;}
+.fresh-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); gap:10px;}
+.fresh-item{padding:10px 11px; border-radius:10px; border:1px solid var(--line); border-left:4px solid var(--dim2); background:var(--card2);}
+.fresh-item.ok{border-left-color:var(--green);}
+.fresh-item.warn{border-left-color:var(--yellow); background:rgba(251,191,36,.06);}
+.fresh-item.err{border-left-color:var(--red); background:rgba(248,113,113,.06);}
+.fresh-head{display:flex; align-items:center; gap:6px; font-size:12.5px; font-weight:700;}
+.fresh-dot{width:8px; height:8px; border-radius:50%; background:var(--dim2); flex:0 0 auto;}
+.fresh-dot.ok{background:var(--green); box-shadow:0 0 8px rgba(52,211,153,.7);}
+.fresh-dot.warn{background:var(--yellow); box-shadow:0 0 9px rgba(251,191,36,.8); animation:pulse-step 1.4s ease-in-out infinite;}
+.fresh-dot.err{background:var(--red); box-shadow:0 0 9px rgba(248,113,113,.8);}
+.fresh-state{margin-left:auto; font-size:10.5px; font-weight:700; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--dim2); white-space:nowrap;}
+.fresh-state.ok{color:var(--green); border-color:rgba(52,211,153,.45); background:rgba(52,211,153,.12);}
+.fresh-state.warn{color:var(--yellow); border-color:rgba(251,191,36,.5); background:rgba(251,191,36,.12);}
+.fresh-state.err{color:var(--red); border-color:rgba(248,113,113,.5); background:rgba(248,113,113,.12);}
+.fresh-meta{margin-top:6px; font-size:10.8px; line-height:1.75; color:var(--dim2); font-family:Consolas,monospace; word-break:break-all;}
+.fresh-hint{margin-top:5px; font-size:11px; line-height:1.55; color:var(--dim);}
+.obs-net-warn{margin-top:10px; padding:8px 11px; border-radius:9px; font-size:12.5px; font-weight:700;
+  color:var(--yellow); background:rgba(251,191,36,.12); border:1px dashed rgba(251,191,36,.5);}
+.w10-ok{color:var(--green);} .w10-warn{color:var(--yellow);} .w10-err{color:var(--red);} .w10-dim{color:var(--dim2);}
+.pcard .ptimes{color:var(--dim2);}
+.w10-nofix{color:var(--yellow);}
+.obs-mask{position:fixed; inset:0; z-index:70; display:none; align-items:flex-start; justify-content:center;
+  padding:22px 18px; overflow:auto; background:rgba(2,6,23,.78); backdrop-filter:blur(3px);}
+.obs-mask.show{display:flex; animation:prompt-fade .18s ease-out;}
+.obs-card{width:100%; max-width:760px; border-radius:14px; border:1px solid rgba(34,211,238,.45); overflow:hidden;
+  background:linear-gradient(165deg,#182033,#0e1524); box-shadow:0 22px 70px rgba(0,0,0,.65);
+  animation:prompt-pop .22s cubic-bezier(.2,.9,.3,1.15);}
+.obs-head{display:flex; align-items:center; gap:9px; padding:12px 15px; font-size:14px; font-weight:800;
+  color:var(--cyan); background:rgba(34,211,238,.12); border-bottom:1px solid rgba(34,211,238,.3);}
+.obs-head .obs-rid{margin-left:auto; font-size:10.5px; font-weight:600; color:var(--dim2);
+  font-family:Consolas,monospace; max-width:290px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.obs-x{cursor:pointer; border:none; background:transparent; color:var(--dim); font-size:15px; font-weight:800; padding:0 2px;}
+.obs-body{padding:14px 15px 6px; font-size:13px; line-height:1.65;}
+.obs-sec{margin-top:13px; padding-top:11px; border-top:1px dashed var(--line);}
+.obs-sec-t{font-size:12.5px; font-weight:700; color:var(--cyan); margin-bottom:7px;}
+.obs-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(232px,1fr)); gap:8px;}
+.obs-row{padding:8px 10px; border-radius:9px; border:1px solid var(--line); background:#0b1220;}
+.obs-k{font-size:10.5px; color:var(--dim2); letter-spacing:.3px;}
+.obs-v{font-family:Consolas,monospace; font-size:11.5px; color:var(--txt); word-break:break-all; margin-top:3px;}
+.obs-v.ok{color:var(--green);} .obs-v.warn{color:var(--yellow);} .obs-v.err{color:var(--red);}
+.obs-img{width:100%; max-height:260px; object-fit:contain; border-radius:10px; border:1px solid var(--line); background:#0b1220; display:block;}
+.obs-note{margin-top:8px; font-size:11.5px; line-height:1.65; color:var(--dim2);}
+.obs-note.warn{color:var(--yellow);}
+.obs-foot{display:flex; gap:10px; padding:12px 15px 15px;}
+.obs-foot .btn{flex:1;}
 </style>
 </head>
 <body>
@@ -311,6 +359,8 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
         <div class="imu-offline-tip" id="imu_offline_tip" style="display:none">❌ 设备离线，无实时数据 · 波形已冻结</div>
       </div>
       <div class="imu-readout mono" id="imu_readout">AX: -- &nbsp; AY: -- &nbsp; AZ: --</div>
+      <div class="hint mono" id="imu_fresh_line" title="IMU 观测状态与三种时间戳（采集/接收/展示）">IMU 观测状态：--</div>
+      <div class="obs-net-warn" id="imu_net_nodata" style="display:none">⚠️ 网络连通，但传感器无新数据</div>
     </div>
     <div class="card">
       <div class="card-h"><span class="card-t">📶 设备状态</span></div>
@@ -319,6 +369,19 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
         <div class="dash-item"><div class="dash-k">RSSI 信号强度</div><div class="dash-v mono" id="dev_rssi">32</div><div class="bars"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></div></div>
         <div class="dash-item"><div class="dash-k">链路</div><div class="dash-v" style="font-size:13px" id="dev_link">HTTP 轮询 2s</div></div>
         <div class="dash-item"><div class="dash-k">最近上传</div><div class="dash-v small mono" id="dev_last">--</div></div>
+      </div>
+      <div class="fresh-sep">
+        <div class="fresh-title">🩺 数据新鲜度（观测 vs 当前状态）
+          <span class="pill pill-dim mono" id="fresh_policy_pill" style="margin-left:auto">阈值 --</span>
+        </div>
+        <div class="fresh-grid" id="fresh_grid"></div>
+        <div class="obs-net-warn" id="fresh_net_nodata" style="display:none">⚠️ 网络连通，但传感器无新数据</div>
+        <div class="hint mono" id="fresh_display_ack">展示刷新回执 displayed_at：--</div>
+        <div class="hint">每条源的独立性：摄像头“无新画面”（事件源，无固定阈值）与“抓拍失败”是两件事；定位在本次未取到 fix 时严格为空，
+          只用历史位置做参考，绝不用旧数据冒充当前状态。</div>
+      </div>
+      <div class="fresh-sep">
+        <button class="btn" onclick="openObsPanel(null,null)">🔍 原始数据观测对照</button>
       </div>
     </div>
   </section>
@@ -392,6 +455,21 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
     <div class="prompt-btns">
       <button class="prompt-btn retry" id="prompt_retry_btn" onclick="promptConfirmRetake()">🔄 确认重拍</button>
       <button class="prompt-btn ignore" id="prompt_ignore_btn" onclick="promptIgnore()">❌ 忽略</button>
+    </div>
+  </div>
+</div>
+<!-- week10: 原始数据观测对照（一条采集 = 一次历史观测：原图 + 采集/接收/展示三时间 + 推理耗时 + 位置） -->
+<div class="obs-mask" id="obs_mask" role="dialog" aria-modal="true" aria-label="原始数据观测对照">
+  <div class="obs-card">
+    <div class="obs-head">
+      <span>🔍</span><span>原始数据观测对照（观测 ≠ 当前状态）</span>
+      <span class="obs-rid mono" id="obs_rid">--</span>
+      <button class="obs-x" title="关闭 (Esc)" onclick="closeObsPanel()">✕</button>
+    </div>
+    <div class="obs-body" id="obs_body"><div class="obs-note">⏳ 正在读取观测记录…</div></div>
+    <div class="obs-foot">
+      <button class="btn" onclick="reportDisplayAckFromPanel()">🖥 我已看到这张图（上报展示刷新时间）</button>
+      <button class="btn" onclick="closeObsPanel()">关闭</button>
     </div>
   </div>
 </div>
@@ -1340,9 +1418,10 @@ function setImuOffline(off){
 function updateImu(){
   fetch('/api/imu_data').then(r=>r.json()).then(d=>{
     const offline = (d.offline === true) || (d.device_online === false);
+    const changed = setImuOffline(offline);
+    renderImuFreshness(d, offline);   // week10: 独立 IMU 状态 + 三种时间（陈旧=黄 / 丢失=红，绝不冒充当前）
     // 离线时后端已剥离模拟点；这里再加一道防线，避免任何来源的 SIM 数据被画进曲线
     const h = (d.history || []).filter(s => s.source === 'device' || !offline);
-    const changed = setImuOffline(offline);
     const srcPill = $('imu_src');
     if (offline){
       if (changed){                     // 只在“刚刚掉线”这一拍冻结在最后一帧真实数据
@@ -1361,6 +1440,8 @@ function updateImu(){
       if (d.source === 'device'){ srcPill.innerText = '● LIVE 1Hz (DEVICE)'; srcPill.className = 'pill pill-live'; }
       else { srcPill.innerText = '● SIM 1Hz（设备在线，待真实数据）'; srcPill.className = 'pill pill-dim'; }
     }
+    const fresh = (d.imu_state && d.imu_state.status) || '';   // week10: 网络在线 ≠ 传感器有数据
+    if (fresh === 'stale' || fresh === 'no_data' || fresh === 'fail') w10ImuPill(fresh, d.imu_state);
     _imuLastReal = h.slice(-60);
     renderImuReadout(h, false);
     if (useEcharts && chart){ chart.setOption({ xAxis:{data:h.map(s=>fmtClock(s.t))}, series:[{data:h.map(s=>s.ax)},{data:h.map(s=>s.ay)},{data:h.map(s=>s.az)}] }); }
@@ -1422,6 +1503,7 @@ function updateStatus(st){
     }
   }
   if (st.last_update){ const age=Math.max(0,Math.round(Date.now()/1000-st.last_update)); $('task_age').innerText='更新于 '+age+'s 前'; }
+  renderFreshness(st);   // week10: 每条源独立状态 + 数据新鲜度阈值 + 网络连通但无数据
 }
 // week8: 画廊卡片上的 AI 徽章（成功=绿色 / 拒识=黄色 / 人工修正=紫色）+ 纠正与重算按钮
 // week9: 若用户对这次采集选择了【忽略重拍建议】→ 卡片上打上灰底标记（台账 user_action 溯源）
@@ -1461,6 +1543,9 @@ function renderGallery(photos){
           '<div class="prow psub"><span>🕒 '+esc(when)+'</span></div>'+
           '<div class="prow psub"><span>🎯 '+esc(trig)+'</span></div>'+
           '<div class="prow psub"><span class="mono" title="request_id">🔗 '+rid+'</span></div>'+
+          '<div class="prow psub mono ptimes" title="采集时间：板端上报才有（缺失=null，绝不用接收时间冒充）"><span>📥 采集 '+esc(p.collected_at || '--（板端未上报）')+'</span></div>'+
+          '<div class="prow psub mono ptimes" title="服务器接收时间（权威）"><span>🛰 接收 '+esc(p.received_at || when)+'</span></div>'+
+          '<div class="prow psub"><span><button class="btn-mini" onclick="openObsPanel(\''+w10Arg(p.request_id)+'\',\'\')" title="这条失败记录的观测对照（时间/位置/来源）">🔍 观测对照</button></span></div>'+
           (isIgnoredRetake(p) ? '<div class="prow"><span class="tag tag-ignored" title="用户在主动询问中选择忽略；30 秒内不再弹窗">🚫 用户已忽略重拍建议</span></div>' : '')+
         '</div></div>';
     }
@@ -1476,8 +1561,297 @@ function renderGallery(photos){
       '<div class="prow psub"><span>🕒 '+esc(when)+'</span><span>'+sizeTxt+'</span></div>'+
       '<div class="prow psub"><span>🎯 '+esc(trig)+'</span>'+(grayTxt?'<span>'+grayTxt+'</span>':'')+'</div>'+
       '<div class="prow psub"><span class="mono" title="request_id">🔗 '+rid+'</span></div>'+
+      '<div class="prow psub mono ptimes" title="采集时间：板端上报才有（缺失=null，绝不用接收时间冒充）"><span>📥 采集 '+(p.collected_at ? esc(p.collected_at) : '--（板端未上报）')+'</span></div>'+
+      '<div class="prow psub mono ptimes" title="服务器接收时间（权威）+ 传输/入库延迟"><span>🛰 接收 '+esc(p.received_at || when)+(p.upload_latency_ms!=null?(' · 传输 +'+p.upload_latency_ms+'ms'):'')+'</span></div>'+
+      '<div class="prow psub mono ptimes" title="浏览器展示刷新时间（displayed_at，由 /api/display_ack 上报）"><span>🖥 展示 '+(p.displayed_at ? esc(p.displayed_at)+(p.display_latency_ms!=null?(' · 刷新 +'+p.display_latency_ms+'ms'):'') : '未回执（点🔍对照上报）')+'</span></div>'+
+      '<div class="prow psub" title="'+(p.location_fix ? '本次观测有位置解（与 request_id 绑定）' : esc(p.location_note||'本次无位置数据（no_fix）—— 不使用历史位置顶替'))+'"><span class="'+(p.location_fix?'':'w10-nofix')+'">📍 '+(p.location_fix ? ('已定位 '+(((p.location||{}).latitude!=null) ? ((p.location||{}).latitude+', '+(p.location||{}).longitude) : '经纬度 --')) : '本次无位置数据（no_fix）')+'</span></div>'+
+      '<div class="prow psub"><span><button class="btn-mini" onclick="openObsPanel(\''+w10Arg(p.request_id)+'\',\''+w10Arg(p.name)+'\')" title="原图 + 采集/接收/展示三时间 + 推理耗时 + 位置观测">🔍 原始数据观测对照</button></span></div>'+
       aiCardLine(p)+'</div></div>';
   }).join('');
+}
+// ======================================================================
+// week10: 观测(observation) 与 当前状态(state) 严格分离
+//   * 三种时间：采集 collected_at / 接收 received_at / 展示 displayed_at（缺谁就是 null）
+//   * 每条源独立判定新鲜度：>5s 黄“数据陈旧”，>10s 红“数据丢失/设备离线”（阈值来自后端）
+//   * 陈旧数据只允许“如实标注 + 冻结”，绝不当成当前状态展示
+// ======================================================================
+const W10_STATE_TEXT = {
+  online:'● 数据新鲜', ready:'● 就绪', capturing:'📥 采集中', stale:'⚠️ 数据陈旧',
+  offline:'❌ 数据丢失/设备离线', no_data:'○ 无数据', fail:'⛔ 故障', unknown:'未知'
+};
+const W10_STATE_CLS = {online:'ok', ready:'ok', capturing:'warn', stale:'warn',
+                       offline:'err', fail:'err', no_data:'dim', unknown:'dim'};
+const W10_SRC_NAME = {imu:'IMU 加速度计', camera:'摄像头 / 抓拍', location:'定位 GNSS', device:'设备心跳(网络)'};
+let _w10ImuStatus = '', _w10Policy = null, _w10AckKey = null, _w10ObsRid = null, _w10ObsName = null;
+
+function w10Cls(s){ return W10_STATE_CLS[s] || 'dim'; }
+function w10Txt(s){ return W10_STATE_TEXT[s] || (s || '未知'); }
+function w10Age(sec){ return (sec == null) ? '从未收到' : (Number(sec).toFixed(1) + 's 前'); }
+function w10Arg(s){ return String(s == null ? '' : s).replace(/[^A-Za-z0-9_.:+-]/g, ''); }   // 只允许安全字符进 onclick
+function w10Row(k, v, cls){
+  return '<div class="obs-row"><div class="obs-k">' + esc(k) + '</div><div class="obs-v'
+    + (cls ? ' ' + cls : '') + '">' + esc(v == null || v === '' ? '--' : String(v)) + '</div></div>';
+}
+function w10Item(title, status, meta, hint){
+  const c = w10Cls(status);
+  return '<div class="fresh-item ' + c + '">'
+    + '<div class="fresh-head"><span class="fresh-dot ' + c + '"></span><span>' + esc(title) + '</span>'
+    + '<span class="fresh-state ' + c + '">' + esc(w10Txt(status)) + '</span></div>'
+    + '<div class="fresh-meta">' + meta + '</div>'
+    + (hint ? '<div class="fresh-hint">' + esc(hint) + '</div>' : '') + '</div>';
+}
+function w10ImuPill(status, st){          // 阈值一律取后端 imu_state（前端不写死 5s/10s）
+  const pill = $('imu_src'); if (!pill) return;
+  st = st || {};
+  const sTxt = (st.stale_threshold_sec == null) ? '--' : st.stale_threshold_sec;
+  const oTxt = (st.offline_threshold_sec == null) ? '--' : st.offline_threshold_sec;
+  if (status === 'stale'){
+    pill.innerText = '⚠️ STALE · 数据陈旧（>' + sTxt + 's 无新采样）'; pill.className = 'pill pill-err';
+  } else if (status === 'no_data'){
+    pill.innerText = '○ NO DATA · 尚未收到真实采样'; pill.className = 'pill pill-dim';
+  } else if (status === 'fail'){
+    pill.innerText = '⛔ FAIL · 板端上报 IMU 故障'; pill.className = 'pill pill-err';
+  } else {
+    pill.innerText = '❌ OFFLINE · 数据丢失/设备离线（>' + oTxt + 's）'; pill.className = 'pill pill-err';
+  }
+}
+// 把“网络连通但传感器无新数据”如实贴出来（两处：IMU 卡片 + 设备状态卡片）
+function w10NetNoData(note){
+  ['imu_net_nodata', 'fresh_net_nodata'].forEach(function(id){
+    const el = $(id); if (!el) return;
+    el.style.display = note ? 'block' : 'none';
+    if (note) el.innerText = '⚠️ ' + note;
+  });
+}
+function renderImuFreshness(d, offline){
+  d = d || {};
+  const st = d.imu_state || {};
+  const latest = (d.latest && (d.latest.source === 'device' || !offline)) ? d.latest : null;
+  _w10ImuStatus = st.status || (offline ? 'offline' : 'unknown');
+  const line = $('imu_fresh_line');
+  if (line){
+    line.innerHTML = '观测状态 <b class="w10-' + w10Cls(_w10ImuStatus) + '">' + esc(w10Txt(_w10ImuStatus)) + '</b>'
+      + (st.age_sec != null ? '（观测年龄 ' + esc(String(st.age_sec)) + 's，阈值 ' + esc(String(st.stale_threshold_sec))
+          + 's 陈旧 / ' + esc(String(st.offline_threshold_sec)) + 's 丢失）' : '（' + esc(st.hint || '尚无观测') + '）')
+      + '<br>📥 采集 ' + esc(latest ? (latest.collected_at || (latest.collected_at_ms ? latest.collected_at_ms + 'ms' : '--（板端未上报）')) : '--')
+      + ' · 🛰 接收 ' + esc(latest ? (latest.received_at || latest.received_at_ms + 'ms') : '--')
+      + ' · 🖥 展示 ' + esc((d.display && d.display.displayed_at) || '--（未回执）');
+  }
+  if (offline) w10ImuPill('offline', st);
+  w10NetNoData(d.network_but_no_data || null);
+}
+function renderFreshness(st){
+  st = st || {};
+  const obs = st.observation || {};
+  const imu = st.imu_state || obs.imu_state || {};
+  const cam = st.camera_state || obs.camera_state || {};
+  const loc = st.location_state || obs.location_state || {};
+  const dev = st.device_state || obs.device_state || {};
+  const pol = st.freshness_policy || obs.policy || {};
+  const disp = st.display || obs.display || {};
+  _w10Policy = pol;
+  const pill = $('fresh_policy_pill');
+  if (pill && pol.imu_stale_sec != null){
+    pill.innerText = '更新 ' + fmtClock(Date.now() / 1000) + ' · IMU >' + pol.imu_stale_sec + 's ' + (pol.stale_note || '数据陈旧')
+      + ' / >' + pol.imu_offline_sec + 's ' + (pol.offline_note || '数据丢失') + ' · 定位 >' + pol.location_stale_sec
+      + 's ' + (pol.stale_note || '数据陈旧') + ' · 心跳窗口 ' + pol.device_window_sec + 's';
+  }
+  const grid = $('fresh_grid');
+  if (grid){
+    const imuMeta = [
+      '📥 采集 collected_at: ' + esc(imu.last_time || '--（板端未上报）'),
+      '🛰 接收 received_at: ' + esc(obs.server_time || '--'),
+      '🖥 展示 displayed_at: ' + esc(disp.displayed_at || '--（未回执）'),
+      '观测年龄: ' + esc(w10Age(imu.age_sec)) + '（阈值 ' + esc(String(pol.imu_stale_sec)) + 's / ' + esc(String(pol.imu_offline_sec)) + 's）',
+      '真实采样 ' + esc(String(imu.samples == null ? '--' : imu.samples)) + ' 条（SIM 预热点不计入年龄）'
+    ].join('<br>');
+    const camMeta = [
+      '最近成功画面: ' + esc(cam.last_time || '--') + '（' + esc(w10Age(cam.age_sec)) + '）',
+      '最近失败: ' + esc(cam.last_fail_time || '--') + (cam.fail_reason ? ('（原因 ' + esc(cam.fail_reason) + '）') : ''),
+      '本次采集状态: ' + esc(cam.capture_state || '--') + (cam.locked ? (' · 锁定剩余 ' + esc(String(cam.lock_remaining)) + 's') : ''),
+      '阈值: 不适用（事件源，不是周期采样源）'
+    ].join('<br>');
+    const locMeta = [
+      '本次是否有位置 fix: ' + esc(loc.fix ? ('是（request_id ' + (loc.request_id || '--') + '）') : '否（no_fix，严格为空）'),
+      '📥 定位采集时间: ' + esc(loc.collected_at || '--'),
+      '🛰 定位接收时间: ' + esc(loc.received_at || '--'),
+      '经纬度: ' + esc(loc.fix ? (loc.latitude + ', ' + loc.longitude) : 'null（不用历史位置顶替）'),
+      '历史位置: ' + esc((loc.historical && loc.historical.available)
+        ? ('仅参考 · ' + loc.historical.latitude + ',' + loc.historical.longitude) : '无')
+    ].join('<br>');
+    const devMeta = [
+      '网络: ' + esc(dev.ip || '--') + (dev.rssi != null ? (' · RSSI ' + esc(String(dev.rssi))) : ''),
+      '心跳: ' + esc(w10Age(dev.age_sec)) + '（窗口 ' + esc(String(dev.window_sec)) + 's）',
+      '状态是现算的：心跳一停就变红，不会留在“最后一次在线”'
+    ].join('<br>');
+    grid.innerHTML = w10Item('IMU 加速度计', imu.status || 'unknown', imuMeta, imu.hint)
+      + w10Item('摄像头 / 抓拍', cam.status || 'unknown', camMeta, cam.hint)
+      + w10Item('定位 GNSS', loc.status || 'unknown', locMeta, loc.hint)
+      + w10Item('设备心跳(网络)', dev.online ? 'online' : 'offline', devMeta, dev.hint);
+  }
+  const ack = $('fresh_display_ack');
+  if (ack){
+    ack.innerText = '展示刷新回执 displayed_at：' + (disp.displayed_at || '--（未回执）')
+      + (disp.displayed_at ? (' · 服务器落库 ' + (disp.received_at || '--')
+          + ' · 时钟偏差 ' + (disp.clock_skew_ms == null ? '--' : disp.clock_skew_ms + 'ms')) : '');
+  }
+  w10NetNoData(st.network_but_no_data || obs.network_but_no_data || null);
+}
+// ---- displayed_at 回执（三种时间里的第三种）：浏览器刷新展示这张图的时刻 ----
+function reportDisplayAck(request_id, filename){
+  const nowMs = Date.now();
+  return fetch('/api/display_ack', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({request_id: request_id || null, filename: filename || null,
+                          target:'observation', displayed_at_ms: nowMs, client_time_ms: nowMs})})
+    .then(r=>r.json()).then(d=>{
+      if (d && d.display){
+        const ack = $('fresh_display_ack');
+        if (ack) ack.innerText = '展示刷新回执 displayed_at：' + (d.display.displayed_at || '--')
+          + ' · 服务器落库 ' + (d.display.received_at || '--')
+          + ' · 时钟偏差 ' + (d.display.clock_skew_ms == null ? '--' : d.display.clock_skew_ms + 'ms')
+          + '（' + (d.written ? '已写回台账 ' + (d.photo || '') : '台账未命中，仅记录展示时刻') + '）';
+      }
+      return d;
+    }).catch(()=>null);
+}
+function maybeReportDisplay(photos){
+  const first = (photos || []).find(function(p){ return p.status === 'stored' && p.name; });
+  if (!first) return;
+  const key = first.name + '|' + (first.received_at_ms || '');
+  if (_w10AckKey === key) return;          // 同一张图只回执一次，避免每 2s 刷屏
+  _w10AckKey = key;
+  reportDisplayAck(first.request_id, first.name);
+}
+function reportDisplayAckFromPanel(){
+  if (!_w10ObsRid && !_w10ObsName){ showToast('err', '请先选择一条采集记录'); return; }
+  reportDisplayAck(_w10ObsRid, _w10ObsName).then(function(){
+    showToast('ok', '✅ 已上报展示刷新时间（displayed_at）');
+    loadObsPanel(false);
+  });
+}
+// ---- 原始数据观测对照面板（原图 + 三时间 + 延迟归因 + 推理耗时 + 位置） ----
+function obsImgFail(el){
+  el.outerHTML = '<div class="obs-note warn">原图不可用（配额到期已清理 / 加载失败）—— 采集/接收/展示时间与位置元数据仍完整保留</div>';
+}
+function openObsPanel(request_id, filename){
+  const mask = $('obs_mask'); if (!mask) return;
+  _w10ObsRid = request_id || null;
+  _w10ObsName = (filename && filename !== '') ? filename : null;
+  mask.className = 'obs-mask show';
+  const body = $('obs_body');
+  if (body) body.innerHTML = '<div class="obs-note">⏳ 正在读取观测记录…</div>';
+  loadObsPanel(true);      // 打开即上报 displayed_at，再拿回带展示时间的对照
+}
+function closeObsPanel(){ const m = $('obs_mask'); if (m) m.className = 'obs-mask'; }
+function loadObsPanel(withAck){
+  const qs = [];
+  if (_w10ObsRid) qs.push('request_id=' + encodeURIComponent(_w10ObsRid));
+  if (_w10ObsName) qs.push('filename=' + encodeURIComponent(_w10ObsName));
+  const url = '/api/observation' + (qs.length ? ('?' + qs.join('&')) : '');
+  const go = function(){
+    fetch(url).then(r=>r.json()).then(function(d){ renderObsPanel(d); }).catch(function(){
+      const body = $('obs_body');
+      if (body) body.innerHTML = '<div class="obs-note warn">❌ 读取观测记录失败（后端不可达）—— 不展示任何猜测数据</div>';
+    });
+  };
+  if (withAck && (_w10ObsRid || _w10ObsName)) reportDisplayAck(_w10ObsRid, _w10ObsName).then(go);
+  else go();
+}
+document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeObsPanel(); });
+function renderObsPanel(d){
+  const body = $('obs_body'); if (!body) return;
+  d = d || {};
+  const p = d.photo || {};
+  const ridTag = $('obs_rid');
+  if (ridTag) ridTag.innerText = p.request_id ? ('🔗 ' + p.request_id) : '（未指定：显示最近一条）';
+  let h = '';
+  if (!p.available){
+    h = '<div class="obs-note warn">' + esc(p.note || '暂无可对照的照片（先抓拍一次）') + '</div>';
+  } else {
+    if (p.url) h += '<img class="obs-img" src="' + p.url + '" alt="' + esc(p.name || '') + '" onerror="obsImgFail(this)">';
+    else h += '<div class="obs-note warn">原图已清理（时间 / 位置 / 推理元数据仍完整保留）</div>';
+    h += '<div class="obs-note">' + esc(p.name || '--') + ' · 状态 ' + esc(p.status || '--')
+      + ' · 触发 ' + esc(labelTrigger(p.trigger)) + '</div>';
+    h += '<div class="obs-sec"><div class="obs-sec-t">🕒 三种时间戳（缺谁就是 null，绝不互相冒充）</div><div class="obs-grid">'
+      + w10Row('① 采集 collected_at（来源: ' + (p.collected_at_source || 'unknown') + '）',
+               p.collected_at, p.collected_at ? 'ok' : 'warn')
+      + w10Row('② 接收 received_at（来源: ' + (p.received_at_source || 'server') + '）', p.received_at, 'ok')
+      + w10Row('③ 展示 displayed_at（来源: front / display_ack）', p.displayed_at, p.displayed_at ? 'ok' : 'warn')
+      + '</div><div class="obs-note">' + esc(((p.timing_note || {}).collected_at) || '')
+      + ' ' + esc(((p.timing_note || {}).displayed_at) || '') + '</div></div>';
+    h += '<div class="obs-sec"><div class="obs-sec-t">⏱ 延迟归因（每个差值的来源：慢在哪一步看得见）</div><div class="obs-grid">'
+      + w10Row('传输 + 入库 upload_latency_ms = 接收 − 采集',
+               p.upload_latency_ms == null ? 'null（板端未上报采集时间，无法计算）' : (p.upload_latency_ms + ' ms'),
+               p.upload_latency_ms == null ? 'warn' : 'ok')
+      + w10Row('页面展示 display_latency_ms = 展示 − 接收',
+               p.display_latency_ms == null ? 'null（尚未收到展示回执）' : (p.display_latency_ms + ' ms'),
+               p.display_latency_ms == null ? 'warn' : 'ok')
+      + w10Row('时钟偏差 skew_ms = 浏览器 − 服务器', p.skew_ms == null ? '--' : (p.skew_ms + ' ms'))
+      + '</div></div>';
+    const ai = p.ai || {};
+    h += '<div class="obs-sec"><div class="obs-sec-t">🤖 推理耗时（week8 结果：不属于传感器观测，单独列）</div><div class="obs-grid">'
+      + w10Row('推理耗时 cost_ms', ai.cost_ms == null ? '--（未推理 / 未记录）' : (ai.cost_ms + ' ms'))
+      + w10Row('结果 status / label', (ai.status || '--') + ' / ' + (ai.label || '--'))
+      + w10Row('score（置信度，不是准确率）', ai.score == null ? '--' : ai.score)
+      + w10Row('引擎 engine', ai.engine || '--')
+      + '</div></div>';
+    h += obsLocationSection(p);
+  }
+  h += obsFreshSection(d) + obsTimingNote(d);
+  body.innerHTML = h;
+}
+function obsLocationSection(p){
+  const lo = p.location || {}, hi = lo.historical_location || p.historical_location;
+  let h = '<div class="obs-sec"><div class="obs-sec-t">📍 本次位置观测（no_fix 时严格为空，历史位置只作参考）</div><div class="obs-grid">'
+    + w10Row('本次是否有位置 fix', lo.fix ? ('是（绑定 request_id ' + (lo.request_id || '--') + '）') : '否（no_fix）',
+             lo.fix ? 'ok' : 'warn')
+    + w10Row('定位采集时间 collected_at', lo.collected_at || '--', lo.collected_at ? 'ok' : '')
+    + w10Row('定位接收时间 received_at', lo.received_at_ms == null ? '--' : lo.received_at_ms + ' ms')
+    + w10Row('经纬度', lo.fix ? (lo.latitude + ', ' + lo.longitude) : 'null（不用历史位置顶替本次观测）',
+             lo.fix ? 'ok' : 'warn')
+    + w10Row('卫星数 satellites', lo.satellites == null ? '--' : lo.satellites)
+    + '</div>';
+  if (hi && hi.available){
+    h += '<div class="obs-note warn">🕘 历史位置（仅参考，不代表本次采集时的位置）：'
+      + esc(hi.latitude + ', ' + hi.longitude) + ' · 采集于 ' + esc(hi.collected_at || '--')
+      + (hi.note ? ' · ' + esc(hi.note) : '') + '</div>';
+  }
+  h += '<div class="obs-note">' + esc(p.location_note || p.no_fix_note || '') + '</div></div>';
+  return h;
+}
+function obsFreshSection(d){
+  d = d || {};
+  const pol = d.policy || _w10Policy || {};
+  const items = [['imu','IMU 加速度计'], ['camera','摄像头 / 抓拍'], ['location','定位 GNSS'], ['device','设备心跳(网络)']];
+  const rows = items.map(function(it){
+    const s = d[it[0]] || {};
+    const status = (it[0] === 'device') ? (s.online ? 'online' : 'offline') : (s.status || 'unknown');
+    return w10Row(it[1], w10Txt(status) + (s.age_sec == null ? '（无观测记录）' : (' · 观测年龄 ' + s.age_sec + 's')),
+                  w10Cls(status) === 'dim' ? '' : w10Cls(status));
+  }).join('');
+  let h = '<div class="obs-sec"><div class="obs-sec-t">🩺 当前状态（此刻现算，与上面这条历史观测分开）</div><div class="obs-grid">'
+    + rows + '</div>';
+  h += '<div class="obs-note">阈值全部来自后端同一份策略：IMU >' + esc(String(pol.imu_stale_sec)) + 's → '
+    + esc(pol.stale_note || '数据陈旧') + '，>' + esc(String(pol.imu_offline_sec)) + 's → '
+    + esc(pol.offline_note || '数据丢失') + '；定位 >' + esc(String(pol.location_stale_sec)) + 's → '
+    + esc(pol.stale_note || '数据陈旧') + '；设备心跳窗口 ' + esc(String(pol.device_window_sec))
+    + 's。陈旧数据只标注，绝不当成当前状态展示。</div>';
+  if (d.network_but_no_data) h += '<div class="obs-note warn">⚠️ ' + esc(d.network_but_no_data) + '</div>';
+  return h + '</div>';
+}
+function obsTimingNote(d){
+  const t = (d && d.timing) || {};
+  const dis = (d && d.display) || {};
+  return '<div class="obs-sec"><div class="obs-sec-t">📘 时间口径（前后端共用同一份解释）</div>'
+    + '<div class="obs-note">① ' + esc(t.collected_at || '采集时间：板端上报才有')
+    + '<br>② ' + esc(t.received_at || '接收时间：服务器权威时间戳')
+    + '<br>③ ' + esc(t.displayed_at || '展示时间：浏览器上报')
+    + '<br>' + esc(t.measured_latency || '') + '<br>' + esc(t.skew || '') + '</div>'
+    + '<div class="obs-note">最近一次展示回执：' + esc(dis.displayed_at || '--')
+    + (dis.displayed_at ? ('（浏览器 ' + esc(String(dis.client_time_ms == null ? '--' : dis.client_time_ms)) + ' ms · 服务器落库 '
+        + esc(dis.received_at || '--') + ' · 偏差 '
+        + esc(String(dis.clock_skew_ms == null ? '--' : dis.clock_skew_ms)) + ' ms）') : '')
+    + ' · 服务器当前时间 ' + esc((d && d.server_time) || '--') + '</div></div>';
 }
 function refresh(){
   fetch('/api/status').then(r=>r.json()).then(st=>{
@@ -1507,6 +1881,7 @@ function refresh(){
     renderGallery(all);
     updateCapturePreview(all);        // week7: 只认本次 request_id 的图片
     autoInferNew(all);                // week8: 新卡片出现 → 自动调用 /api/infer_image
+    maybeReportDisplay(all);          // week10: 页面确实渲染了这张图 → 上报 displayed_at（同一张只报一次）
     const first=all[0];
     $('dev_last').innerText = first ? (first.time_ms_str||first.time_str||'--').slice(5) : '--';
   }).catch(()=>{});

@@ -61,6 +61,27 @@ GRAY_SAMPLE = 64                 # 灰度统计前缩放到 64×64，足够快�
 # 而不是任务状态；超过该窗口没有任何板端请求 → 判定离线 → 前端必须冻结波形、绝不注入模拟数据。
 DEVICE_ONLINE_WINDOW = 6.0       # 秒；>6s 无心跳 = 离线（抓拍入口另用 60s 宽松窗口，见 trigger_capture）
 
+# ---------------- week10: 多源传感器状态 / 三种时间戳 / 数据陈旧（Stale）判定 ----------------
+# 任务书要求“区分传感器观测与当前状态”——绝不能把旧数据当成当前状态展示。实现要点：
+#   1) 三种时间【严格分开】，任何一处都不允许互相冒充：
+#      collected_at —— 传感器采集时间：只有板端明确上报才可信；没上报就是 null，
+#                      绝不用“服务器接收时间”伪装成采集时间（不同源 = 不同字段）；
+#      received_at  —— 服务器接收时间：权威、必有，用于算传输/入库延迟；
+#      displayed_at —— 前端展示刷新时间：由浏览器 POST /api/display_ack 上报并写回台账；
+#   2) 每个传感器源各自维护状态与时间戳（imu_state / camera_state / location_state），
+#      某个源陈旧绝不影响其它源的判定（不允许“拿最后一次成功值顶替当前状态”）；
+#   3) 数据陈旧判定（IMU 观测年龄，基准是【真实板端采样】而不是模拟预热点）：
+#        age <= IMU_STALE_SECONDS(5s)    → online  （绿：数据新鲜）
+#        5s < age <= IMU_OFFLINE_SECONDS(10s) → stale（黄：数据陈旧 / 网络连通但传感器无新数据）
+#        age > IMU_OFFLINE_SECONDS(10s)  → offline（红：数据丢失 / 设备离线）
+#      从未收到过真实采样 → no_data；板端上报 IMU 故障 → fail。
+IMU_STALE_SECONDS = 5.0           # > 5s 无新 IMU 观测 → stale（黄底：数据陈旧）
+IMU_OFFLINE_SECONDS = 10.0        # > 10s 无新 IMU 观测 → offline（红底：数据丢失/设备离线）
+LOCATION_STALE_SECONDS = 30.0     # 定位观测陈旧阈值（仅用于状态展示与提示）
+LOCATION_OFFLINE_SECONDS = 120.0  # 定位观测丢失阈值（仅用于状态展示与提示）
+OBSERVATION_NO_FIX_NOTE = "照片已拍，但本次无位置数据（保留历史位置）"   # week10 边界用例文案（前端与后端共用同一句）
+OBSERVATION_NET_NO_DATA = "网络连通，但传感器无新数据"                  # week10 边界用例文案（同上）
+
 try:
     from PIL import Image as _PILImage   # 仅用于“遮挡初判”的灰度统计（缺失时自动降级）
     _PIL_AVAILABLE = True
@@ -216,6 +237,584 @@ def _prompt_cooldown_active():
     with prompt_lock:
         return prompt_gate["cooldown_until"] > time.time()
 
+# ================== week10: 多源传感器独立状态 + 三种时间戳 ==================
+# 设计原则（任务书“区分传感器观测与当前状态”）：
+#   * 每个源的状态只由【该源自己的观测/事件】决定（IMU 观测 / 抓拍状态机 / 定位观测），
+#     某个源陈旧时其它源照旧判定 —— 不允许用别的源的“新鲜”来掩盖本源的陈旧；
+#   * 状态推导是【惰性】的：每次读取用「现在 - 该源最后一次真实观测时间」现算，
+#     所以 age_sec 永远在涨，不会出现“最后一次成功值被当成当前状态”的假象；
+#   * 所有时间都是 epoch 秒 / 毫秒，前端负责本地化显示。
+sensor_lock = threading.Lock()
+imu_fail = {                      # 板端上报的 IMU 故障（真故障才置位，不猜）
+    "active": False,
+    "detail": None,
+    "since_ms": None,
+}
+imu_display = {                   # 前端展示刷新记录（displayed_at 的回执）
+    "displayed_at": None,         # epoch 秒（浏览器时间）
+    "displayed_at_ms": None,      # epoch 毫秒
+    "request_id": None,           # 这次展示讨论的是哪一次采集
+    "photo": None,                # 哪张图（可空）
+    "source": None,               # 哪个接口上报的（imu / observation / ...）
+    "received_at": None,          # 上报时刻的服务器时间（对照浏览器时间的偏差用）
+    "client_time_ms": None,       # 浏览器本地时钟（用于展示两边时钟差）
+    "clock_skew_ms": None,        # 浏览器时间 - 服务器时间（>0 表示浏览器走得快）
+}
+location_state = {                # 定位模块（板端未上报 GPS 硬件时如实为 no_data）
+    "fix": False,                 # 本次是否有位置解
+    "latitude": None,
+    "longitude": None,
+    "satellites": None,
+    "accuracy_m": None,
+    "collected_at_ms": None,      # 传感器采集时间（板端上报才有）
+    "received_at_ms": None,       # 服务器接收时间
+    "received_at": None,
+    "last_fix_ms": None,          # 最近一次【成功定位】的采集时间（历史位置，仅作参考）
+    "last_fix_received_at_ms": None,
+    "last_fix_latitude": None,
+    "last_fix_longitude": None,
+    "last_fix_satellites": None,
+    "last_fix_request_id": None,  # 那次定位是绑在哪一次采集上的
+    "fail": False,
+    "fail_detail": None,
+    "fail_since_ms": None,
+    "count": 0,                   # 收到过的定位观测次数（含 fail）
+}
+camera_last_success_ms = None     # 最近一次“成功拿到画面”的服务器接收时间（毫秒）
+camera_last_fail_ms = None        # 最近一次“采集失败”的判定时间（毫秒，用于区分“没拍”与“拍失败”）
+
+
+def _ms_str(ms):
+    """epoch 毫秒 → 'YYYY-mm-dd HH:MM:SS.mmm'（与 week7 画廊时间戳同一格式）。"""
+    if ms is None:
+        return None
+    ms = int(ms)
+    return (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ms / 1000.0))
+            + ".%03d" % (ms % 1000))
+
+
+def _parse_ms_field(value):
+    """板端上报的时间字段 → epoch 毫秒（>1e11 视为毫秒、>1e9 视为秒，其余视为非法）。
+
+    week10：采集时间（collected_at）只接受板端明确上报的值，解析不出来就是 None，
+    由调用方决定“标注 unknown”，绝不用服务器时间冒充。"""
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v > 1e11:
+        return int(v)
+    if v > 1e9:
+        return int(v * 1000)
+    return None
+
+
+def _imu_latest_real_sample():
+    """最近一条【真实板端采样】的时间戳（epoch 秒）。
+
+    注意用 imu_last_real（只有 /api/device/upload_imu 真实上报才会推进）而不是
+    imu_history 的最后一点：这样“模拟预热点/SIM 点”永远不会被算成真实观测年龄。
+    """
+    with imu_lock:
+        t = float(imu_last_real or 0.0)
+        n = sum(1 for s in imu_history if s.get("source") == "device")
+    return (t if t > 0 else None), n
+
+
+def _obs_age_sec(ts, now=None):
+    """观测年龄（秒）。未收到过观测 → None（不是 0，也不允许拿别的源的时间顶替）。"""
+    if ts is None:
+        return None
+    now = time.time() if now is None else now
+    return max(0.0, now - ts)
+
+
+def _imu_state(now=None):
+    """IMU 源状态：online / stale / offline / no_data / fail。
+
+    * online   —— age_sec <= IMU_STALE_SECONDS(5s)：数据新鲜（前端绿底）
+    * stale    —— 5s < age_sec <= IMU_OFFLINE_SECONDS(10s)：数据陈旧（前端黄底）
+    * offline  —— age_sec > 10s：数据丢失 / 设备离线（前端红底）
+    * no_data  —— 从未收到真实采样（新板子/刚启动/固件没在传）
+    * fail     —— 板端明确上报 IMU 故障
+    注意：状态是【现算】的，age_sec 只增不减 —— 绝不会把“最后一次成功值”当成当前状态。
+    """
+    now = time.time() if now is None else now
+    with sensor_lock:
+        fail = dict(imu_fail)
+    last, samples = _imu_latest_real_sample()
+    age = _obs_age_sec(last, now)
+    last_ms = None if last is None else int(last * 1000)
+    if fail["active"]:
+        status = "fail"
+        hint = "板端上报 IMU 故障：" + str(fail.get("detail") or "未知原因")
+    elif last is None:
+        status = "no_data"
+        hint = "尚未收到任何 IMU 采样（板端未开始上传）"
+    elif age <= IMU_STALE_SECONDS:
+        status = "online"
+        hint = "IMU 数据新鲜"
+    elif age <= IMU_OFFLINE_SECONDS:
+        status = "stale"
+        hint = "数据陈旧：超过 %.0f 秒未收到新 IMU 采样" % IMU_STALE_SECONDS
+    else:
+        status = "offline"
+        hint = "数据丢失：超过 %.0f 秒未收到新 IMU 采样" % IMU_OFFLINE_SECONDS
+    return {
+        "status": status,
+        "age_sec": None if age is None else round(age, 1),
+        "last_time": None if last_ms is None else _ms_str(last_ms),
+        "last_time_ms": last_ms,
+        "displayed_at": _display_public().get("displayed_at"),     # 三种时间的第三种（前端刷新）
+        "fresh": status == "online",
+        "stale": status in ("stale", "offline", "no_data", "fail"),
+        "stale_threshold_sec": IMU_STALE_SECONDS,       # > 5s → stale
+        "offline_threshold_sec": IMU_OFFLINE_SECONDS,   # > 10s → offline
+        "offline_at_ms": None if last_ms is None else last_ms + int(IMU_OFFLINE_SECONDS * 1000),
+        "fail": bool(fail["active"]),
+        "fail_detail": fail.get("detail"),
+        "fail_since_ms": fail.get("since_ms"),
+        "samples": samples,                             # 已接收的真实采样条数
+        "exclude_simulated": True,                      # SIM 预热点不参与年龄计算（诚实标注）
+        "hint": hint,
+    }
+
+
+def _camera_state(now=None):
+    """摄像头/抓拍源状态：ready / capturing / fail（与 week7 采集状态机同一份事实）。"""
+    now = time.time() if now is None else now
+    with lock:
+        ts = dict(task_state)
+    gate = _capture_gate_state()
+    with sensor_lock:
+        last_ms = camera_last_success_ms
+        last_fail_ms = camera_last_fail_ms
+    st = ts.get("status") or "IDLE"
+    status = {"PENDING": "capturing", "ACCEPTED": "capturing",
+              "COLLECTING": "capturing", "COMPLETED": "ready",
+              "TIMEOUT": "fail", "FAIL": "fail"}.get(st, "ready")
+    hint = {"ready": "摄像头就绪（最近一次采集链路正常）",
+            "capturing": "正在采集画面（%s）" % st,
+            "fail": "最近一次采集失败：%s" % (ts.get("fail_reason") or st)}[status]
+    return {
+        "status": status,
+        "capture_state": st,
+        "last_time": None if last_ms is None else _ms_str(last_ms),
+        "last_time_ms": last_ms,
+        "age_sec": _obs_age_sec(None if last_ms is None else last_ms / 1000.0, now),
+        # week10: “没有画面”与“画面拍失败”是两件事，分开记录、分别展示
+        "last_fail_time": None if last_fail_ms is None else _ms_str(last_fail_ms),
+        "last_fail_time_ms": last_fail_ms,
+        "fail_age_sec": _obs_age_sec(None if last_fail_ms is None else last_fail_ms / 1000.0, now),
+        "fail_reason": ts.get("fail_reason"),
+        "has_frame": last_ms is not None,
+        "request_id": ts.get("request_id"),
+        "locked": gate["locked"],
+        "lock_remaining": gate["locked_remaining"],
+        "consecutive_fails": gate["consecutive_fails"],
+        "fresh": status != "fail",
+        "stale": status == "fail",
+        "stale_threshold_sec": None,      # 摄像头是【事件源】不是周期采样源：没有“几秒没数据”的阈值
+        "hint": hint,
+    }
+
+
+def _location_state(now=None):
+    """定位源状态：online / stale / offline / no_data / fail。
+
+    定位模块在本项目固件里【没有上报任何位置数据】，因此如实为 no_data；
+    有历史成功定位时，历史位置单独放在 historical 字段里（只作参考、带“不代表本次”标注），
+    绝不会被当成“当前状态”替代本次缺失的观测。
+    """
+    now = time.time() if now is None else now
+    with sensor_lock:
+        loc = dict(location_state)
+    last_fix_sec = loc["last_fix_ms"] / 1000.0 if loc.get("last_fix_ms") else None
+    age = _obs_age_sec(last_fix_sec, now)
+    if loc.get("fail"):
+        status = "fail"
+    elif loc.get("fix"):
+        status = "online"
+    elif last_fix_sec is None:
+        status = "no_data"
+    elif age <= LOCATION_STALE_SECONDS:
+        status = "online"
+    elif age <= LOCATION_OFFLINE_SECONDS:
+        status = "stale"
+    else:
+        status = "offline"
+    hint = {
+        "online": "定位数据新鲜",
+        "stale": "定位数据陈旧（超过 %.0f 秒无新定位）" % LOCATION_STALE_SECONDS,
+        "offline": "定位数据丢失（超过 %.0f 秒无新定位）" % LOCATION_OFFLINE_SECONDS,
+        "no_data": "本设备未上报位置数据（拍照时不使用历史位置顶替本次观测）",
+        "fail": "板端上报定位故障",
+    }[status]
+    has_fix = bool(loc.get("fix"))
+    return {
+        "status": status,
+        "fix": has_fix,                       # 本次观测是否有位置解（no_fix 时严格为 False）
+        "has_fix": has_fix,
+        "fix_is_current": has_fix,            # 只有“本次观测”才算当前状态
+        "no_fix": not has_fix,
+        "age_sec": None if age is None else round(age, 1),
+        "collected_at": None if not has_fix else _ms_str(loc.get("collected_at_ms")),
+        "collected_at_ms": loc.get("collected_at_ms") if has_fix else None,
+        "received_at": loc.get("received_at") and _ms_str(int(loc["received_at"] * 1000)),
+        "received_at_ms": loc.get("received_at_ms") if has_fix else None,
+        "last_time": None if not loc.get("collected_at_ms") else _ms_str(loc["collected_at_ms"]),
+        "latitude": loc.get("latitude") if has_fix else None,
+        "longitude": loc.get("longitude") if has_fix else None,
+        "satellites": loc.get("satellites") if has_fix else None,
+        "accuracy_m": loc.get("accuracy_m") if has_fix else None,
+        "request_id": loc.get("request_id") if has_fix else None,
+        "fresh": status == "online",
+        "stale": status in ("stale", "offline", "no_data", "fail"),
+        "stale_threshold_sec": LOCATION_STALE_SECONDS,
+        "offline_threshold_sec": LOCATION_OFFLINE_SECONDS,
+        "fail": bool(loc.get("fail")),
+        "fail_detail": loc.get("fail_detail"),
+        "observations": loc.get("count", 0),
+        # 历史位置（只作参考，绝不顶替当前观测）
+        "historical": {
+            "available": bool(loc.get("last_fix_ms")),
+            "collected_at": None if not loc.get("last_fix_ms") else _ms_str(loc["last_fix_ms"]),
+            "collected_at_ms": loc.get("last_fix_ms"),
+            "received_at_ms": loc.get("last_fix_received_at_ms"),
+            "latitude": loc.get("last_fix_latitude"),
+            "longitude": loc.get("last_fix_longitude"),
+            "satellites": loc.get("last_fix_satellites"),
+            "request_id": loc.get("last_fix_request_id"),
+            "age_sec": None if age is None else round(age, 1),
+            "note": "历史位置仅作参考，不代表本次采集时的位置" if loc.get("last_fix_ms") else None,
+        },
+        "hint": hint,
+    }
+
+
+def _device_state(now=None):
+    """网络/设备心跳状态（week7 既有语义，此处只做一次封装，字段保持兼容）。"""
+    now = time.time() if now is None else now
+    last = device_info.get("last_seen")
+    age = _obs_age_sec(last, now)
+    online = bool(last and age is not None and age <= DEVICE_ONLINE_WINDOW)
+    return {
+        "online": online,
+        "ip": device_info.get("ip"),
+        "rssi": device_info.get("rssi"),
+        "last_seen": last,
+        "last_seen_ms": None if last is None else int(last * 1000),
+        "age_sec": None if age is None else round(age, 1),
+        "window_sec": DEVICE_ONLINE_WINDOW,
+        "hint": "网络连通（板端心跳正常）" if online else "网络不通 / 设备离线（未收到板端心跳）",
+    }
+
+
+def _freshness_policy():
+    """阈值与文案集中一处：前端渲染底色/文案时直接取用，避免前后端两套阈值。"""
+    return {
+        "imu_stale_sec": IMU_STALE_SECONDS,
+        "imu_offline_sec": IMU_OFFLINE_SECONDS,
+        "location_stale_sec": LOCATION_STALE_SECONDS,
+        "location_offline_sec": LOCATION_OFFLINE_SECONDS,
+        "device_window_sec": DEVICE_ONLINE_WINDOW,
+        "stale_note": "数据陈旧",
+        "offline_note": "数据丢失/设备离线",
+        "no_fix_note": OBSERVATION_NO_FIX_NOTE,
+        "network_but_no_data_note": OBSERVATION_NET_NO_DATA,
+    }
+
+
+def _sensor_role_hints(net_ok, imu):
+    """week10 边界用例②：网络在线但数据未更新 → 明确标注，而不是伪装成在线数据。"""
+    if net_ok and imu["status"] in ("stale", "no_data"):
+        return OBSERVATION_NET_NO_DATA
+    if (not net_ok) and imu["status"] == "online":
+        return "IMU 观测仍新鲜，但已超过 %.0fs 无板端心跳（网络可能中断）" % DEVICE_ONLINE_WINDOW
+    return None
+
+
+def _current_observation(now=None):
+    """当前观测快照（week10 核心）：每个源谁的、多旧的，全部摆在明面上。"""
+    now = time.time() if now is None else now
+    imu = _imu_state(now)
+    cam = _camera_state(now)
+    loc = _location_state(now)
+    dev = _device_state(now)
+    return {
+        "server_time": _ms_str(int(now * 1000)),
+        "server_time_ms": int(now * 1000),
+        "imu": imu,
+        "camera": cam,
+        "location": loc,
+        "device": dev,
+        "imu_state": imu,            # 任务书命名的别名（外部脚本/前端都能直接取）
+        "camera_state": cam,
+        "location_state": loc,
+        "device_state": dev,
+        "network_ok": dev["online"],
+        "network_but_no_data": _sensor_role_hints(dev["online"], imu),
+        "policy": _freshness_policy(),
+    }
+
+
+def _display_public():
+    """displayed_at 回执（前端展示刷新时间）快照。"""
+    with sensor_lock:
+        d = dict(imu_display)
+    return {
+        "displayed_at": None if not d.get("displayed_at_ms") else _ms_str(d["displayed_at_ms"]),
+        "displayed_at_ms": d.get("displayed_at_ms"),
+        "received_at": None if not d.get("received_at_ms") else _ms_str(d["received_at_ms"]),
+        "received_at_ms": d.get("received_at_ms"),
+        "request_id": d.get("request_id"),
+        "photo": d.get("photo"),
+        "source": d.get("source"),
+        "client_time_ms": d.get("client_time_ms"),
+        "clock_skew_ms": d.get("clock_skew_ms"),
+        "server_age_sec": None if not d.get("received_at_ms")
+        else round((time.time() * 1000 - d["received_at_ms"]) / 1000.0, 1),
+    }
+
+
+def _observation_public(now=None):
+    """给 /api/status 与 /api/observation 的观测快照（含三种时间的来源说明 + 展示回执）。"""
+    obs = _current_observation(now)
+    obs["timing"] = {
+        "collected_at": "传感器采集时间：仅板端上报才有（没上报就是 null，绝不用接收时间冒充）",
+        "received_at": "服务器接收时间：权威时间戳，用于算传输/入库延迟",
+        "displayed_at": "前端展示刷新时间：由浏览器 POST /api/display_ack 上报",
+        "measured_latency": "接收时间 - 采集时间（端到端延迟；采集时间缺失时为 null 并标注原因）",
+        "skew": "浏览器时间 - 服务器时间（时钟偏差，用于解释展示时间与接收时间的差）",
+    }
+    obs["display"] = _display_public()
+    obs["no_fix_note"] = OBSERVATION_NO_FIX_NOTE
+    obs["network_but_no_data_note"] = OBSERVATION_NET_NO_DATA
+    return obs
+
+
+def _photo_observation(entry, obs=None):
+    """单张照片的“采集 / 接收 / 展示”三时间对照 + 本次位置观测（week10 对照面板用）。
+
+    每个时间差都给出【来源】，让“为什么慢”可归因：
+      upload_latency_ms  = received_at - collected_at（传输/入库；采集时间缺失 → null 并说明）
+      display_latency_ms = displayed_at - received_at（页面刷新/浏览器渲染）
+      skew_ms            = 浏览器时间 - 服务器时间（时钟偏差，解释上面两个差值）
+    """
+    obs = obs or _observation_public()
+    disp = obs.get("display") or {}
+    if not entry:
+        return {"available": False, "note": "暂无可对照的照片（先抓拍一次）",
+                "display": disp, "timing": obs.get("timing"),
+                "no_fix_note": OBSERVATION_NO_FIX_NOTE}
+    collected_ms = entry.get("collected_at_ms")
+    received_ms = entry.get("received_at_ms") or entry.get("ts_ms")
+    displayed_ms = entry.get("displayed_at_ms")
+    if entry.get("name") and disp.get("photo") == entry.get("name"):
+        displayed_ms = disp.get("displayed_at_ms") or displayed_ms
+    loc_fix = bool(entry.get("location_fix"))
+    has_hist = bool(entry.get("location_historical_available"))
+    return {
+        "available": True,
+        "name": entry.get("name"),
+        "request_id": entry.get("request_id"),
+        "url": ("/photos/" + entry["name"]) if entry.get("name") else None,
+        "status": entry.get("status"),
+        "trigger": entry.get("trigger"),
+        # ---- 三种时间（缺谁就是 null，绝不互相冒充） ----
+        "collected_at": entry.get("collected_at"),
+        "collected_at_ms": collected_ms,
+        "collected_at_source": entry.get("collected_at_source") or "unknown",
+        "received_at": entry.get("received_at") or _ms_str(received_ms),
+        "received_at_ms": received_ms,
+        "received_at_source": entry.get("received_at_source") or "server",
+        "displayed_at": None if not displayed_ms else _ms_str(displayed_ms),
+        "displayed_at_ms": displayed_ms,
+        "upload_latency_ms": (int(received_ms) - int(collected_ms)) if collected_ms else None,
+        "display_latency_ms": (int(displayed_ms) - int(received_ms)) if displayed_ms else None,
+        "skew_ms": disp.get("clock_skew_ms"),
+        # ---- 推理耗时（week8 结果，不属于传感器观测，单独列） ----
+        "ai": {
+            "cost_ms": entry.get("ai_cost_ms"),
+            "status": "success" if entry.get("ai_corrected") else entry.get("ai_status"),
+            "label": (entry.get("ai_label_manual") if entry.get("ai_corrected")
+                      else entry.get("ai_label")),
+            "score": entry.get("ai_score"),
+            "ts_ms": entry.get("ai_ts_ms"),
+            "engine": entry.get("ai_engine"),
+        },
+        # ---- 位置观测：本次无位置 → fix=False + latitude/longitude=None ----
+        "location_fix": loc_fix,
+        "location": {
+            "fix": loc_fix,
+            "collected_at": entry.get("location_collected_at"),
+            "collected_at_ms": entry.get("location_collected_at_ms"),
+            "received_at_ms": entry.get("location_received_at_ms"),
+            "latitude": entry.get("location_latitude"),
+            "longitude": entry.get("location_longitude"),
+            "satellites": entry.get("location_satellites"),
+            "request_id": entry.get("location_request_id"),
+            "note": entry.get("location_note") or (None if loc_fix else OBSERVATION_NO_FIX_NOTE),
+            "historical_location": {
+                "available": has_hist,
+                "latitude": entry.get("location_historical_latitude"),
+                "longitude": entry.get("location_historical_longitude"),
+                "collected_at": entry.get("location_historical_collected_at"),
+                "collected_at_ms": entry.get("location_historical_collected_at_ms"),
+                "note": entry.get("location_historical_note"),
+            } if has_hist else None,
+        },
+        "location_note": entry.get("location_note") or (None if loc_fix else OBSERVATION_NO_FIX_NOTE),
+        "no_fix_note": OBSERVATION_NO_FIX_NOTE,
+        "timing_note": {
+            "collected_at": ("板端上报的拍摄时刻" if collected_ms
+                             else "板端未上报采集时间 → null（未用接收时间冒充）"),
+            "received_at": "服务器收到图片并写入台账的时刻（权威）",
+            "displayed_at": "浏览器刷新展示这张图的时刻（前端 /api/display_ack 上报）",
+            "upload_latency_ms": "接收时间 - 采集时间（传输 + 入库延迟）",
+            "display_latency_ms": "展示时间 - 接收时间（页面刷新 / 渲染延迟）",
+        },
+        "display": disp,
+        "timing": obs.get("timing"),
+    }
+
+
+def _record_display_ack(request_id=None, photo=None, source="front",
+                        displayed_at_ms=None, client_time_ms=None):
+    """记录一次“前端已刷新展示”（displayed_at）。浏览器时间与服务器时间都留档，便于对照。"""
+    now_ms = int(time.time() * 1000)
+    with sensor_lock:
+        if displayed_at_ms:
+            imu_display["displayed_at_ms"] = int(displayed_at_ms)
+            imu_display["displayed_at"] = int(displayed_at_ms) / 1000.0
+        if client_time_ms:
+            imu_display["client_time_ms"] = int(client_time_ms)
+            imu_display["clock_skew_ms"] = int(client_time_ms) - now_ms
+        imu_display["received_at_ms"] = now_ms
+        imu_display["received_at"] = now_ms / 1000.0
+        imu_display["request_id"] = request_id or imu_display.get("request_id")
+        imu_display["photo"] = photo or imu_display.get("photo")
+        imu_display["source"] = source
+    return _display_public()
+
+
+def _set_imu_fail(active, detail=None):
+    """板端 IMU 故障的上报/清除（只在真收到板端报文时调用，不猜）。"""
+    with sensor_lock:
+        imu_fail["active"] = bool(active)
+        if active:
+            imu_fail["detail"] = detail or "板端上报 IMU 故障"
+            imu_fail["since_ms"] = int(time.time() * 1000)
+            print(f"【IMU 故障】{imu_fail['detail']}")
+        else:
+            imu_fail["detail"] = None
+            imu_fail["since_ms"] = None
+            print("【IMU 故障】板端恢复上报 → 故障标志清除")
+
+
+def _record_location(payload, received_ms=None):
+    """记录一条定位观测（真收到板端上报才调用）。fix=false 表示“本次无位置”。
+
+    边界用例①（有历史位置但本次 no_fix）在这里就被严格区分：fix=false 时
+    location_state["fix"] 保持 False，历史位置只留在 last_fix_* 里，绝不回填。
+    """
+    received_ms = int(time.time() * 1000) if received_ms is None else int(received_ms)
+    fix = bool(payload.get("fix"))
+    fail = bool(payload.get("fail"))
+    collected_ms = payload.get("collected_at_ms")
+    with sensor_lock:
+        location_state["count"] = location_state.get("count", 0) + 1
+        location_state["fix"] = fix
+        location_state["fail"] = fail
+        location_state["fail_detail"] = payload.get("detail") if fail else None
+        location_state["fail_since_ms"] = received_ms if fail else None
+        location_state["received_at_ms"] = received_ms
+        location_state["received_at"] = received_ms / 1000.0
+        location_state["collected_at_ms"] = collected_ms if fix else None
+        location_state["latitude"] = payload.get("latitude") if fix else None
+        location_state["longitude"] = payload.get("longitude") if fix else None
+        location_state["satellites"] = payload.get("satellites") if fix else None
+        location_state["accuracy_m"] = payload.get("accuracy_m") if fix else None
+        location_state["request_id"] = payload.get("request_id") if fix else None
+        if fix:
+            # 成功定位 → 更新“历史位置”（仅作参考，绑定那次采集的 request_id）
+            location_state["last_fix_ms"] = collected_ms or received_ms
+            location_state["last_fix_received_at_ms"] = received_ms
+            location_state["last_fix_latitude"] = payload.get("latitude")
+            location_state["last_fix_longitude"] = payload.get("longitude")
+            location_state["last_fix_satellites"] = payload.get("satellites")
+            location_state["last_fix_request_id"] = payload.get("request_id")
+    if fix:
+        print("【定位】本次有位置解 request_id=%s lat=%s lon=%s" % (
+            payload.get("request_id"), payload.get("latitude"), payload.get("longitude")))
+    elif fail:
+        print("【定位】板端上报定位故障：%s" % payload.get("detail"))
+    else:
+        print("【定位】本次无位置数据（no_fix）→ 不使用历史位置顶替")
+
+
+def _observation_link(entry, request_id=None, received_ms=None):
+    """把定位观测绑到某次采集上：只有【同一次采集】的位置才算本次的位置。
+
+    返回 (location_fix, location_note, location_public)：
+      * 有绑定   → (True, None, {...本次位置...})；
+      * 无绑定但有历史位置 → (False, "照片已拍，但本次无位置数据（保留历史位置）",
+                              {"historical_location": {...} + 明示“不代表本次”})；
+      * 都没有   → (False, "本次无位置数据（设备未上报定位，且无历史位置）", {...})
+
+    边界用例①就在这里被彻底处理：历史位置只出现在 historical_location 字段里，
+    本次的 latitude/longitude 一律为 None —— 前端不可能“拿旧位置顶替”。
+    """
+    rid = request_id or (entry or {}).get("request_id")
+    with sensor_lock:
+        loc = dict(location_state)
+    same_task = bool(rid) and (loc.get("request_id") == rid)
+    if loc.get("fix") and loc.get("collected_at_ms") and same_task:
+        return True, None, {
+            "fix": True,
+            "collected_at": _ms_str(loc["collected_at_ms"]),
+            "collected_at_ms": loc["collected_at_ms"],
+            "received_at": None if not loc.get("received_at_ms") else _ms_str(loc["received_at_ms"]),
+            "received_at_ms": loc.get("received_at_ms"),
+            "latitude": loc.get("latitude"),
+            "longitude": loc.get("longitude"),
+            "satellites": loc.get("satellites"),
+            "accuracy_m": loc.get("accuracy_m"),
+            "request_id": loc.get("request_id"),
+            "historical": False,
+            "note": "位置与本次采集同源（request_id 一致）",
+        }
+    has_hist = bool(loc.get("last_fix_ms"))
+    note = OBSERVATION_NO_FIX_NOTE if has_hist else "本次无位置数据（设备未上报定位，且无历史位置）"
+    return False, note, {
+        "fix": False,
+        "collected_at": None,
+        "collected_at_ms": None,
+        "received_at": None if not loc.get("received_at_ms") else _ms_str(loc["received_at_ms"]),
+        "received_at_ms": loc.get("received_at_ms"),
+        "latitude": None,          # 本次没有位置 → 严格为 None（绝不填历史值）
+        "longitude": None,
+        "satellites": None,
+        "accuracy_m": None,
+        "request_id": None,
+        "historical": True,
+        "note": note,
+        "historical_location": {
+            "available": has_hist,
+            "collected_at": None if not has_hist else _ms_str(loc["last_fix_ms"]),
+            "collected_at_ms": loc.get("last_fix_ms"),
+            "received_at_ms": loc.get("last_fix_received_at_ms"),
+            "latitude": loc.get("last_fix_latitude"),
+            "longitude": loc.get("last_fix_longitude"),
+            "satellites": loc.get("last_fix_satellites"),
+            "request_id": loc.get("last_fix_request_id"),
+            "note": "历史位置仅作参考，不代表本次采集时的位置" if has_hist else None,
+        },
+    }
+
+
 def check_timeout():
     """推进 week7 单张采集状态机（/api/status 与设备/AI 路径都会调用）。
       ACCEPTED --(板端 2s 冷却结束)--> COLLECTING（“采集中...”）
@@ -291,12 +890,21 @@ def _capture_gate_state():
         }
 
 def _capture_failure(reason, detail, request_id=None, task_id=None, trigger="web",
-                     ts_ms=None, unusable=False):
+                     ts_ms=None, unusable=False, collected_ms=None):
     """记一次失败的采集：写台账（含 request_id + 毫秒时间戳）→ 连续失败计数 →
-    连续 2 次失败即锁定抓拍 30s。返回台账条目。"""
+    连续 2 次失败即锁定抓拍 30s。返回台账条目。
+
+    week10: 失败记录同样区分三种时间（collected_at 只在板端上报时才有），
+    并同样经过 no_fix 位置绑定规则 —— 失败卡片上也不会出现“上次的位置”。"""
+    global camera_last_fail_ms
+    ms = int(ts_ms if ts_ms is not None else time.time() * 1000)
+    loc_fix, loc_note, loc_public = _observation_link(None, request_id=request_id, received_ms=ms)
     entry = ledger_add_attempt(request_id, task_id, trigger, ok=False, reason=reason,
-                               detail=detail, unusable=unusable, ts_ms=ts_ms,
-                               state="FAIL")
+                               detail=detail, unusable=unusable, ts_ms=ms,
+                               state="FAIL", collected_ms=collected_ms, received_ms=ms,
+                               location_fix=loc_fix, location_note=loc_note, location=loc_public)
+    with sensor_lock:
+        camera_last_fail_ms = ms        # week10: 记录“最后一次采集失败”的时间（与成功时间分开）
     # 板端报错（含 <500B 空帧）也要立即结束本次采集：否则 10s 到点后还会再记一次
     # 超时失败 → 同一次采集被计两次失败（也会把按钮误锁）。
     with lock:
@@ -739,6 +1347,20 @@ def ledger_load():
         e.setdefault("ts_ms", int(float(e.get("ts") or 0) * 1000))   # 旧记录补齐毫秒字段
         if e.get("status") == "stored" and not os.path.exists(os.path.join(UPLOAD_FOLDER, e["name"])):
             e["status"] = "cleaned"
+    # week10: 旧记录补齐三种时间字段（历史数据没有板端采集时间 → 如实标注 unknown，绝不冒充）
+    for e in ledger:
+        ms = int(e.get("ts_ms") or int(float(e.get("ts") or 0) * 1000))
+        e.setdefault("received_at_ms", ms)
+        e.setdefault("received_at", _ms_str(ms))
+        e.setdefault("received_at_source", "server")
+        e.setdefault("collected_at_ms", None)
+        e.setdefault("collected_at", None)
+        e.setdefault("collected_at_source", "unknown")   # 旧台账从未记录板端采集时间
+        e.setdefault("displayed_at_ms", None)
+        e.setdefault("displayed_at", None)
+        e.setdefault("upload_latency_ms", None)
+        e.setdefault("location_fix", False)
+        e.setdefault("location_note", None)
     ledger_save()
 
 ledger_load()
@@ -757,16 +1379,25 @@ def ledger_add(name, size, **extra):
 
 def ledger_add_attempt(request_id, task_id, trigger, ok, reason=None, detail=None,
                        name=None, size=0, blocked=False, avg_gray=None, dark_ratio=None,
-                       unusable=False, ts_ms=None, state=None, retake_of=None, prompt_id=None):
+                       unusable=False, ts_ms=None, state=None, retake_of=None, prompt_id=None,
+                       collected_ms=None, received_ms=None, collected_source=None,
+                       location_fix=False, location_note=None, location=None):
     """week7: 记录一次【真实硬件采集】的成败。
     成功 → status=stored（有图片文件）；失败 → status=failed（无图片文件，元数据保留）。
     两种记录都带 request_id 与毫秒级时间戳，满足“图像与请求强关联”的溯源要求。
-    失败的记录同样进入画廊（前端渲染成 ❌ 采集失败卡片），不会被软删除。"""
-    ms = int(ts_ms if ts_ms is not None else time.time() * 1000)
+    失败的记录同样进入画廊（前端渲染成 ❌ 采集失败卡片），不会被软删除。
+
+    week10: 严格区分三种时间 + 本次位置观测（绝不用历史值顶替）：
+      collected_at —— 传感器采集时间：只有板端上报（collected_ms）才写，否则 None；
+      received_at  —— 服务器接收时间：= ts_ms（本函数被调用的时刻），必有；
+      displayed_at —— 前端展示刷新时间：初始 None，由 /api/display_ack 回填。
+    """
+    ms = int(received_ms if received_ms is not None else
+             (ts_ms if ts_ms is not None else time.time() * 1000))
     entry = {
         "name": name,                                   # 失败时无文件（None）
-        "ts": ms / 1000.0,                              # 兼容旧字段（秒，浮点）
-        "ts_ms": ms,                                    # week7: 毫秒级精确时间戳
+        "ts": ms / 1000.0,                              # 兼容旧字段（秒，浮点）= 接收时间
+        "ts_ms": ms,                                    # week7: 毫秒级精确时间戳（接收时间）
         "size": size,
         "status": "stored" if ok else "failed",
         "kind": "photo" if ok else "failed",
@@ -781,7 +1412,35 @@ def ledger_add_attempt(request_id, task_id, trigger, ok, reason=None, detail=Non
         "dark_ratio": dark_ratio,                       # 近黑像素占比（诊断用）
         "reason": reason,
         "detail": detail,
+        # ---- week10: 三种时间（严格分开，互不冒充） ----
+        "received_at_ms": ms,
+        "received_at": _ms_str(ms),
+        "received_at_source": "server",
+        "collected_at_ms": int(collected_ms) if collected_ms else None,
+        "collected_at": _ms_str(collected_ms) if collected_ms else None,
+        # 板端没上报采集时间时如实标注来源为未知，绝不用 received_at 冒充
+        "collected_at_source": ("device" if collected_ms else (collected_source or "unknown")),
+        "displayed_at_ms": None,
+        "displayed_at": None,
+        # 端到端延迟（只在两端时间都可信时给出）
+        "upload_latency_ms": (ms - int(collected_ms)) if collected_ms else None,
+        # ---- week10: 本次位置观测（no_fix 时严格 False，历史值单独存放） ----
+        "location_fix": bool(location_fix),
+        "location_note": location_note,
     }
+    loc = location or {}
+    entry["location_collected_at_ms"] = loc.get("collected_at_ms")
+    entry["location_received_at_ms"] = loc.get("received_at_ms")
+    entry["location_latitude"] = loc.get("latitude")
+    entry["location_longitude"] = loc.get("longitude")
+    entry["location_satellites"] = loc.get("satellites")
+    entry["location_request_id"] = loc.get("request_id")
+    hist = loc.get("historical_location") or {}
+    entry["location_historical_available"] = bool(hist.get("available"))
+    entry["location_historical_latitude"] = hist.get("latitude")
+    entry["location_historical_longitude"] = hist.get("longitude")
+    entry["location_historical_collected_at_ms"] = hist.get("collected_at_ms")
+    entry["location_historical_note"] = hist.get("note")
     # week9: 本次采集若源自【主动询问】建议的重拍 → 记录来源（谁建议的、哪次询问），
     # 这样画廊里能一眼看出“这张是忽略/确认重拍链路里的哪一张”，也不会与其它采集串台。
     if retake_of:
@@ -1278,15 +1937,20 @@ def upload_photo():
     rid = active_request_id if active else _mint_capture_id("hw")
     tid = active_task_id if active else None
 
+    # ---- week10: 板端若随本次上传报了“拍摄/采集时刻”，先解析出来 ----
+    # 失败分支也如实记录（采集时间只来自板端上报，没上报就是 None，绝不用接收时间冒充）
+    collected_ms = _parse_ms_field(request.form.get('collected_at_ms')
+                                   or request.form.get('captured_at_ms'))
+
     if 'image' not in request.files:
         _capture_failure("device_error", "设备返回错误：缺少 image 分片", rid, tid, trigger,
-                         int(now * 1000), unusable=True)
+                         int(now * 1000), unusable=True, collected_ms=collected_ms)
         return jsonify({"error": "No image part", "request_id": rid, "blocked": True,
                         "unusable": True}), 400
     file = request.files['image']
     if file.filename == '':
         _capture_failure("device_error", "设备返回错误：文件名称为空", rid, tid, trigger,
-                         int(now * 1000), unusable=True)
+                         int(now * 1000), unusable=True, collected_ms=collected_ms)
         return jsonify({"error": "No selected file", "request_id": rid, "blocked": True,
                         "unusable": True}), 400
 
@@ -1299,7 +1963,7 @@ def upload_photo():
         detail = f"设备返回错误：图像仅 {file_size} 字节（<{MIN_PHOTO_SIZE}B，空帧/镜头遮挡）"
         print(f"【告警】拒绝保存无效文件: {file.filename}, 大小仅 {file_size} 字节 (阈值 {MIN_PHOTO_SIZE})")
         _capture_failure("empty_image", detail, rid, tid, trigger, int(now * 1000),
-                         unusable=True)
+                         unusable=True, collected_ms=collected_ms)
         return jsonify({"error": f"File too small ({file_size} bytes), likely corrupt",
                         "request_id": rid, "blocked": True, "unusable": True,
                         "detail": detail}), 400
@@ -1311,17 +1975,22 @@ def upload_photo():
         detail = f"设备返回错误：非 JPEG 数据（头部 {header.hex()}）"
         print(f"【告警】非JPEG文件，拒绝保存: {file.filename}, 头部: {header.hex()}")
         _capture_failure("device_error", detail, rid, tid, trigger, int(now * 1000),
-                         unusable=True)
+                         unusable=True, collected_ms=collected_ms)
         return jsonify({"error": "Not a valid JPEG image",
                         "request_id": rid, "blocked": True, "unusable": True,
                         "detail": detail}), 400
 
     # 毫秒级文件名：同一秒内连续两次采集不会互相覆盖（旧命名 photo_<秒>.jpg 会撞名）
-    ms = int(time.time() * 1000)
+    ms = int(time.time() * 1000)                      # 服务器接收时间（week10: received_at 基准）
     filename = f"photo_{ms}.jpg"
     filepath = os.path.join(UPLOAD_FOLDER, filename)
     file.save(filepath)
     actual_size = os.path.getsize(filepath)
+
+    # ---- week10: collected_ms 已在上文由 _parse_ms_field 解析（板端未上报则为 None） ----
+    if collected_ms and not (0 < ms - collected_ms < 3600_000):
+        print(f"【时间戳告警】板端采集时间与服务器时间差过大（{ms - collected_ms}ms）→ 丢弃该上报")
+        collected_ms = None
 
     # ---- week7 要求 3：遮挡/画面不可用初判（<500B 或 偏黑=平均灰度 < 40）----
     # 小于 500B 已在上面拦下（unusable=True，前端显示黄色遮挡告警）；这里补“偏黑/遮挡”判定。
@@ -1352,10 +2021,17 @@ def upload_photo():
               f"触发源: {trigger}, request_id: {rid})")
 
     # 图片与请求强关联落台账（含毫秒时间戳 + 遮挡判定）
+    # week10: 三种时间 + 本次位置观测（同一次采集才有位置；否则 no_fix + 历史位置另存）
+    loc_fix, loc_note, loc_public = _observation_link(None, request_id=rid, received_ms=ms)
     entry = ledger_add_attempt(rid, tid, trigger, ok=True, name=filename, size=actual_size,
                                blocked=blocked, avg_gray=avg_gray, dark_ratio=dark_ratio,
                                detail=detail, ts_ms=ms, state="COMPLETED",
-                               retake_of=active_retake_of, prompt_id=active_prompt_id)
+                               retake_of=active_retake_of, prompt_id=active_prompt_id,
+                               collected_ms=collected_ms, received_ms=ms,
+                               location_fix=loc_fix, location_note=loc_note, location=loc_public)
+    global camera_last_success_ms
+    with sensor_lock:
+        camera_last_success_ms = ms           # week10: 摄像头源“最近一次成功画面”的接收时间
 
     # ---- week8: 采集成功即自动做一次真实视觉推理（毫秒级），并把结果写回台账 ----
     # 这样画廊/采集面板无需额外请求就能显示可理解的反馈；前端仍会调用 /api/infer_image（命中缓存）。
@@ -1379,7 +2055,17 @@ def upload_photo():
                     # week7 fix(Bug1): blocked / unusable 两个字段都给出，前端任一命中即弹黄色遮挡告警
                     "unusable": blocked, "avg_gray": avg_gray,
                     "dark_ratio": dark_ratio, "detail": detail,
-                    "threshold": BLOCKED_MAX_GRAY}), 200
+                    "threshold": BLOCKED_MAX_GRAY,
+                    # ---- week10: 三种时间 + 本次位置观测（no_fix 时如实标注，绝不顶替） ----
+                    "collected_at_ms": collected_ms,
+                    "received_at_ms": ms,
+                    "received_at": _ms_str(ms),
+                    "upload_latency_ms": (ms - collected_ms) if collected_ms else None,
+                    "timing_source": {"collected_at": "device" if collected_ms else "unknown",
+                                      "received_at": "server"},
+                    "location_fix": loc_fix,
+                    "location_note": loc_note,
+                    "location": loc_public}), 200
 
 def cleanup_old_photos(max_keep=50):
     """Remove oldest photos beyond max_keep and mark them cleaned in ledger."""
@@ -1455,6 +2141,38 @@ def list_photos():
             "prompt_cooldown_until_ms": e.get("prompt_cooldown_until_ms"),
             "retake_of": e.get("retake_of"),          # 本次采集源自哪次采集（主动询问建议的重拍）
             "prompt_id": e.get("prompt_id"),          # 源自哪次主动询问
+            # ---- week10: 三种时间（采集/接收/展示）+ 时间差来源 + 本次位置观测 ----
+            "collected_at": e.get("collected_at"),
+            "collected_at_ms": e.get("collected_at_ms"),
+            "collected_at_source": e.get("collected_at_source") or "unknown",
+            "received_at": e.get("received_at"),
+            "received_at_ms": e.get("received_at_ms", ms),
+            "received_at_source": e.get("received_at_source") or "server",
+            "displayed_at": e.get("displayed_at"),
+            "displayed_at_ms": e.get("displayed_at_ms"),
+            "upload_latency_ms": e.get("upload_latency_ms"),
+            # 展示延迟：前端刷新展示时间 - 服务器接收时间（解释“我看到的比收到的晚多久”）
+            "display_latency_ms": (int(e["displayed_at_ms"]) - int(e.get("received_at_ms") or ms))
+            if e.get("displayed_at_ms") else None,
+            "timing_note": ("collected_at 来自板端上报；received_at 为服务器接收时间；"
+                            "displayed_at 由前端刷新时上报"),
+            "location_fix": bool(e.get("location_fix")),
+            "location_note": e.get("location_note"),
+            "location": {
+                "collected_at_ms": e.get("location_collected_at_ms"),
+                "received_at_ms": e.get("location_received_at_ms"),
+                "latitude": e.get("location_latitude"),
+                "longitude": e.get("location_longitude"),
+                "satellites": e.get("location_satellites"),
+                "request_id": e.get("location_request_id"),
+            },
+            "historical_location": {
+                "available": bool(e.get("location_historical_available")),
+                "latitude": e.get("location_historical_latitude"),
+                "longitude": e.get("location_historical_longitude"),
+                "collected_at_ms": e.get("location_historical_collected_at_ms"),
+                "note": e.get("location_historical_note"),
+            } if e.get("location_historical_available") else None,
             "url": f"/photos/{e['name']}" if has_file else None,
         })
     return jsonify({"photos": out[:60]})
@@ -1587,6 +2305,25 @@ def get_status():
     data["device_offline"] = (not online)
     data["device_seen_age"] = device_seen_age()
     data["device_online_window"] = DEVICE_ONLINE_WINDOW
+    # ---- week10: 多源独立状态 + 数据新鲜度（陈旧/离线阈值）+ 三种时间戳 + 观测快照 ----
+    obs = _observation_public()
+    data["observation"] = obs
+    data["imu_state"] = obs["imu_state"]              # 任务书：{"status","age_sec","last_time",...}
+    data["camera_state"] = obs["camera_state"]        # 任务书：{"status":"ready/capturing/fail",...}
+    data["location_state"] = obs["location_state"]    # 定位源独立状态（no_fix 严格区分）
+    data["device_state"] = obs["device_state"]
+    data["sensor_states"] = {                         # 一屏可读的“谁鲜活、谁陈旧”
+        "imu": obs["imu_state"]["status"],
+        "camera": obs["camera_state"]["status"],
+        "location": obs["location_state"]["status"],
+        "device": "online" if obs["device_state"]["online"] else "offline",
+    }
+    data["freshness_policy"] = obs["policy"]          # 5s stale / 10s offline 等阈值与文案
+    data["network_but_no_data"] = obs["network_but_no_data"]   # 网络连通但传感器无新数据
+    data["timing"] = obs["timing"]                    # 三种时间的含义（来源标注）
+    data["display"] = obs["display"]                  # 前端展示刷新时间（displayed_at）回执
+    data["server_time"] = obs["server_time"]
+    data["server_time_ms"] = obs["server_time_ms"]
     # ---- week8: 本次采集的视觉推理结果 + 可解释标签集（前端“人工纠正”下拉框直接复用）----
     ai_entry = None
     if cap.get("photo"):
@@ -1618,6 +2355,125 @@ def get_status():
         data["timer_interval"] = timer_state["interval"]
         data["timer_last_result"] = timer_state["last_result"]
     return jsonify(data)
+
+@app.route('/api/observation', methods=['GET', 'POST'])
+def observation():
+    """week10: “原始数据观测对照”面板的唯一数据源。
+
+    GET /api/observation[?request_id=..&filename=..]     → 观测快照 + 指定照片的三时间对照
+    POST /api/observation {request_id, filename, displayed_at_ms}
+         → 记录 displayed_at（前端展示刷新时间）后返回同一份对照
+
+    返回里的 photo 字段逐项标注每个时间差的来源：
+      collected_at  （板端采集，可能为 null）
+      received_at   （服务器接收，必有）
+      displayed_at  （浏览器刷新展示，上报后才有）
+      upload_latency_ms  = received_at - collected_at     （传输/入库延迟，采集时间缺失时为 null）
+      display_latency_ms = displayed_at - received_at     （“我看到的”比“服务器收到的”晚多久）
+      skew_ms            = 浏览器时间 - 服务器时间        （时钟偏差，用于解释上面两个差值）
+    定位一律走 no_fix 规则：本次没有位置时 location.fix=false + note 明说，历史位置另存。
+    """
+    d = request.get_json(silent=True) or {}
+    rid = str(d.get("request_id") or request.args.get("request_id") or "").strip()
+    fname = str(d.get("filename") or request.args.get("filename") or "").strip()
+    if fname and os.path.basename(fname) != fname:
+        return jsonify({"status": "error", "msg": "filename 非法（不允许路径）"}), 400
+    raw_disp = d.get("displayed_at_ms", request.args.get("displayed_at_ms"))
+    displayed_ms = None
+    if raw_disp:
+        try:
+            displayed_ms = int(float(raw_disp))
+        except (TypeError, ValueError):
+            displayed_ms = None
+    if displayed_ms:
+        _record_display_ack(request_id=rid or None, photo=fname or None,
+                            source="observation", displayed_at_ms=displayed_ms,
+                            client_time_ms=d.get("client_time_ms"))
+    obs = _observation_public()
+    entry = ledger_find_any(request_id=rid or None, filename=fname or None) if (rid or fname) \
+        else ledger_find_any()
+    obs["photo"] = _photo_observation(entry, obs)
+    return jsonify(obs), 200
+
+
+@app.route('/api/display_ack', methods=['POST'])
+def display_ack():
+    """week10: 前端每次刷新展示后回报 displayed_at（三种时间里的第三种）。
+
+    入参 JSON：{"request_id": .., "filename": .., "displayed_at_ms": 浏览器时间(ms),
+                "client_time_ms": 可选（浏览器本地时钟，用于算时钟偏差）,
+                "target": "imu"|"observation"|"status"（默认 observation）}
+    写回规则：能定位到台账记录（photo_* / 采集失败记录都可以）就只回填
+    displayed_at* 三个字段，其它字段（采集/接收/位置/推理）一律不动。"""
+    d = request.get_json(silent=True) or {}
+    rid = str(d.get("request_id") or request.args.get("request_id") or "").strip()
+    fname = str(d.get("filename") or request.args.get("filename") or "").strip()
+    target = str(d.get("target") or "observation").strip() or "observation"
+    if fname and os.path.basename(fname) != fname:
+        return jsonify({"status": "error", "msg": "filename 非法（不允许路径）"}), 400
+    raw_disp = d.get("displayed_at_ms")
+    displayed_ms = None
+    if raw_disp:
+        try:
+            displayed_ms = int(float(raw_disp))
+        except (TypeError, ValueError):
+            displayed_ms = None
+    if displayed_ms is None:                  # 前端没带就用服务器现在（并标注来源）
+        displayed_ms = int(time.time() * 1000)
+    ack = _record_display_ack(request_id=rid or None, photo=fname or None, source=target,
+                              displayed_at_ms=displayed_ms, client_time_ms=d.get("client_time_ms"))
+    entry = ledger_find_any(request_id=rid or None, filename=fname or None) if (rid or fname) else None
+    if entry:
+        ledger_save_ai(entry, displayed_at_ms=displayed_ms, displayed_at=_ms_str(displayed_ms),
+                       displayed_at_source="front")
+    return jsonify({"status": "ok", "display": ack,
+                    "photo": (entry or {}).get("name"),
+                    "request_id": (entry or {}).get("request_id") or (rid or None),
+                    "written": bool(entry)}), 200
+
+
+@app.route('/api/device/upload_location', methods=['POST'])
+def upload_location():
+    """week10: 板端上报一条定位观测（可选接口：固件没有定位能力就不调用）。
+
+    入参 JSON：{"fix": true/false, "latitude":.., "longitude":.., "satellites":..,
+                "collected_at_ms": 采集时刻(ms|秒), "request_id": 绑定哪次采集,
+                "fail": true, "detail": ".."}
+    语义（边界用例①）：
+      * fix=true  → 本次有位置（带 request_id 时只绑定这一次采集）；
+      * fix=false → 本次【无位置数据】，历史位置不回填，只留在 historical 里；
+      * fail=true → 定位模块故障（location_state=fail）。"""
+    d = request.get_json(silent=True) or {}
+    touch_device()                    # 板端上报定位同样算设备心跳
+    raw_fail = d.get("fail")
+    fail = raw_fail is not None and str(raw_fail).lower() not in ("", "0", "false", "none")
+    if fail:
+        _record_location({"fix": False, "fail": True,
+                          "detail": str(d.get("detail") or d.get("msg") or "定位模块无响应"),
+                          "request_id": str(d.get("request_id") or "").strip() or None})
+        return jsonify({"status": "ok", "action": "fail",
+                        "location_state": _location_state()}), 200
+    fix = bool(d.get("fix", d.get("has_fix", d.get("valid", False))))
+    collected_ms = _parse_ms_field(d.get("collected_at_ms", d.get("ts_ms")))
+    lat = d.get("latitude", d.get("lat"))
+    lon = d.get("longitude", d.get("lon", d.get("lng")))
+    if fix and (lat is None or lon is None):
+        return jsonify({"status": "error",
+                        "msg": "fix=true 时必须带 latitude/longitude"}), 400
+    _record_location({
+        "fix": fix,
+        "fail": False,
+        "collected_at_ms": collected_ms,
+        "latitude": None if lat is None else float(lat),
+        "longitude": None if lon is None else float(lon),
+        "satellites": d.get("satellites", d.get("sats")),
+        "accuracy_m": d.get("accuracy_m"),
+        "request_id": str(d.get("request_id") or "").strip() or None,
+    })
+    return jsonify({"status": "ok", "action": "fix" if fix else "no_fix",
+                    "location_state": _location_state(),
+                    "note": None if fix else OBSERVATION_NO_FIX_NOTE}), 200
+
 
 @app.route('/photos/<filename>')
 def get_photo(filename):
@@ -1753,13 +2609,26 @@ def timer_stop():
 def imu_data():
     """实时 IMU 曲线数据。
     week7 fix(Bug2): 附带在线判定字段；设备离线时只返回板端真实采样（不含任何模拟点），
-    前端据此把波形冻结在最后一帧并显示“设备离线，无实时数据”。"""
+    前端据此把波形冻结在最后一帧并显示“设备离线，无实时数据”。
+
+    week10: 每条采样都带三种时间（collected_at / received_at / displayed_at），并附带
+    imu_state（online/stale/offline/no_data/fail + age_sec）——前端据此给“数据延迟”上色，
+    绝不允许把陈旧数据当成当前状态展示。"""
     online = device_online()
     with imu_lock:
         hist = list(imu_history)[-60:]
     if not online:
         hist = [s for s in hist if s.get("source") == "device"]   # 离线：剥离模拟点，避免“假实时”
+    disp = _display_public()
+    for s in hist:                       # 逐条补齐三种时间的显式字段（缺的就是 null）
+        s["collected_at_ms"] = s.get("collected_at_ms")
+        s.setdefault("collected_at", None)
+        s["received_at_ms"] = s.get("received_at_ms") or (int(float(s.get("t") or 0) * 1000))
+        s["received_at"] = _ms_str(s["received_at_ms"])       # 与 gallery 同一格式（前端直接显示）
+        s["displayed_at_ms"] = disp.get("displayed_at_ms")
+        s["displayed_at"] = disp.get("displayed_at")
     latest = hist[-1] if hist else None
+    imu_now = _imu_state()
     return jsonify({"latest": latest, "history": hist,
                     "source": (latest or {}).get("source", "device" if not online else "simulated"),
                     "device_online": online,
@@ -1767,15 +2636,44 @@ def imu_data():
                     "stale": (not online),
                     "frozen": (not online) and latest is not None,   # 有最后一帧真实数据 → 前端冻结
                     "frozen_at": (latest or {}).get("t"),
-                    "device_seen_age": device_seen_age()})
+                    "device_seen_age": device_seen_age(),
+                    # ---- week10: 独立状态 + 数据新鲜度 + 三种时间说明 ----
+                    "imu_state": imu_now,
+                    "age_sec": imu_now["age_sec"],                   # 数据延迟（秒），只增不减
+                    "freshness": ("online" if imu_now["status"] == "online" else
+                                  "stale" if imu_now["status"] == "stale" else "offline"),
+                    "stale_threshold_sec": IMU_STALE_SECONDS,        # > 5s → 黄底“数据陈旧”
+                    "offline_threshold_sec": IMU_OFFLINE_SECONDS,    # > 10s → 红底“数据丢失/设备离线”
+                    "network_but_no_data": _sensor_role_hints(online, imu_now),
+                    "timing": {
+                        "collected_at": "传感器采集时间（板端上报才有，否则 null）",
+                        "received_at": "服务器接收时间",
+                        "displayed_at": "前端展示刷新时间（/api/display_ack 上报）",
+                    },
+                    "display": disp,
+                    "server_time_ms": int(time.time() * 1000)})
 
 @app.route('/api/device/upload_imu', methods=['POST'])
 def upload_imu():
     """Real IMU samples from board firmware (QMA6100P, m/s^2).
     Accepts {"x","y","z"} (firmware v3 payload) or {"ax","ay","az"} (legacy).
-    Real data wins for 5 s windows: /api/imu_data reports source='device'."""
+    Real data wins for 5 s windows: /api/imu_data reports source='device'.
+
+    week10 追加（全部可选，板端不报就是 null，绝不猜测）：
+      * {"collected_at_ms": <ms|秒>} / {"captured_at_ms"} → 传感器采集时间（collected_at）；
+      * {"fail": true, "detail": "..."}                    → 板端上报 IMU 故障（imu_state=fail）；
+      * {"fail": false}                                    → 故障恢复。
+    服务器接收时间（received_at）始终由本接口自己打点，是权威值。"""
     global imu_last_real
     d = request.get_json(silent=True) or {}
+    raw_fail = d.get("fail", d.get("fault", d.get("error")))
+    if raw_fail is not None and str(raw_fail).lower() not in ("", "0", "false", "none"):
+        _set_imu_fail(True, str(d.get("detail") or d.get("msg") or "板端上报 IMU 故障"))
+        touch_device()
+        return jsonify({"status": "ok", "imu_fail": True,
+                        "imu_state": _imu_state()}), 200
+    if raw_fail is not None and str(raw_fail).lower() in ("0", "false"):
+        _set_imu_fail(False)
     try:
         ax = float(d.get("ax", d.get("x", 0)))
         ay = float(d.get("ay", d.get("y", 0)))
@@ -1786,14 +2684,26 @@ def upload_imu():
     ax = min(max(ax, -30.0), 30.0)
     ay = min(max(ay, -30.0), 30.0)
     az = min(max(az, -30.0), 30.0)
-    sample = {"t": round(time.time(), 3),
+    received_ms = int(time.time() * 1000)          # week10: 服务器接收时间（权威）
+    collected_ms = _parse_ms_field(d.get("collected_at_ms", d.get("captured_at_ms", d.get("ts_ms"))))
+    if collected_ms and abs(received_ms - collected_ms) > 3600_000:
+        print(f"【时间戳告警】IMU 采集时间与接收时间差过大（{received_ms - collected_ms}ms）→ 丢弃")
+        collected_ms = None
+    sample = {"t": round(received_ms / 1000.0, 3),
               "ax": round(ax, 3), "ay": round(ay, 3), "az": round(az, 3),
-              "source": "device"}
+              "source": "device",
+              # ---- week10: 三种时间（逐条采样，绝不用接收时间冒充采集时间） ----
+              "collected_at_ms": collected_ms,
+              "received_at_ms": received_ms}
     with imu_lock:
         imu_history.append(sample)
-        imu_last_real = time.time()
+        imu_last_real = received_ms / 1000.0
     touch_device()
-    return jsonify({"status": "ok"}), 200
+    if imu_fail["active"]:
+        _set_imu_fail(False)      # 收到真实采样 → 故障自动解除
+    return jsonify({"status": "ok", "received_at_ms": received_ms,
+                    "collected_at_ms": collected_ms,
+                    "imu_state": _imu_state()}), 200
 
 # ---------------- API: AI Chat with Function Calling ----------------
 import urllib.request
