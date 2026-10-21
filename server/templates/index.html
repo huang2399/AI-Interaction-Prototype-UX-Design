@@ -59,8 +59,8 @@ body{background:radial-gradient(1200px 600px at 80% -10%, rgba(34,211,238,.08), 
 .badge-dim{background:rgba(148,163,184,.1); color:var(--dim); border:1px solid var(--line);}
 .form-row{display:flex; gap:10px; margin-bottom:10px; flex-wrap:wrap;}
 .form-row label{flex:1; min-width:120px; font-size:12px; color:var(--dim); display:flex; flex-direction:column; gap:6px;}
-input[type=number], select{background:#0b1220; border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:9px 10px; font-size:14px; font-family:Consolas,monospace; outline:none;}
-input[type=number]:focus, select:focus{border-color:rgba(34,211,238,.5);}
+input[type=text], input[type=number], select{background:#0b1220; border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:9px 10px; font-size:14px; font-family:Consolas,monospace; outline:none;}
+input[type=text]:focus, input[type=number]:focus, select:focus{border-color:rgba(34,211,238,.5);}
 #imu_chart{width:100%; height:300px; border:none;}
 .legend{display:flex; gap:12px; font-size:12px; color:var(--dim); align-items:center;}
 .legend i{display:inline-block; width:10px; height:3px; border-radius:2px; margin-right:5px; vertical-align:middle;}
@@ -154,6 +154,24 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
 .cap-preview .cap-tag.warn{background:rgba(251,191,36,.9); color:#3a2606; left:8px; right:auto; font-weight:700;}
 .cap-warn{margin-top:10px; padding:9px 11px; border-radius:9px; font-size:12.5px; font-weight:700; color:var(--yellow); background:rgba(251,191,36,.12); border:1px solid rgba(251,191,36,.45);}
 .cap-err{margin-top:10px; padding:9px 11px; border-radius:9px; font-size:12.5px; font-weight:700; color:var(--red); background:rgba(248,113,113,.12); border:1px solid rgba(248,113,113,.45);}
+/* ---- week8: 视觉推理徽章（置信度，不是准确率）+ 人工纠正 ---- */
+.ai-row{display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:10px;}
+.ai-badge{display:inline-flex; align-items:center; gap:5px; padding:5px 10px; border-radius:8px; font-size:12px;
+  font-weight:700; letter-spacing:.2px; border:1px solid var(--line); background:var(--card2); color:var(--dim);}
+.ai-badge.ok{background:rgba(52,211,153,.15); color:var(--green); border-color:rgba(52,211,153,.45);}
+.ai-badge.warn{background:rgba(251,191,36,.15); color:var(--yellow); border-color:rgba(251,191,36,.45);}
+.ai-badge.fix{background:rgba(167,139,250,.15); color:var(--violet); border-color:rgba(167,139,250,.45);}
+.ai-badge.dim{color:var(--dim2);}
+.ai-badge small{font-weight:500; opacity:.85;}
+.ai-ver{font-size:11px; font-weight:500; color:var(--dim2); letter-spacing:.2px; font-family:Consolas,monospace; white-space:nowrap;}
+.ai-fix{display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:8px; padding:9px 10px;
+  border:1px dashed rgba(167,139,250,.4); border-radius:9px; background:rgba(167,139,250,.06);}
+.ai-fix select{flex:0 1 auto; min-width:200px;}
+.ai-fix input[type=text]{flex:1 1 130px; min-width:110px; font-size:13px;}
+.ai-meta{margin-top:7px; color:var(--dim2); font-size:11px; line-height:1.6; font-family:Consolas,monospace;}
+.ai-line{margin-top:7px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;}
+.btn-mini{padding:4px 8px; font-size:11px; border-radius:7px; border:1px solid var(--line); background:var(--card2); color:var(--dim); cursor:pointer; font-weight:600;}
+.btn-mini:hover{filter:brightness(1.3); color:var(--txt);}
 .btn-capture.locked{background:linear-gradient(135deg,#475569,#334155); color:var(--dim); cursor:not-allowed; box-shadow:none; opacity:.85;}
 .btn-capture.locked:hover{transform:none; box-shadow:none;}
 .tag-fail{background:rgba(248,113,113,.15); color:var(--red); border:1px solid rgba(248,113,113,.45);}
@@ -195,6 +213,23 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
       <div class="cap-warn" id="capture_warn" style="display:none">⚠️ 画面可能被遮挡或采集失败，请检查</div>
       <div class="cap-err" id="capture_error" style="display:none">❌ 采集失败：设备超时/错误</div>
       <div class="hint mono" id="capture_meta">触发来源 -- · 时间 -- · request_id --</div>
+      <!-- week8: 视觉推理（置信度，非准确率）+ 人工纠正 -->
+      <div class="ai-row">
+        <span class="ai-badge dim" id="ai_badge">🤖 AI 识别：尚未推理</span>
+        <!-- week8: 记录当前模型版本号（引擎）—— 绿色徽章旁的小灰字，值取自 /api/status.ai_engine 或推理结果的 engine 字段 -->
+        <span class="ai-ver" id="ai_engine_txt" title="当前视觉推理引擎（模型版本号）">(引擎: --)</span>
+        <button class="btn" id="ai_btn" onclick="inferCurrentPhoto(false)">🔍 AI 识别</button>
+        <button class="btn" id="ai_btn_force" onclick="inferCurrentPhoto(true)">♻️ 重新识别</button>
+        <span class="pill pill-dim mono" id="ai_target_pill" title="当前推理/纠正的目标图片">目标 --</span>
+      </div>
+      <div class="ai-fix" id="ai_fix_row" style="display:none">
+        <select id="ai_fix_label" title="选择纠正后的标签（来自后端标签表）"></select>
+        <input type="text" id="ai_fix_text" placeholder="或输入自定义标签（≤40 字）" maxlength="40"
+               onkeydown="if(event.key==='Enter')saveLabelFix()">
+        <button class="btn btn-on" onclick="saveLabelFix()">💾 保存纠正</button>
+        <button class="btn" onclick="cancelLabelFix()">取消</button>
+      </div>
+      <div class="ai-meta" id="ai_meta">引擎 -- · 分数由真实像素特征计算，未经标注集校准（是“置信度”，不是准确率）</div>
       <div class="hint">提示：下发后指令进入云端队列，单板模组在下一次轮询（约 2s）抓拍；状态会依次走到 <b>PENDING → ACCEPTED → 采集中...</b>，
         <b>10 秒</b>内未收到图片即如实报“采集失败”（不会显示上一张旧图）；连续 2 次失败会锁定抓拍 30 秒。</div>
     </div>
@@ -582,6 +617,12 @@ function updateCapturePreview(photos){
     if (mine.avg_gray != null) _capAvgGray = mine.avg_gray;
     _capState = 'COMPLETED';
     clearCaptureWatchdog();
+    // week8: 本次采集的新图片 → 自动触发一次 AI 识别（后端已推理过则命中缓存）
+    if (!_aiAutoPulled[mine.name]){
+      _aiAutoPulled[mine.name] = true;
+      console.log('[AI] 抓拍完成 → 自动推理 ' + mine.name);
+      inferPhoto(mine.name, null, false).then(a => { if (a) refresh(); }).catch(() => {});
+    }
   } else if (mine.status === 'failed'){
     _capResult = mine;
     _capBlocked = !!(mine.unusable || mine.blocked);   // <500B/空帧 → 黄色遮挡告警
@@ -592,6 +633,196 @@ function updateCapturePreview(photos){
     box.innerHTML = '❌ 本次采集未产生图片（request_id <span class="mono">' + esc(_capRid) + '</span>）';
   }
   renderCaptureState();
+}
+
+// ================= week8: 视觉推理（置信度，非准确率）+ 人工纠正 =================
+// 硬性约束：分数只作“置信度”展示、绝不写成准确率；标签只描述画面级特征（亮度/色偏/纹理），
+// 不含编造的物体名称与位置坐标；低分（<0.4）如实提示“AI无法确定”并允许人工纠正。
+const AI_LABELS_FALLBACK = ['画面过暗（疑似遮挡）', '画面过曝（强光/反光）', '偏绿环境（植被/绿幕）',
+  '偏蓝画面（天空/水面/冷光）', '暖色环境（室内灯光/木质）', '低彩度平坦画面（白墙/桌面/弱光室内）',
+  '细节丰富的杂色场景', '常规场景（亮度与彩度均衡，无强烈色偏）'];
+let _aiLabels = AI_LABELS_FALLBACK.slice();   // 由 /api/status.ai_labels 覆盖（与后端同一份标签表）
+let _ai = null;            // 最近一次推理结果（面板展示用）
+let _aiTarget = null;      // 当前推理/纠正目标 {filename, request_id}
+let _aiBusy = false;       // 防止重复请求
+let _aiAutoPulled = {};    // 已自动触发过推理的图片名（防重复）
+let _aiAutoShown = {};     // 已弹过提示的图片名（防重复提示）
+// week8: 记录当前模型版本号（引擎）。兜底值与后端 INFER_ENGINE 对齐，运行中以 /api/status.ai_engine 为准
+const AI_ENGINE_FALLBACK = 'week8-lite-vision-v1';
+let _aiEngine = AI_ENGINE_FALLBACK;
+
+function seedAiLabels(labels){
+  if (!labels || !labels.length) return;
+  _aiLabels = labels.slice();
+  const sel = $('ai_fix_label');
+  if (!sel || sel.dataset.seeded === '1') return;
+  sel.innerHTML = '<option value="">-- 选择标签 --</option>'
+    + _aiLabels.map(l => '<option value="' + esc(l) + '">' + esc(l) + '</option>').join('');
+  sel.dataset.seeded = '1';
+}
+function aiScoreTxt(a){ return (a && a.score != null) ? Number(a.score).toFixed(2) : '--'; }
+function aiBadgeCls(a){
+  if (!a) return 'dim';
+  if (a.corrected) return 'fix';
+  if (a.status === 'low_confidence') return 'warn';
+  if (a.status === 'success') return 'ok';
+  return 'dim';
+}
+function aiBadgeText(a){
+  if (!a) return '🤖 AI 识别：尚未推理';
+  if (a.status === 'error' || a.status === 'not_found') return '🤖 ' + esc(a.msg || 'AI 推理不可用');
+  if (a.corrected){
+    return '✏️ 人工修正：' + esc(a.label)
+      + (a.label_raw ? ' <small>（模型原判 ' + esc(a.label_raw) + ' ' + aiScoreTxt(a) + '）</small>' : '');
+  }
+  if (a.status === 'low_confidence'){
+    return '⚠️ AI无法确定'
+      + (a.alt && a.alt.label ? ' <small>最接近：' + esc(a.alt.label) + ' ' + Number(a.alt.score).toFixed(2) + '</small>' : '')
+      + ' <small>（置信度 ' + aiScoreTxt(a) + ' < ' + (a.low_conf_threshold != null ? a.low_conf_threshold : 0.4) + '，建议重采或人工纠正）</small>';
+  }
+  return '✔ AI识别: ' + esc(a.label) + ' <small>(置信度: ' + aiScoreTxt(a) + ')</small>';
+}
+function aiBadgeHtml(a){ return '<span class="ai-badge ' + aiBadgeCls(a) + '">' + aiBadgeText(a) + '</span>'; }
+function aiFromPhoto(p){
+  if (!p || !p.ai_status) return null;
+  return { status: p.ai_status, label: p.ai_label, label_raw: p.ai_label_raw, score: p.ai_score,
+           msg: p.ai_msg, alt: p.ai_alt, corrected: !!p.ai_corrected, engine: p.ai_engine,
+           backend: p.ai_backend, low_conf_threshold: p.ai_low_conf_threshold, cost_ms: p.ai_cost_ms,
+           features: {}, filename: p.name, request_id: p.request_id };
+}
+function renderAiPanel(){
+  const badge = $('ai_badge'), pill = $('ai_target_pill'), meta = $('ai_meta'), ver = $('ai_engine_txt');
+  // 面板始终展示“它自称的那张图”的结果，避免上一条采集的标签串台
+  const cur = (_capResult && _capResult.name) || (_aiTarget && _aiTarget.filename) || null;
+  let a = _ai;
+  if (cur && (!a || a.filename !== cur) && _capResult && _capResult.name === cur && _capResult.ai_status){
+    a = aiFromPhoto(_capResult);
+  }
+  if (badge){ badge.className = 'ai-badge ' + aiBadgeCls(a); badge.innerHTML = aiBadgeText(a); }
+  // week8: 绿色徽章旁的小灰字 —— 当前模型版本号（引擎），优先用本次推理结果，其次用 /api/status.ai_engine
+  if (ver){
+    const eng = (a && a.engine) || _aiEngine || AI_ENGINE_FALLBACK;
+    ver.innerText = '(引擎: ' + eng + ')';
+    ver.title = '当前视觉推理引擎（模型版本号）：' + eng + '（由后端 /api/status.ai_engine 提供，本次采集记录在台账 ai_engine 字段）';
+  }
+  if (pill){
+    const nm = (a && a.filename) || (_aiTarget && _aiTarget.filename) || (_capResult && _capResult.name);
+    pill.innerText = nm ? ('目标 ' + nm) : '目标 --';
+  }
+  if (meta){
+    let t = '引擎 ' + ((a && a.engine) || '--') + ' · 后端 ' + ((a && a.backend) || '--')
+          + ' · 拒识阈值 ' + ((a && a.low_conf_threshold != null) ? a.low_conf_threshold : 0.4);
+    const f = a && a.features;
+    if (f && f.gray_mean != null){
+      t += ' · 实测亮度 ' + f.gray_mean + '/255 · 彩色度 ' + f.colorfulness + ' · 纹理 ' + f.texture;
+    }
+    if (a && a.cost_ms != null) t += ' · 耗时 ' + a.cost_ms + 'ms';
+    t += ' · 置信度≠准确率（未经标注集校准）';
+    meta.innerText = t;
+  }
+}
+
+function inferPhoto(filename, request_id, force){
+  if (_aiBusy) return Promise.resolve(null);
+  _aiBusy = true;
+  const body = { force: !!force };
+  if (filename) body.filename = filename;
+  else if (request_id) body.request_id = request_id;
+  return fetch('/api/infer_image', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                     body: JSON.stringify(body) })
+    .then(r => r.json().then(j => ({ ok: r.ok, j: j })).catch(() => ({ ok: r.ok, j: {} })))
+    .then(res => {
+      const a = res.j || {};
+      _aiBusy = false;
+      if (a.filename || a.label || a.status) _ai = a;
+      if (a.request_id) _aiTarget = { filename: a.filename || filename || null, request_id: a.request_id };
+      renderAiPanel();
+      return a;
+    })
+    .catch(() => { _aiBusy = false; return null; });
+}
+function inferCurrentPhoto(force){
+  const name = (_aiTarget && _aiTarget.filename) || (_ai && _ai.filename) || (_capResult && _capResult.name) || null;
+  const rid = (_capResult && _capResult.request_id) || _capRid || null;
+  if (!name && !rid){ showToast('err', '还没有可识别的图片，请先抓拍一次'); return; }
+  inferPhoto(name, name ? null : rid, force).then(a => {
+    if (!a){ showToast('err', 'AI 识别请求失败（网络错误）'); return; }
+    if (a.status === 'not_found') showToast('err', a.msg || '没有可识别的图片');
+    else if (a.status === 'error') showToast('err', a.msg || 'AI 推理失败');
+    else if (a.status === 'low_confidence') showToast('err', '⚠️ AI无法确定：' + (a.msg || '请重新采集或用人工纠正'));
+    else if (a.corrected) showToast('ok', '✏️ 人工修正：' + a.label);
+    else showToast('ok', '🤖 AI识别: ' + a.label + '（置信度 ' + aiScoreTxt(a) + '）');
+    refresh();
+  });
+}
+
+let _aiSeenInit = false;
+// 需求 1：抓拍成功、画廊出现新卡片后【自动调用 /api/infer_image】。
+// 后端在图片落盘时已同步推理过（1ms 级），这里的调用会命中缓存（cached=true）；
+// 若采集发生在页面关闭期间（板端主动上传），这里就是该图的首次推理。
+// 首次渲染只登记已有图片，不批量请求。
+function autoInferNew(photos){
+  const list = (photos || []).filter(p => p.status === 'stored' && p.url);
+  if (!_aiSeenInit){ list.forEach(p => { _aiAutoPulled[p.name] = true; }); _aiSeenInit = true; return; }
+  const fresh = list.find(p => !_aiAutoPulled[p.name]);
+  if (!fresh) return;
+  _aiAutoPulled[fresh.name] = true;
+  console.log('[AI] 新图片自动推理: ' + fresh.name);
+  inferPhoto(fresh.name, null, false).then(a => {
+    if (!a) return;
+    if (a.filename === fresh.name && a.status === 'low_confidence' && !_aiAutoShown[a.filename]){
+      _aiAutoShown[a.filename] = true;
+      showToast('err', '⚠️ AI无法确定：' + (a.msg || '无法确定画面内容，请重新采集'));
+    }
+    refresh();
+  }).catch(() => {});
+}
+
+// 需求 3：人工纠正（选择一个目标图 → 下拉框/自定义标签 → 保存纠正）
+function pickFixTarget(name, rid){
+  _aiTarget = { filename: name || null, request_id: rid || null };
+  const row = $('ai_fix_row'); if (row) row.style.display = 'flex';
+  seedAiLabels(_aiLabels);
+  if (name){
+    inferPhoto(name, null, false).then(a => { if (a) refresh(); });
+  } else renderAiPanel();
+  const sel = $('ai_fix_label'); if (sel) sel.focus();
+  showToast('ok', '请在下方选择/输入正确标签后点“保存纠正”');
+}
+function cancelLabelFix(){ const row = $('ai_fix_row'); if (row) row.style.display = 'none'; }
+function saveLabelFix(){
+  const sel = $('ai_fix_label'), txt = $('ai_fix_text');
+  const custom = txt ? txt.value.trim() : '';
+  const label = custom || (sel ? sel.value : '');
+  if (!label){ showToast('err', '请先选择或输入一个标签'); return; }
+  const t = _aiTarget || {};
+  const name = t.filename || (_ai && _ai.filename) || (_capResult && _capResult.name) || null;
+  const rid = t.request_id || (_capResult && _capResult.request_id) || _capRid || null;
+  if (!name && !rid){ showToast('err', '没有可纠正的图片记录'); return; }
+  fetch('/api/correct_label', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: label, filename: name || undefined, request_id: rid || undefined }) })
+    .then(r => r.json().then(j => ({ ok: r.ok, j: j })).catch(() => ({ ok: r.ok, j: {} })))
+    .then(res => {
+      const j = res.j || {};
+      if (!res.ok || (j.status !== 'success' && j.status !== 'corrected')){
+        showToast('err', j.msg || '保存纠正失败'); return;
+      }
+      _ai = j; renderAiPanel();
+      if (txt) txt.value = '';
+      if (sel) sel.value = '';
+      showToast('ok', '✏️ 已记录人工修正：' + j.label);
+      refresh();
+    })
+    .catch(() => showToast('err', '保存纠正失败（网络错误）'));
+}
+function reInfer(name){
+  inferPhoto(name, null, true).then(a => {
+    if (!a){ showToast('err', 'AI 识别请求失败（网络错误）'); return; }
+    if (a.status === 'low_confidence') showToast('err', '⚠️ AI无法确定（置信度 ' + aiScoreTxt(a) + '）');
+    else if (a.status === 'success') showToast('ok', '🤖 AI识别: ' + a.label + '（置信度 ' + aiScoreTxt(a) + '）');
+    else showToast('err', a.msg || 'AI 推理失败');
+    refresh();
+  });
 }
 
 function sendAck(){ fetch('/api/device/ack',{method:'POST'}).then(r=>r.json()).then(()=>{ $('ack_btn').style.display='none'; showToast('ok','已确认收到'); }).catch(()=>showToast('err','ACK发送失败')); }
@@ -815,7 +1046,25 @@ function updateStatus(st){
       link.style.color='';
     }
   }
+  // week8: 标签表来自后端（前后端共用同一份）；模型版本号（引擎）也以后端为准；本次采集的推理结果同步到面板
+  if (st.ai_labels) seedAiLabels(st.ai_labels);
+  if (st.ai_engine && st.ai_engine !== _aiEngine){ _aiEngine = st.ai_engine; renderAiPanel(); }
+  const aiCur = (_capResult && _capResult.name) || (_aiTarget && _aiTarget.filename) || (_ai && _ai.filename) || null;
+  if (st.ai && (!aiCur || st.ai.filename === aiCur)){
+    if (!_ai || st.ai.ts_ms !== _ai.ts_ms || !!st.ai.corrected !== !!_ai.corrected || st.ai.label !== _ai.label){
+      _ai = st.ai; renderAiPanel();
+    }
+  }
   if (st.last_update){ const age=Math.max(0,Math.round(Date.now()/1000-st.last_update)); $('task_age').innerText='更新于 '+age+'s 前'; }
+}
+// week8: 画廊卡片上的 AI 徽章（成功=绿色 / 拒识=黄色 / 人工修正=紫色）+ 纠正与重算按钮
+function aiCardLine(p){
+  let html = '<div class="ai-line">' + aiBadgeHtml(aiFromPhoto(p));
+  if (p.status === 'stored'){
+    html += '<button class="btn-mini" title="人工纠正该图的标签" onclick="pickFixTarget(\'' + esc(p.name) + '\')">✏️ 纠正</button>'
+          + '<button class="btn-mini" title="强制重新推理" onclick="reInfer(\'' + esc(p.name) + '\')">♻️ 重新识别</button>';
+  }
+  return html + '</div>';
 }
 function renderGallery(photos){
   const g=$('gallery'), empty=$('empty_state');
@@ -854,7 +1103,8 @@ function renderGallery(photos){
       '<div class="pmeta"><div class="prow"><span class="pname" title="'+esc(p.name)+'">'+esc(p.name)+'</span>'+tag+'</div>'+
       '<div class="prow psub"><span>🕒 '+esc(when)+'</span><span>'+sizeTxt+'</span></div>'+
       '<div class="prow psub"><span>🎯 '+esc(trig)+'</span>'+(grayTxt?'<span>'+grayTxt+'</span>':'')+'</div>'+
-      '<div class="prow psub"><span class="mono" title="request_id">🔗 '+rid+'</span></div></div></div>';
+      '<div class="prow psub"><span class="mono" title="request_id">🔗 '+rid+'</span></div>'+
+      aiCardLine(p)+'</div></div>';
   }).join('');
 }
 function refresh(){
@@ -881,12 +1131,13 @@ function refresh(){
     const all=d.photos||[];
     renderGallery(all);
     updateCapturePreview(all);        // week7: 只认本次 request_id 的图片
+    autoInferNew(all);                // week8: 新卡片出现 → 自动调用 /api/infer_image
     const first=all[0];
     $('dev_last').innerText = first ? (first.time_ms_str||first.time_str||'--').slice(5) : '--';
   }).catch(()=>{});
 }
 setInterval(()=>{ $('clock').innerText=fmtClock(Date.now()/1000); }, 1000);
-initChart(); updateImu(); refresh(); renderCaptureState();   // week7: 采集面板初始化
+initChart(); updateImu(); refresh(); renderCaptureState(); renderAiPanel();   // week7/8: 采集面板 + AI 面板初始化
 setInterval(updateImu, 1000);
 setInterval(refresh, 2000);
 

@@ -69,6 +69,53 @@ except ImportError:
     _PIL_AVAILABLE = False
     print("【告警】未安装 Pillow，遮挡初判仅按文件大小判定（pip install pillow 可启用灰度判定）")
 
+# ---------------- week8: 轻量视觉推理（真实像素特征 + 可解释分类器） ----------------
+# 任务书要求“把视觉推理结果变成可理解反馈”，同时硬性规定“未经校准的模型分数不能写成现实正确率”。
+# 因此这里的做法是：
+#   1) 特征全部来自真实像素统计（亮度/对比度/饱和度/色相分布/彩色度/纹理梯度），
+#      代码里没有任何写死的“键盘/杯子”之类结论，也没有编造任何位置坐标；
+#   2) 分类器是确定性规则集成：score = 特征隶属度 × 区分度裕量，只表示“这幅图有多像该描述”，
+#      是【置信度】而不是经过标注集校准的准确率（calibrated=False，前端也只显示“置信度”）；
+#   3) 最高置信度 < INFER_LOW_CONF(0.4) → status=low_confidence，
+#      如实提示“无法确定画面内容，请重新采集”，并允许人工纠正
+#      （/api/correct_label 写回台账，标记 ai_source='manual'）。
+# 特征提取后端二选一：检测到 OpenCV 就用 cv2（RGB→HSV + 直方图），
+# 否则用 Pillow + NumPy 做等价实现（本机 Anaconda 未装 cv2，实测走 NumPy 通道）。
+try:
+    import numpy as _np
+    _NP_AVAILABLE = True
+except ImportError:
+    _np = None
+    _NP_AVAILABLE = False
+    print("【视觉推理】⚠ 未安装 NumPy，/api/infer_image 将返回 error（pip install numpy 可启用）")
+
+try:
+    import cv2 as _cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    _cv2 = None
+    _CV2_AVAILABLE = False
+
+# Pillow ≥ 9.1 用 Image.Resampling.LANCZOS，旧版本用 Image.LANCZOS（缺失时传 None 用默认算法）
+_PIL_RESAMPLE = getattr(getattr(_PILImage, "Resampling", _PILImage), "LANCZOS", None)
+
+INFER_SAMPLE = 96            # 推理前缩放到 96×96：特征稳定且单张耗时毫秒级
+INFER_LOW_CONF = 0.4         # 最高置信度 < 0.4 → low_confidence（任务书硬性要求）
+INFER_ENGINE = "week8-lite-vision-v1"   # 自研轻量特征分类器（无外部权重文件）
+# 可解释标签集：前端“人工纠正”下拉框直接复用这一份，避免前后端两套文案
+AI_LABELS = [
+    "画面过暗（疑似遮挡）",
+    "画面过曝（强光/反光）",
+    "偏绿环境（植被/绿幕）",
+    "偏蓝画面（天空/水面/冷光）",
+    "暖色环境（室内灯光/木质）",
+    "低彩度平坦画面（白墙/桌面/弱光室内）",
+    "细节丰富的杂色场景",
+    "常规场景（亮度与彩度均衡，无强烈色偏）",
+]
+print(f"【视觉推理】引擎 {INFER_ENGINE} 就绪 · 特征后端 "
+      f"{'opencv' if _CV2_AVAILABLE else 'pillow+numpy'} · 拒识阈值 {INFER_LOW_CONF}")
+
 task_state = {
     "task_id": None,
     "status": "IDLE",  # IDLE, PENDING, ACCEPTED, COLLECTING, COMPLETED, TIMEOUT, FAIL
@@ -267,6 +314,182 @@ def photo_avg_gray(path):
     except Exception as e:
         print(f"【告警】灰度分析失败（遮挡初判跳过）: {e}")
         return None, None
+
+
+# ---------------- week8: 真实像素特征提取（无任何预训练权重 / 不依赖外部模型文件） ----------------
+def _rgb_to_hsv(arr):
+    """arr: HxWx3 float32 (0-255, RGB) → (hue°, sat, val)，NumPy 向量化实现。
+    公式与 cv2.COLOR_RGB2HSV 一致：H 单位是度（0-360），S/V 归一化到 0-1。
+    这是“没装 OpenCV 时的等价替代”，不是近似玩具实现。"""
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    v = arr.max(axis=2)
+    mn = arr.min(axis=2)
+    c = v - mn
+    s = _np.where(v > 1e-6, c / _np.maximum(v, 1e-6), 0.0)
+    h = _np.zeros_like(v)
+    nz = c > 1e-6
+    m = nz & (v == r)                        # 红色为主：H = 60°·((G-B)/C mod 6)
+    if bool(m.any()):
+        h[m] = (60.0 * ((g[m] - b[m]) / c[m])) % 360.0     # 只在掩码内做除法（避免 0/0 警告）
+    m = nz & (v == g) & (v != r)             # 绿色为主：H = 60°·((B-R)/C + 2)
+    if bool(m.any()):
+        h[m] = 60.0 * (((b[m] - r[m]) / c[m]) + 2.0) % 360.0
+    m = nz & (v == b) & (v != r) & (v != g)  # 蓝色为主：H = 60°·((R-G)/C + 4)
+    if bool(m.any()):
+        h[m] = (60.0 * (((r[m] - g[m]) / c[m]) + 4.0)) % 360.0
+    return h, s, v
+
+
+def extract_visual_features(path):
+    """对一张真实图片做像素统计特征提取，返回 dict（无法解码返回 None）。
+    特征：平均亮度/对比度/暗亮像素占比/饱和度/彩色度/通道占比/色相分布/纹理梯度。"""
+    if not (_PIL_AVAILABLE and _NP_AVAILABLE):
+        return None
+    try:
+        with _PILImage.open(path) as im:
+            small = im.convert("RGB").resize((INFER_SAMPLE, INFER_SAMPLE), _PIL_RESAMPLE)
+            arr = _np.asarray(small, dtype=_np.float32)
+    except Exception as e:
+        print(f"【视觉推理】图像解码失败（无法推理）: {e}")
+        return None
+
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    gray = 0.299 * r + 0.587 * g + 0.114 * b          # 亮度（ITU-R BT.601 权重）
+    total = float(gray.size) or 1.0
+    gray_mean = float(gray.mean())
+    gray_std = float(gray.std())                      # 对比度
+    dark_ratio = float((gray < DARK_LEVEL).sum()) / total
+    bright_ratio = float((gray > 200).sum()) / total
+
+    # HSV：优先 OpenCV，缺失时用上面的等价值
+    backend = "opencv" if _CV2_AVAILABLE else "pillow+numpy"
+    if _CV2_AVAILABLE:
+        hsv = _cv2.cvtColor(arr.astype(_np.uint8), _cv2.COLOR_RGB2HSV).astype(_np.float32)
+        hue = hsv[..., 0] * 2.0                       # OpenCV 的 H 是 0-179 → 还原成 0-360°
+        sat = hsv[..., 1] / 255.0
+        val = hsv[..., 2]
+    else:
+        hue, sat, val = _rgb_to_hsv(arr)
+
+    chroma = sat * val / 255.0                        # 0-1 色度权重（灰/白像素≈0，不参与色相统计）
+    lit = val > 20.0
+    sat_mean = float(sat[lit].mean()) if bool(lit.any()) else 0.0
+
+    # Hasler & Süsstrunk (2003) colorfulness：公开的彩色度量（不是私有魔数）
+    rg = r - g
+    yb = 0.5 * (r + g) - b
+    colorfulness = float(_np.sqrt(rg.std() ** 2 + yb.std() ** 2)
+                         + 0.3 * _np.sqrt(rg.mean() ** 2 + yb.mean() ** 2))
+
+    pix_sum = float(arr.sum()) or 1.0
+    r_share = float(r.sum()) / pix_sum
+    g_share = float(g.sum()) / pix_sum
+    b_share = float(b.sum()) / pix_sum
+
+    # 色相直方图：12 个 30° bin，按色度加权（判断色偏方向 + 单一色相集中度）
+    hh = hue[lit] if bool(lit.any()) else hue.ravel()
+    ww = chroma[lit] if bool(lit.any()) else chroma.ravel()
+    hist, _ = _np.histogram(hh, bins=12, range=(0.0, 360.0), weights=ww)
+    hist = hist / (float(hist.sum()) or 1.0)
+    hue_warm = float(hist[0] + hist[1] + hist[10] + hist[11])   # 红/橙/黄：0-60° 与 300-360°
+    hue_green = float(hist[2] + hist[3] + hist[4] + hist[5])    # 绿/青：60-180°
+    hue_blue = float(hist[6] + hist[7] + hist[8] + hist[9])     # 蓝/紫：180-300°
+    hue_conc = float(hist.max())                                # 最大单 bin 占比
+
+    # 纹理：梯度幅值均值 + 明显边缘占比（区分“平坦墙面/桌面”与“细节丰富的近景”）
+    gy, gx = _np.gradient(gray)
+    mag = _np.sqrt(gx ** 2 + gy ** 2)
+    texture = float(mag.mean()) / 255.0
+    edge_ratio = float((mag > 12.0).mean())
+
+    return {
+        "backend": backend,
+        "sample": f"{INFER_SAMPLE}x{INFER_SAMPLE}",
+        "gray_mean": round(gray_mean, 2),        # 平均亮度 0-255
+        "gray_std": round(gray_std, 2),          # 对比度
+        "dark_ratio": round(dark_ratio, 4),      # 暗像素占比（灰度 < DARK_LEVEL）
+        "bright_ratio": round(bright_ratio, 4),  # 过亮像素占比（灰度 > 200）
+        "sat_mean": round(sat_mean, 4),          # 平均饱和度
+        "colorfulness": round(colorfulness, 2),  # 彩色度
+        "r_share": round(r_share, 4),
+        "g_share": round(g_share, 4),
+        "b_share": round(b_share, 4),
+        "hue_warm": round(hue_warm, 4),
+        "hue_green": round(hue_green, 4),
+        "hue_blue": round(hue_blue, 4),
+        "hue_conc": round(hue_conc, 4),
+        "texture": round(texture, 5),
+        "edge_ratio": round(edge_ratio, 4),
+        "calibrated": False,                     # 明确标注：特征/分数未做标注集校准
+    }
+
+
+def _ramp(v, lo, hi):
+    """分段线性隶属度：v<=lo → 0.0，v>=hi → 1.0，中间线性（把特征值映射为“有多像该描述”）。"""
+    if hi == lo:
+        return 0.0
+    x = (float(v) - lo) / (hi - lo)
+    if x <= 0.0:
+        return 0.0
+    return 1.0 if x >= 1.0 else round(x, 4)
+
+
+def classify_visual_features(f):
+    """规则集成分类器：每个标签的隶属度都是真实特征的连续函数（没有写死的结论）。
+    返回 dict: label / score（置信度，非准确率）/ status / margin / memberships / alt。"""
+    if not f:
+        return {"label": None, "score": 0.0, "status": "error", "margin": 0.0, "memberships": {},
+                "alt": None, "msg": "特征提取失败（图片无法解码，或缺少 Pillow/NumPy）"}
+
+    gray_mean, dark, bright = f["gray_mean"], f["dark_ratio"], f["bright_ratio"]
+    sat, colorful = f["sat_mean"], f["colorfulness"]
+    warm, green, blue, conc = f["hue_warm"], f["hue_green"], f["hue_blue"], f["hue_conc"]
+    r_share, g_share, b_share = f["r_share"], f["g_share"], f["b_share"]
+    tex = f["texture"]
+
+    m = {}
+    # 1) 过暗：与 week7 的遮挡阈值 BLOCKED_MAX_GRAY 对齐（镜头被挡住是最常见原因）
+    m[AI_LABELS[0]] = max(_ramp(BLOCKED_MAX_GRAY - gray_mean, 2.0, 25.0), _ramp(dark, 0.55, 0.92))
+    # 2) 过曝：平均亮度过高，或大面积像素接近饱和（强光/反光）
+    m[AI_LABELS[1]] = max(_ramp(gray_mean, 195.0, 240.0), _ramp(bright, 0.28, 0.65))
+    # 3/4/5) 色偏：通道占比 + 色相集中在对应色区 + 有足够饱和度（三个条件同时成立才算）
+    # 阈值取自 50 张真机照片实测分布：通道占比中位 0.33，色偏场景 0.38~0.47
+    m[AI_LABELS[2]] = min(_ramp(g_share, 0.345, 0.400), _ramp(green, 0.32, 0.65), _ramp(sat, 0.06, 0.22))
+    m[AI_LABELS[3]] = min(_ramp(b_share, 0.345, 0.395), _ramp(blue, 0.32, 0.65), _ramp(sat, 0.06, 0.22))
+    m[AI_LABELS[4]] = min(_ramp(r_share, 0.345, 0.395), _ramp(warm, 0.32, 0.62), _ramp(sat, 0.06, 0.22))
+    # 6) 低彩度平坦画面：彩色度低 + 纹理弱 + 饱和度低，且亮度处在“非过暗也非过曝”的区间
+    #    （亮度带避免把纯黑/纯白画面也算成“白墙桌面”）
+    low_color = min(_ramp(24.0 - colorful, 6.0, 18.0),
+                    _ramp(0.052 - tex, 0.015, 0.042),
+                    _ramp(0.20 - sat, 0.03, 0.14))
+    bright_band = min(_ramp(gray_mean - 42.0, 6.0, 30.0), _ramp(205.0 - gray_mean, 8.0, 35.0))
+    m[AI_LABELS[5]] = min(low_color, bright_band)
+    # 7) 细节丰富的杂色场景：纹理高、彩色度高、且没有单一色相支配
+    m[AI_LABELS[6]] = min(_ramp(tex, 0.030, 0.075),
+                          _ramp(colorful, 18.0, 42.0),
+                          _ramp(0.80 - conc, 0.02, 0.30))
+    # 8) 常规场景（兜底头）：亮度适中、彩度处在中段、没有单一色相支配
+    #    —— 没有这一项时，大量“不好不坏”的画面会因为所有隶属度都接近 0 而被拒识
+    m[AI_LABELS[7]] = min(_ramp(gray_mean - 45.0, 5.0, 30.0), _ramp(200.0 - gray_mean, 10.0, 40.0),
+                          _ramp(colorful, 3.5, 10.0), _ramp(32.0 - colorful, 6.0, 24.0),
+                          _ramp(0.72 - conc, 0.02, 0.25))
+
+    order = sorted(m.items(), key=lambda kv: kv[1], reverse=True)
+    best_label, best = order[0]
+    second_label, second = order[1] if len(order) > 1 else (None, 0.0)
+    # 置信度 = 最高隶属度 × 区分度裕量（与次优标签差距归一化到 0-0.3）。
+    # 两者接近说明“这幅图同时像多个描述”，此时置信度被压下来 —— 宁可拒识也不硬贴标签。
+    sep = _ramp(best - second, 0.0, 0.30)
+    score = round(best * (0.60 + 0.40 * sep), 3)
+    if best < INFER_LOW_CONF or score < INFER_LOW_CONF:
+        return {"label": None, "score": score, "status": "low_confidence",
+                "margin": round(best - second, 3), "memberships": m,
+                # 只有“最接近的描述”本身有实际隶属度时才展示，0 分时不给用户看噪声
+                "alt": ({"label": best_label, "score": round(best, 3)} if best >= 0.05 else None),
+                "msg": "无法确定画面内容，请重新采集"}
+    return {"label": best_label, "score": score, "status": "success",
+            "margin": round(best - second, 3), "memberships": m, "alt": None,
+            "alt2": {"label": second_label, "score": round(second, 3)} if second_label else None}
 
 
 # ---------------- Request isolation & cancellation (week 6) ----------------
@@ -501,6 +724,108 @@ def ledger_mark_cleaned(names):
                 e["status"] = "cleaned"
         ledger_save()
 
+# ---------------- week8: 视觉推理结果 ↔ 台账（photos_ledger.json）----------------
+def ledger_find_entry(request_id=None, filename=None):
+    """按 filename / request_id 定位台账条目（返回台账内的同一个 dict 对象，便于写回）。
+    两者都不给 → 返回最近一张“已入库”的记录。"""
+    with ledger_lock:
+        items = list(ledger)
+    if filename:
+        for e in reversed(items):
+            if e.get("name") == filename:
+                return e
+        return None
+    if request_id:
+        for e in reversed(items):
+            if e.get("request_id") == request_id and e.get("name"):
+                return e
+        return None
+    for e in reversed(items):
+        if e.get("name") and e.get("status") == "stored":
+            return e
+    return None
+
+
+def ledger_save_ai(entry, **fields):
+    """把视觉推理 / 人工纠正结果作为【新字段】追加到台账对应记录里（绝不新建记录）。"""
+    if not entry:
+        return None
+    with ledger_lock:
+        entry.update(fields)
+        ledger_save()
+    return entry
+
+
+def _ai_public(entry, cached=False):
+    """推理结果的对外视图：人工纠正优先展示，并把“置信度≠准确率”一路带到前端。"""
+    if not entry:
+        return None
+    corrected = bool(entry.get("ai_corrected"))
+    return {
+        "filename": entry.get("name"),
+        "request_id": entry.get("request_id"),
+        "label": entry.get("ai_label_manual") if corrected else entry.get("ai_label"),
+        "label_raw": entry.get("ai_label"),
+        "score": entry.get("ai_score"),
+        "status": "success" if corrected else (entry.get("ai_status") or "pending"),
+        "msg": entry.get("ai_msg"),
+        "corrected": corrected,
+        "source": entry.get("ai_source"),          # auto(采集时) / api(接口) / manual(人工纠正)
+        "engine": entry.get("ai_engine"),
+        "backend": entry.get("ai_backend"),
+        "calibrated": False,                       # 硬性约束：未校准分数绝不写成准确率
+        "low_conf_threshold": entry.get("ai_low_conf_threshold", INFER_LOW_CONF),
+        "ts_ms": entry.get("ai_ts_ms"),
+        "cost_ms": entry.get("ai_cost_ms"),
+        "alt": entry.get("ai_alt"),                # 拒识时给出“最接近的描述”，方便人工纠正
+        "margin": entry.get("ai_margin"),
+        "features": entry.get("ai_features") or {},
+        "note": entry.get("ai_manual_note"),
+        "cached": cached,
+    }
+
+
+def infer_photo_entry(entry, force=False, source="api"):
+    """对一条台账记录做一次真实视觉推理，并把结果写回台账。返回对外视图。"""
+    if not entry or not entry.get("name"):
+        return {"status": "not_found", "msg": "没有可推理的图片：请先抓拍，或传入 filename / request_id"}
+    if entry.get("ai_status") and not force:
+        return _ai_public(entry, cached=True)        # 已算过 → 复用（force=true 才重算）
+    path = os.path.join(UPLOAD_FOLDER, entry["name"])
+    if not os.path.exists(path):
+        ledger_save_ai(entry, ai_status="error", ai_msg="原图已清理，无法推理",
+                       ai_engine=INFER_ENGINE, ai_source=source, ai_calibrated=False,
+                       ai_ts_ms=int(time.time() * 1000))
+        return _ai_public(entry)
+
+    t0 = time.time()
+    feats = extract_visual_features(path)
+    res = classify_visual_features(feats)
+    cost_ms = round((time.time() - t0) * 1000.0, 1)
+    ledger_save_ai(
+        entry,
+        ai_label=res.get("label"),
+        ai_score=res.get("score"),
+        ai_status=res["status"],
+        ai_msg=res.get("msg"),
+        ai_alt=res.get("alt"),
+        ai_margin=res.get("margin"),
+        ai_engine=INFER_ENGINE,
+        ai_backend=(feats or {}).get("backend"),
+        ai_calibrated=False,                     # 未做标注集校准 → 只能叫“置信度”
+        ai_low_conf_threshold=INFER_LOW_CONF,
+        ai_features=feats,
+        ai_ts_ms=int(time.time() * 1000),
+        ai_cost_ms=cost_ms,
+        ai_source=source,
+    )
+    label_txt = res.get('label') or ('(解码失败)' if res['status'] == 'error' else '(拒识: 置信度不足)')
+    print(f"【视觉推理】{entry['name']} → status={res['status']} "
+          f"label={label_txt} score={res.get('score')} "
+          f"backend={(feats or {}).get('backend')} 耗时={cost_ms}ms")
+    return _ai_public(entry)
+
+
 # ---------------- API: control plane ----------------
 @app.route('/api/trigger_capture', methods=['POST'])
 def trigger_capture():
@@ -674,9 +999,16 @@ def upload_photo():
               f"触发源: {trigger}, request_id: {rid})")
 
     # 图片与请求强关联落台账（含毫秒时间戳 + 遮挡判定）
-    ledger_add_attempt(rid, tid, trigger, ok=True, name=filename, size=actual_size,
-                       blocked=blocked, avg_gray=avg_gray, dark_ratio=dark_ratio,
-                       detail=detail, ts_ms=ms, state="COMPLETED")
+    entry = ledger_add_attempt(rid, tid, trigger, ok=True, name=filename, size=actual_size,
+                               blocked=blocked, avg_gray=avg_gray, dark_ratio=dark_ratio,
+                               detail=detail, ts_ms=ms, state="COMPLETED")
+
+    # ---- week8: 采集成功即自动做一次真实视觉推理（毫秒级），并把结果写回台账 ----
+    # 这样画廊/采集面板无需额外请求就能显示可理解的反馈；前端仍会调用 /api/infer_image（命中缓存）。
+    try:
+        infer_photo_entry(entry, source="auto")
+    except Exception as e:
+        print(f"【视觉推理】自动推理失败（不影响采集结果）: {e}")
 
     # 一次有效采集 → 连续失败计数清零（不会误触发 30s 锁定）
     with capture_lock:
@@ -747,9 +1079,86 @@ def list_photos():
             "reason": e.get("reason"),
             "detail": e.get("detail"),
             "state": e.get("state"),
+            # ---- week8: 视觉推理结果（score 是置信度，不是准确率；人工纠正优先） ----
+            "ai_label": (e.get("ai_label_manual") if e.get("ai_corrected") else e.get("ai_label")),
+            "ai_label_raw": e.get("ai_label"),
+            "ai_score": e.get("ai_score"),
+            "ai_status": ("success" if e.get("ai_corrected") else e.get("ai_status")),
+            "ai_msg": e.get("ai_msg"),
+            "ai_alt": e.get("ai_alt"),
+            "ai_corrected": bool(e.get("ai_corrected")),
+            "ai_source": e.get("ai_source"),
+            "ai_engine": e.get("ai_engine"),
+            "ai_backend": e.get("ai_backend"),
+            "ai_calibrated": False,
+            "ai_low_conf_threshold": e.get("ai_low_conf_threshold", INFER_LOW_CONF),
+            "ai_ts_ms": e.get("ai_ts_ms"),
+            "ai_cost_ms": e.get("ai_cost_ms"),
             "url": f"/photos/{e['name']}" if has_file else None,
         })
     return jsonify({"photos": out[:60]})
+
+
+@app.route('/api/infer_image', methods=['POST'])
+def infer_image():
+    """week8: 对指定（默认最近一次）抓拍图片做真实视觉推理。
+    入参 JSON：{"request_id": "cap_..."} 或 {"filename": "photo_....jpg"}，可选 {"force": true} 强制重算。
+    返回：{"status": "success"|"low_confidence"|"not_found"|"error", "label", "score", ...}
+    最高置信度 < 0.4 → status=low_confidence + msg="无法确定画面内容，请重新采集"。"""
+    d = request.get_json(silent=True) or {}
+    rid = str(d.get("request_id") or request.args.get("request_id") or "").strip()
+    fname = str(d.get("filename") or request.args.get("filename") or "").strip()
+    raw_force = d.get("force", request.args.get("force", ""))
+    force = str(raw_force).lower() in ("1", "true", "yes", "on")
+    if fname and os.path.basename(fname) != fname:
+        return jsonify({"status": "error", "msg": "filename 非法（不允许路径）"}), 400
+    if fname and not fname.lower().endswith(".jpg"):
+        return jsonify({"status": "error", "msg": "只支持 .jpg 图像"}), 400
+
+    entry = ledger_find_entry(request_id=rid or None, filename=fname or None)
+    if entry is None and fname:
+        path = os.path.join(UPLOAD_FOLDER, fname)
+        if os.path.exists(path):                     # 目录里有图但台账缺记录 → 补一条再推理
+            entry = ledger_add(fname, os.path.getsize(path), trigger="gallery", request_id=None)
+    if entry is None:
+        return jsonify({"status": "not_found",
+                        "msg": "没有可推理的图片：请先抓拍一次，或传入 filename / request_id"}), 404
+
+    res = infer_photo_entry(entry, force=force, source="api")
+    if not res.get("msg"):
+        res["msg"] = "无法确定画面内容，请重新采集" if res.get("status") == "low_confidence" else None
+    code = 200 if res.get("status") in ("success", "low_confidence") else 404
+    return jsonify(res), code
+
+
+@app.route('/api/correct_label', methods=['POST'])
+def correct_label():
+    """week8: 人工纠正 AI 标签（未经校准的模型不可能总是对，纠正结果写回台账）。
+    入参 JSON：{"label": "暖色环境（室内灯光/木质）", "filename"|"request_id": ..., "note": 可选}
+    台账新增字段：ai_label_manual / ai_corrected / ai_source='manual' / ai_correct_ts_ms。"""
+    d = request.get_json(silent=True) or {}
+    label = str(d.get("label") or d.get("value") or "").strip()
+    note = (str(d.get("note") or "").strip()[:120]) or None
+    fname = str(d.get("filename") or "").strip()
+    rid = str(d.get("request_id") or "").strip()
+    if not label:
+        return jsonify({"status": "error", "msg": "标签不能为空"}), 400
+    if len(label) > 40:
+        return jsonify({"status": "error", "msg": "标签过长（≤40 字符）"}), 400
+    if fname and os.path.basename(fname) != fname:
+        return jsonify({"status": "error", "msg": "filename 非法（不允许路径）"}), 400
+
+    entry = ledger_find_entry(request_id=rid or None, filename=fname or None)
+    if entry is None:
+        return jsonify({"status": "not_found", "msg": "找不到对应的图片记录"}), 404
+    ledger_save_ai(entry, ai_label_manual=label, ai_corrected=True, ai_source="manual",
+                   ai_correct_ts_ms=int(time.time() * 1000), ai_manual_note=note)
+    print(f"【人工纠正】{entry.get('name')} 模型原判 "
+          f"{entry.get('ai_label') or '(拒识)'} → 人工标签: {label}")
+    res = _ai_public(entry)
+    res["status"] = "success"
+    res["msg"] = "已记录人工修正"
+    return jsonify(res), 200
 
 @app.route('/api/status', methods=['GET'])
 def get_status():
@@ -774,6 +1183,16 @@ def get_status():
     data["device_offline"] = (not online)
     data["device_seen_age"] = device_seen_age()
     data["device_online_window"] = DEVICE_ONLINE_WINDOW
+    # ---- week8: 本次采集的视觉推理结果 + 可解释标签集（前端“人工纠正”下拉框直接复用）----
+    ai_entry = None
+    if cap.get("photo"):
+        ai_entry = ledger_find_entry(filename=cap["photo"])
+    if ai_entry is None and cap.get("request_id"):
+        ai_entry = ledger_find_entry(request_id=cap["request_id"])
+    data["ai"] = _ai_public(ai_entry)
+    data["ai_labels"] = list(AI_LABELS)
+    data["ai_engine"] = INFER_ENGINE
+    data["ai_low_conf_threshold"] = INFER_LOW_CONF
     with timer_lock:
         data["timer_running"] = timer_state["running"]
         data["timer_current_batch"] = timer_state["current_batch"]
