@@ -261,8 +261,80 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
 .obs-img{width:100%; max-height:260px; object-fit:contain; border-radius:10px; border:1px solid var(--line); background:#0b1220; display:block;}
 .obs-note{margin-top:8px; font-size:11.5px; line-height:1.65; color:var(--dim2);}
 .obs-note.warn{color:var(--yellow);}
+/* ---- week11: 系统上下文与证据（① 原始证据 → ② 系统推理 → ③ 交互追问） ---- */
+/* 三层视觉严格分层：① 青色=硬件/模型观测、② 紫色=规则推理、③ 橙色=人机交互（追问） */
+.ctx-wrap{display:flex; flex-direction:column; gap:12px;}
+.ctx-bar{display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12.5px; line-height:1.65; color:var(--dim);}
+.ctx-hl{font-weight:800; color:var(--txt);}
+.ctx-sum{margin-top:5px; font-size:11.5px; line-height:1.75; color:var(--dim2);}
+.ctx-err{padding:9px 11px; border-radius:9px; font-size:12px; font-weight:700; line-height:1.6; color:var(--yellow);
+  background:rgba(251,191,36,.12); border:1px dashed rgba(251,191,36,.5);}
+.ctx-layer{border:1px solid var(--line); border-radius:12px; overflow:hidden; background:rgba(11,18,32,.55);}
+.ctx-layer-h{display:flex; align-items:center; gap:9px; padding:9px 12px; font-size:13px; font-weight:800;
+  letter-spacing:.3px; border-bottom:1px solid var(--line);}
+.ctx-n{display:inline-flex; align-items:center; justify-content:center; width:19px; height:19px; flex:0 0 auto;
+  border-radius:6px; font-size:12px; font-weight:800; background:rgba(148,163,184,.16); color:var(--txt);}
+.ctx-cnt{margin-left:auto; font-size:10.5px; font-weight:700; color:var(--dim2); white-space:nowrap;}
+.ctx-layer.obs .ctx-layer-h{color:var(--cyan); background:rgba(34,211,238,.10); border-bottom-color:rgba(34,211,238,.28);}
+.ctx-layer.obs .ctx-n{background:rgba(34,211,238,.18); color:var(--cyan);}
+.ctx-layer.der .ctx-layer-h{color:var(--violet); background:rgba(167,139,250,.10); border-bottom-color:rgba(167,139,250,.28);}
+.ctx-layer.der .ctx-n{background:rgba(167,139,250,.18); color:var(--violet);}
+.ctx-layer.int .ctx-layer-h{color:var(--orange); background:rgba(251,146,60,.10); border-bottom-color:rgba(251,146,60,.28);}
+.ctx-layer.int .ctx-n{background:rgba(251,146,60,.18); color:var(--orange);}
+.ctx-layer-d{padding:7px 12px; font-size:11px; line-height:1.65; color:var(--dim2); border-bottom:1px dashed var(--line);}
+.ctx-list{display:flex; flex-direction:column; gap:8px; padding:11px 12px;}
+.ctx-sub{font-size:11.5px; font-weight:800; letter-spacing:.3px; color:var(--dim); margin:2px 0 -2px;}
+.ctx-item{display:flex; gap:9px; align-items:flex-start; padding:8px 10px; border-radius:9px;
+  border:1px solid var(--line); background:var(--card2);}
+.ctx-org{flex:0 0 auto; font-size:10.5px; font-weight:800; padding:2px 8px; border-radius:6px; white-space:nowrap;}
+.ctx-org.sensor{color:var(--cyan); background:rgba(34,211,238,.14); border:1px solid rgba(34,211,238,.4);}
+.ctx-org.model{color:var(--violet); background:rgba(167,139,250,.14); border:1px solid rgba(167,139,250,.4);}
+.ctx-org.inference{color:var(--green); background:rgba(52,211,153,.14); border:1px solid rgba(52,211,153,.4);}
+.ctx-item-b{min-width:0; flex:1;}
+.ctx-item-t{font-size:12.5px; line-height:1.65; color:var(--txt); word-break:break-word;}
+.ctx-item-m{margin-top:4px; font-size:10.5px; line-height:1.7; color:var(--dim2);
+  font-family:Consolas,monospace; word-break:break-all;}
+.ctx-note{margin:0 1px; font-size:10.5px; line-height:1.7; color:var(--dim2);
+  font-family:Consolas,monospace; word-break:break-all;}
 .obs-foot{display:flex; gap:10px; padding:12px 15px 15px;}
 .obs-foot .btn{flex:1;}
+.ctx-state{padding:10px 11px; border-radius:10px; border:1px solid var(--line); border-left:4px solid var(--dim2);
+  background:var(--card2);}
+.ctx-state.info{border-left-color:var(--cyan);}
+.ctx-state.notice{border-left-color:var(--yellow); background:rgba(251,191,36,.05);}
+.ctx-state.warning{border-left-color:var(--red); background:rgba(248,113,113,.06);}
+.ctx-state-t{display:flex; align-items:center; gap:8px; font-size:13px; font-weight:800; line-height:1.5; flex-wrap:wrap;}
+.ctx-primary{flex:0 0 auto; font-size:10px; font-weight:800; padding:2px 7px; border-radius:6px;
+  color:#06202a; background:linear-gradient(135deg,#22d3ee,#34d399);}
+.ctx-sev{margin-left:auto; flex:0 0 auto; font-size:10.5px; font-weight:700; padding:2px 8px; border-radius:999px;
+  border:1px solid var(--line); color:var(--dim2);}
+.ctx-sev.info{color:var(--cyan); border-color:rgba(34,211,238,.4); background:rgba(34,211,238,.12);}
+.ctx-sev.notice{color:var(--yellow); border-color:rgba(251,191,36,.5); background:rgba(251,191,36,.12);}
+.ctx-sev.warning{color:var(--red); border-color:rgba(248,113,113,.5); background:rgba(248,113,113,.12);}
+.ctx-state-x{margin-top:7px; font-size:12px; line-height:1.75; color:var(--dim);}
+.ctx-state-m{margin-top:6px; font-size:10.5px; line-height:1.75; color:var(--dim2);
+  font-family:Consolas,monospace; word-break:break-all;}
+.ctx-no{margin-top:6px; font-size:11px; line-height:1.65; color:var(--yellow);}
+.ctx-conf{padding:9px 11px; border-radius:9px; border:1px dashed rgba(167,139,250,.45);
+  background:rgba(167,139,250,.07); font-size:11.5px; line-height:1.75; color:var(--dim);}
+.ctx-conf b{color:var(--violet);}
+.ctx-conf-x{margin-top:6px; font-size:11.5px; line-height:1.75; color:var(--dim);}
+.ctx-q{padding:11px 12px; border-radius:10px; border:1px dashed rgba(251,146,60,.45); background:rgba(251,146,60,.07);}
+.ctx-q-t{font-size:13px; font-weight:800; line-height:1.6; color:var(--orange);}
+.ctx-q-b{margin-top:6px; font-size:11.5px; line-height:1.75; color:var(--dim);}
+.ctx-opts{display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;}
+.ctx-opt{flex:1 1 210px; padding:9px 12px; border-radius:9px; cursor:pointer; text-align:left; font-size:12.5px;
+  font-weight:700; color:var(--txt); background:rgba(2,6,23,.55); border:1px solid rgba(251,146,60,.42);
+  transition:transform .12s, filter .15s;}
+.ctx-opt:hover{transform:translateY(-1px); filter:brightness(1.25);}
+.ctx-opt:disabled{opacity:.45; cursor:not-allowed; transform:none; filter:none;}
+.ctx-opt.snooze{color:var(--dim); border-color:var(--line);}
+.ctx-opt-d{display:block; margin-top:4px; font-size:10.5px; font-weight:600; color:var(--dim2); line-height:1.55;}
+.ctx-supp{padding:9px 11px; border-radius:9px; border:1px dashed var(--line); background:rgba(148,163,184,.06);
+  font-size:11.5px; line-height:1.7; color:var(--dim2);}
+.ctx-empty{padding:9px 10px; font-size:12px; line-height:1.7; color:var(--dim2);}
+.ctx-foot{margin-top:2px; font-size:11px; line-height:1.8; color:var(--dim2);}
+.ctx-foot b{color:var(--yellow);}
 </style>
 </head>
 <body>
@@ -436,6 +508,41 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
       <div class="voice-playback-row" id="voice_playback_row">
         <button class="voice-play-btn" onclick="voicePlayClick()">▶️ 播放</button>
         <a class="voice-dl-link" id="voice_dl_link" href="#" download>⬇️ 下载音频</a>
+      </div>
+    </div>
+  </section>
+  <!-- week11: 系统上下文与证据（三层：① 原始证据 → ② 系统推理 → ③ 交互追问），每 2s 轮询 /api/context -->
+  <section class="card gallery-card" id="ctx_card">
+    <div class="card-h"><span class="card-t">🧩 系统上下文与证据</span>
+      <span class="pill pill-info" id="ctx_rule_pill" title="后端规则表版本（来自 /api/context.rule_version）">规则表 --</span>
+      <span class="pill pill-dim mono" id="ctx_topic_pill" title="本面板绑定哪一次采集：默认最近一次；后端支持 ?request_id= / ?filename= 精确指定">绑定 --</span>
+      <span class="pill pill-dim mono" id="ctx_poll_pill" style="margin-left:auto">轮询 2s · 等待首次快照</span>
+    </div>
+    <div class="ctx-wrap">
+      <div class="ctx-bar"><span id="ctx_headline">⏳ 正在读取 /api/context …</span></div>
+      <div class="ctx-err" id="ctx_err" style="display:none">--</div>
+      <div class="ctx-layer obs">
+        <div class="ctx-layer-h"><span class="ctx-n">①</span><span>原始证据（硬件观测 / 模型推断分开列）</span>
+          <span class="ctx-cnt" id="ctx_obs_cnt">--</span></div>
+        <div class="ctx-layer-d" id="ctx_obs_desc">--</div>
+        <div class="ctx-list" id="ctx_obs_list"><div class="ctx-empty">⏳ 正在读取原始证据…</div></div>
+      </div>
+      <div class="ctx-layer der">
+        <div class="ctx-layer-h"><span class="ctx-n">②</span><span>系统推理（规则表 R1~R9 · 可审计）</span>
+          <span class="ctx-cnt" id="ctx_der_cnt">--</span></div>
+        <div class="ctx-layer-d" id="ctx_der_desc">--</div>
+        <div class="ctx-list" id="ctx_der_list"><div class="ctx-empty">⏳ 正在读取派生状态…</div></div>
+      </div>
+      <div class="ctx-layer int">
+        <div class="ctx-layer-h"><span class="ctx-n">③</span><span>交互上下文（已知事实 / 待确认 / 追问）</span>
+          <span class="ctx-cnt" id="ctx_int_cnt">--</span></div>
+        <div class="ctx-layer-d" id="ctx_int_desc">--</div>
+        <div class="ctx-list" id="ctx_int_list"><div class="ctx-empty">⏳ 正在读取交互上下文…</div></div>
+      </div>
+      <div class="ctx-foot" id="ctx_foot">
+        <b>口径：</b>本面板只渲染后端 <span class="mono">/api/context</span> 回传的原文，不做任何前端推测；
+        阈值与规则参数一律取后端 <span class="mono">policy</span>（前端不写死）。追问只问选择题，已作答 / 已静默 / 超额的会被压制成
+        <span class="mono">ask=false</span>（仍回传并显示原因），回答经 <span class="mono">/api/context_answer</span> 落台账、可溯源。
       </div>
     </div>
   </section>
@@ -1891,6 +1998,319 @@ initChart(); updateImu(); refresh(); renderCaptureState(); renderAiPanel();   //
 promptTtsInit(); renderPromptLine();                                        // week9: 主动询问状态行 + 浏览器 TTS 开关
 setInterval(updateImu, 1000);
 setInterval(refresh, 2000);
+
+// ============ Week11: 系统上下文与证据（① 原始证据 → ② 系统推理 → ③ 交互追问） ============
+// 任务书要求：多源证据 → 派生状态 → 交互上下文，三层分开呈现，可审计、可追问。
+// 纪律（与 week7~week10 一脉相承）：
+//   * 面板只渲染 /api/context 回传的原文（origin / rule_id / evidence_ids 全部照抄），前端不做任何推测；
+//   * 阈值与规则参数一律读后端 policy（前端不写死），改后端即刻生效；
+//   * 追问只问选择题：点击 → POST /api/context_answer，成功即用返回的 context 快照【局部刷新】。
+const CTX_POLL_MS = 2000;       // 每 2 秒调用一次 /api/context
+let _ctxData = null;            // 最近一次成功的上下文快照
+let _ctxSig = '';               // 渲染签名：无实质变化就不重绘（避免 2s 重绘打断选择题点击）
+let _ctxBusy = false;           // 轮询重入保护
+let _ctxAnswering = '';         // 正在提交的 question_id（防重复点击）
+let _ctxPointerDown = false;    // 指针按在面板里时暂缓重绘（保证点击不被打断）
+const CTX_ORG_CLS = {sensor:'sensor', model:'model', inference:'inference'};
+const CTX_SEV_CLS = {info:'info', notice:'notice', warning:'warning'};
+const CTX_SEV_BADGE = {info:'badge-info', notice:'badge-warn', warning:'badge-err'};
+
+function ctxOrgCls(o){ return CTX_ORG_CLS[o] || 'inference'; }
+function ctxSevCls(s){ return CTX_SEV_CLS[s] || 'notice'; }
+function ctxSevBadge(s){ return CTX_SEV_BADGE[s] || 'badge-dim'; }
+function ctxArg(s){ return String(s == null ? '' : s).replace(/[^A-Za-z0-9_.:+-]/g, ''); }  // 与 w10Arg 同口径：只允许安全字符进 onclick
+function ctxLine(v){ return (v == null || v === '') ? '--' : String(v); }
+function ctxStamp(){
+  const p = $('ctx_poll_pill'); if (!p) return;
+  p.innerText = '轮询 ' + (CTX_POLL_MS / 1000) + 's · 快照 ' + ctxLine((_ctxData || {}).generated_at);
+}
+function ctxErr(msg){
+  const box = $('ctx_err'); if (!box) return;
+  box.style.display = msg ? 'block' : 'none';
+  if (msg) box.innerText = msg;
+}
+// 渲染签名：只有“证据 / 派生状态 / 追问状态 / 绑定对象”真的变了才重绘；
+// 文案里的“Ns 前”按 10s 档刷新（既不长期停留，也不因秒数抖动每 2s 重绘）。
+function ctxSignature(d){
+  const obs = d.observations || {}, der = d.derived_states || {}, ic = d.interaction_context || {};
+  const items = (obs.items || []).map(i => i.id + '|' + i.origin + '|' + i.text).join('~');
+  const states = (der.items || []).map(s => s.id + '|' + s.severity + '|' + s.status_label + '|' + s.confidence).join('~');
+  const facts = ((ic.known_facts || {}).items || []).map(f => f.id + '|' + f.text).join('~');
+  const conflicts = ((der.conflicts || []).map(c => [c.id, c.resolution, c.claimed_fault,
+                     c.requires_user_input, (c.between || []).join(' vs ')].join('|'))).join('~');
+  const qs = (ic.questions || []).map(function(q){
+    return [q.question_id, q.ask ? '1' : '0', q.answered_choice || '', q.suppressed_reason || '',
+            q.asked_count || 0].join('|');
+  }).join('~');
+  const bucket = Math.floor(Date.now() / 10000);
+  return [d.rule_version, obs.count, der.count, der.conflict_count, ic.headline_id, ic.answer_count,
+          (ic.pending_confirmation || []).length, (ic.askable_count == null ? '' : ic.askable_count),
+          items, states, facts, conflicts, qs, bucket].join('#');
+}
+function ctxErrHint(){
+  return _ctxData ? ('；以下为最后一次成功快照 ' + ctxLine(_ctxData.generated_at) + '，不是当前状态') : '';
+}
+function ctxApply(d, force){
+  if (!d || d.status !== 'ok'){ ctxErr('❌ 上下文快照无效（未返回 status=ok）—— 不展示任何猜测数据'); return; }
+  if (!force){
+    if (_ctxPointerDown || _ctxAnswering) return;                          // 不打断正在进行的点击 / 提交（下一轮再画）
+    if (ctxSignature(d) === _ctxSig){ _ctxData = d; ctxStamp(); return; }   // 无实质变化：只更新快照时间，不重绘
+  }
+  _ctxData = d;
+  _ctxSig = ctxSignature(d);
+  renderContextPanel(d);
+  ctxStamp();
+}
+function pollContext(){
+  if (_ctxBusy || _ctxAnswering) return;
+  _ctxBusy = true;
+  fetch('/api/context')
+    .then(r => r.json().then(j => ({code: r.status, j: j})).catch(() => ({code: r.status, j: null})))
+    .then(function(res){
+      _ctxBusy = false;
+      if (res.code !== 200 || !res.j){
+        ctxErr('❌ 读取上下文失败（HTTP ' + res.code + '）—— 不展示任何猜测数据' + ctxErrHint());
+        return;
+      }
+      ctxErr('');
+      ctxApply(res.j, false);
+    })
+    .catch(function(){
+      _ctxBusy = false;
+      ctxErr('❌ 读取上下文失败（后端不可达）—— 不展示任何猜测数据' + ctxErrHint());
+    });
+}
+
+function ctxLayerLine(d, i){
+  const l = (d.layers || [])[i];
+  return l ? (ctxLine(l.title) + '：' + ctxLine(l.desc)) : '';
+}
+// ① 原始证据的一行：来源标签（硬件观测 / 模型推断）+ 观测值 + 时间与证据 id（全部照抄后端）
+function ctxObsRow(it){
+  const when = it.time || (it.ts_ms ? fmtClock(it.ts_ms / 1000) : '--:--:--');
+  return '<div class="ctx-item"><span class="ctx-org ' + ctxOrgCls(it.origin) + '">'
+    + esc(ctxLine(it.origin_label || it.origin)) + '</span>'
+    + '<div class="ctx-item-b"><div class="ctx-item-t">' + esc(ctxLine(it.text)) + '</div>'
+    + '<div class="ctx-item-m">🕒 ' + esc(when)
+    + (it.collected_at ? (' · 采集 ' + esc(it.collected_at)) : '')
+    + (it.received_at ? (' · 接收 ' + esc(it.received_at)) : '')
+    + '<br>来源 ' + esc(ctxLine(it.source)) + ' · 证据 id ' + esc(ctxLine(it.id)) + '</div></div></div>';
+}
+// ③ 已知事实的一行（带规则与证据回指，可审计）
+function ctxFactRow(f){
+  return '<div class="ctx-item"><span class="ctx-org ' + ctxOrgCls(f.origin) + '">'
+    + esc(ctxLine(f.origin_label || f.origin)) + '</span>'
+    + '<div class="ctx-item-b"><div class="ctx-item-t">' + esc(ctxLine(f.text)) + '</div>'
+    + '<div class="ctx-item-m">' + (f.rule_id ? ('规则 ' + esc(f.rule_id) + ' · ') : '')
+    + (f.severity ? ('严重度 ' + esc(f.severity) + ' · ') : '')
+    + '依据证据 ' + esc((f.evidence_ids || []).join(', ') || '--')
+    + ' · 事实 id ' + esc(ctxLine(f.id)) + '</div></div></div>';
+}
+// ② 派生状态的一条：status_label（人话结论）+ explanation（为什么）+ rule_id / evidence_ids（可审计）+ 不声称清单
+function ctxStateRow(s, der){
+  const sev = ctxSevCls(s.severity);
+  return '<div class="ctx-state ' + sev + '">'
+    + '<div class="ctx-state-t">'
+    + ((der && der.primary_id === s.id) ? '<span class="ctx-primary">主结论</span>' : '')
+    + '<span>' + esc(ctxLine(s.status_label || s.id)) + '</span>'
+    + '<span class="ctx-sev ' + sev + '">' + esc(ctxLine(s.severity_label || s.severity)) + '</span></div>'
+    + '<div class="ctx-state-x">' + esc(ctxLine(s.explanation)) + '</div>'
+    + '<div class="ctx-state-m">' + esc(ctxLine(s.rule_id)) + ' ' + esc(ctxLine(s.rule_name))
+    + ' · 置信度 ' + esc(ctxLine(s.confidence))
+    + (s.confidence_note ? ('（' + esc(s.confidence_note) + '）') : '')
+    + '<br>依据证据 ' + esc((s.evidence_ids || []).join(', ') || '--')
+    + ' · 规则表 ' + esc(ctxLine(s.rule_version)) + ' · origin ' + esc(ctxLine(s.origin)) + '</div>'
+    + (s.source_note ? ('<div class="ctx-state-m">ℹ️ ' + esc(s.source_note) + '</div>') : '')
+    + ((s.not_claimed && s.not_claimed.length)
+        ? ('<div class="ctx-no">🚫 本条不声称：' + esc(s.not_claimed.join('；')) + '</div>') : '')
+    + '</div>';
+}
+// ③ 追问：ask=true → 选择题按钮；ask=false → 说明“这次为什么没再问”（与 week9 冷却口径一致）
+function ctxQuestionHtml(q){
+  if (!q.ask){
+    return '<div class="ctx-supp">🔇 ' + esc(ctxLine(q.question))
+      + '<br>不再追问：' + esc(ctxLine(q.suppressed_reason || '已压制'))
+      + (q.answered_choice_label ? (' · 已记录你的选择：' + esc(q.answered_choice_label)) : '')
+      + (q.answered_at ? ('（' + esc(q.answered_at) + '）') : '')
+      + '<br>追问 id ' + esc(ctxLine(q.question_id)) + ' · 已问 ' + esc(ctxLine(q.asked_count)) + ' 次</div>';
+  }
+  const busy = (_ctxAnswering === q.question_id);
+  const opts = (q.options || []).map(function(o){
+    return '<button class="ctx-opt' + (o.effect === 'snooze' ? ' snooze' : '') + '"' + (busy ? ' disabled' : '')
+      + ' onclick="ctxAnswer(\'' + ctxArg(q.question_id) + '\',\'' + ctxArg(o.value) + '\')">'
+      + esc(ctxLine(o.label || o.value)) + '<span class="ctx-opt-d">' + esc(ctxLine(o.description)) + '</span></button>';
+  }).join('');
+  return '<div class="ctx-q"><div class="ctx-q-t">❓ ' + esc(ctxLine(q.question)) + '</div>'
+    + '<div class="ctx-q-b">' + esc(ctxLine(q.because)) + '</div>'
+    + '<div class="ctx-opts">' + opts + '</div>'
+    + '<div class="ctx-q-b mono">追问 id ' + esc(ctxLine(q.question_id)) + ' · 第 ' + esc(ctxLine(q.asked_count))
+    + ' 次询问 · 最近询问 ' + esc(ctxLine(q.last_asked_at)) + ' · 依据证据 '
+    + esc((q.evidence_ids || []).join(', ') || '--') + (busy ? ' · ⏳ 正在提交你的选择…' : '') + '</div></div>';
+}
+function ctxQuestionsHtml(qs){
+  if (!qs.length) return '<div class="ctx-empty">当前没有歧义需要澄清（无追问项）—— 不为了交互而交互。</div>';
+  return qs.map(ctxQuestionHtml).join('');
+}
+
+// 三层主渲染：只把后端回传的字段摆到对应层，前端不做任何“补充推断”
+function renderContextPanel(d){
+  const obs = d.observations || {}, der = d.derived_states || {}, ic = d.interaction_context || {};
+  const topic = d.topic || {}, facts = ic.known_facts || {};
+  // ---- 顶栏：规则表版本 + 绑定对象（可溯源） ----
+  const rp = $('ctx_rule_pill');
+  if (rp) rp.innerText = '规则表 ' + ctxLine(d.rule_version);
+  const tp = $('ctx_topic_pill');
+  if (tp){
+    tp.innerText = '绑定 ' + (topic.request_id ? ('本次采集 ' + topic.request_id) : '（最近一次采集）')
+      + (topic.filename ? (' · ' + topic.filename) : '');
+    tp.title = ctxLine(topic.note);
+  }
+  // ---- 主结论（人话）+ 一句话总结 ----
+  const hl = $('ctx_headline');
+  if (hl){
+    hl.innerHTML = '<span class="badge ' + ctxSevBadge(ic.headline_severity) + '">'
+      + esc(ctxLine(ic.headline_severity_label)) + '</span> <span class="ctx-hl">主结论：'
+      + esc(ctxLine(ic.headline)) + '</span>'
+      + (ic.summary ? ('<div class="ctx-sum">' + esc(ic.summary) + '</div>') : '');
+  }
+  // ---- ① 原始证据（observations.items） ----
+  const obsCnt = $('ctx_obs_cnt'); const counts = obs.counts || {};
+  if (obsCnt) obsCnt.innerText = '证据 ' + ctxLine(obs.count) + ' 行（硬件 ' + ctxLine(counts.sensor)
+    + ' / 模型 ' + ctxLine(counts.model) + '）';
+  const obsDesc = $('ctx_obs_desc');
+  if (obsDesc) obsDesc.innerText = ctxLayerLine(d, 0) + '；' + ctxLine(obs.note);
+  const obsList = $('ctx_obs_list');
+  if (obsList){
+    const items = obs.items || [];
+    obsList.innerHTML = items.length ? items.map(ctxObsRow).join('')
+      : '<div class="ctx-empty">本次上下文没有可展示的原始证据 —— 证据不足就如实说，不猜测、不借用别的源。</div>';
+  }
+  // ---- ② 系统推理（derived_states.items + 冲突解决 + 已应用规则） ----
+  const derCnt = $('ctx_der_cnt');
+  if (derCnt) derCnt.innerText = '状态 ' + ctxLine(der.count) + ' 条 · 规则表 ' + ctxLine(der.rule_version);
+  const derDesc = $('ctx_der_desc');
+  if (derDesc) derDesc.innerText = ctxLayerLine(d, 1) + '；' + ctxLine(der.note);
+  const derList = $('ctx_der_list');
+  if (derList){
+    const items = der.items || [];
+    let h = items.length ? items.map(function(s){ return ctxStateRow(s, der); }).join('')
+      : '<div class="ctx-empty">当前没有命中的派生状态（规则表未触发 —— 不编造结论）。</div>';
+    const conflicts = der.conflicts || [];
+    if (conflicts.length){
+      h += '<div class="ctx-sub">⚖️ 冲突解决（' + conflicts.length + ' 条 · 不升级为故障）</div>'
+        + conflicts.map(function(c){
+            return '<div class="ctx-conf"><b>' + esc(ctxLine(c.wording || c.id)) + '</b>'
+              + (c.claimed_fault ? ' <span class="ctx-sev warning">已判定故障</span>'
+                                 : ' <span class="ctx-sev info">未判定故障</span>')
+              + (c.requires_user_input ? ' <span class="ctx-sev notice">需用户确认</span>' : '')
+              + (c.resolution ? ('<div class="ctx-conf-x">' + esc(c.resolution) + '</div>') : '')
+              + '<div class="ctx-state-m">冲突 ' + esc(ctxLine(c.id)) + ' · 对立证据 '
+              + esc((c.between || []).join(' vs ') || '--')
+              + ' · 解决规则 ' + esc(ctxLine(c.resolved_by)) + '</div></div>';
+          }).join('');
+    }
+    h += '<div class="ctx-note">已应用规则：' + esc((der.applied_rules || []).map(function(r){
+      return r.rule_id + ' ' + r.name;
+    }).join(' / ') || '--') + '</div>';
+    derList.innerHTML = h;
+  }
+  // ---- ③ 交互上下文（已知事实 → 待确认 → 追问选择题 → 澄清记录 → 不得声称） ----
+  const icCnt = $('ctx_int_cnt');
+  if (icCnt) icCnt.innerText = '已知事实 ' + ctxLine(facts.count) + ' 条 · 可答追问 '
+    + ctxLine(ic.askable_count) + ' 条 · 已答 ' + ctxLine(ic.answer_count);
+  const intDesc = $('ctx_int_desc');
+  if (intDesc) intDesc.innerText = ctxLayerLine(d, 2) + '；' + ctxLine(ic.note);
+  const intList = $('ctx_int_list');
+  if (intList){
+    let h = '<div class="ctx-sub">✅ 已知事实（按来源分层：硬件观测 / 模型推断 / 系统推断）</div>';
+    const fitems = facts.items || [];
+    h += fitems.length ? fitems.map(ctxFactRow).join('') : '<div class="ctx-empty">--</div>';
+    const pend = ic.pending_confirmation || [];
+    if (pend.length){
+      h += '<div class="ctx-sub">❔ 待确认（只问，不替用户假设）</div>'
+        + pend.map(function(p){ return '<div class="ctx-supp">' + esc(p) + '</div>'; }).join('');
+    }
+    h += '<div class="ctx-sub">🙋 追问（只问选择题；已作答 / 已静默的照样显示原因）</div>'
+      + ctxQuestionsHtml(ic.questions || []);
+    const ans = ic.answers || [];
+    if (ans.length){
+      h += '<div class="ctx-sub">🗳 最近澄清记录（最多 3 条，可追溯“是谁确认的”）</div>'
+        + ans.slice(-3).reverse().map(function(a){
+            return '<div class="ctx-supp">' + esc(ctxLine(a.question_id)) + ' → '
+              + esc(ctxLine(a.choice_label || a.choice)) + '（effect ' + esc(ctxLine(a.effect)) + '）· '
+              + esc(ctxLine(a.answered_at)) + (a.request_id ? (' · ' + esc(a.request_id)) : '') + '</div>';
+          }).join('');
+    }
+    const notClaim = ic.must_not_claim || [];
+    if (notClaim.length){
+      h += '<div class="ctx-sub">🚫 本层不得声称</div>'
+        + notClaim.map(function(t){ return '<div class="ctx-supp">' + esc(t) + '</div>'; }).join('');
+    }
+    intList.innerHTML = h;
+  }
+  ctxErr('');   // 渲染成功即清掉错误条
+}
+
+// 追问选择题提交：POST /api/context_answer → 成功即用返回的 context 快照局部刷新（不必等下一轮轮询）
+function ctxAnswer(questionId, choice){
+  if (_ctxAnswering) return;                                     // 防重复点击
+  if (!questionId || !choice){ showToast('err', '追问选项无效（question_id / choice 为空）'); return; }
+  _ctxAnswering = questionId;
+  if (_ctxData) renderContextPanel(_ctxData);                    // 立刻把按钮置灰，避免重复提交
+  const topic = (_ctxData || {}).topic || {};
+  const payload = {question_id: questionId, choice: choice};
+  if (topic.request_id) payload.request_id = topic.request_id;
+  if (topic.filename) payload.filename = topic.filename;
+  fetch('/api/context_answer', {method:'POST', headers:{'Content-Type':'application/json'},
+                                body: JSON.stringify(payload)})
+    .then(function(r){
+      return r.json().then(function(j){ return {code: r.status, j: j}; })
+        .catch(function(){ return {code: r.status, j: {}}; });
+    })
+    .then(function(res){
+      _ctxAnswering = '';
+      const j = res.j || {};
+      if (res.code === 200 && j.status === 'ok'){
+        showToast('ok', j.msg || '已记录你的选择');
+        ctxErr('');
+        const na = j.next_action || null;
+        if (j.context) ctxApply(j.context, true);                 // 局部刷新：直接用回答后的最新快照重绘
+        else pollContext();
+        if (na && na.type === 'retake'){
+          showToast('ok', '📷 已按你的选择发起一次新采集（retake_of = 原 request_id，不复用旧画面）');
+          triggerCapture(na.request_id || undefined);
+        } else if (na && na.type === 'retry_location'){
+          showToast('ok', '📡 已记录：下一次采集时由板端重新上报定位（本次仍严格显示“无位置解”）');
+        }
+      } else if (res.code === 409){
+        showToast('err', j.msg || '该追问已过期（证据已变化）—— 本次回答未被记录');
+        if (j.context) ctxApply(j.context, true); else pollContext();
+      } else {
+        showToast('err', j.msg || ('选项非法（HTTP ' + res.code + '）—— 本次回答未被记录'));
+        if (_ctxData) renderContextPanel(_ctxData);
+        pollContext();
+      }
+    })
+    .catch(function(){
+      _ctxAnswering = '';
+      if (_ctxData) renderContextPanel(_ctxData);
+      showToast('err', '提交失败：后端不可达 —— 本次回答未被记录');
+    });
+}
+
+// 指针按在本面板里时暂缓重绘：保证选择题按钮的点击不被 2s 轮询重绘“吃掉”（下一轮再画）
+document.addEventListener('mousedown', function(e){
+  const t = e && e.target;
+  _ctxPointerDown = !!(t && t.closest && t.closest('#ctx_card'));
+});
+document.addEventListener('mouseup', function(){ _ctxPointerDown = false; });
+document.addEventListener('touchstart', function(e){
+  const t = e && e.target;
+  _ctxPointerDown = !!(t && t.closest && t.closest('#ctx_card'));
+}, {passive: true});
+document.addEventListener('touchend', function(){ _ctxPointerDown = false; });
+pollContext();                                     // week11: 首帧立刻取一次（不必等 2s）
+setInterval(pollContext, CTX_POLL_MS);             // week11: 每 2 秒刷新三层上下文
 
 // ============ Week6: request-id isolation, clarification & stop ============
 let _currentRequestId = null;    // id of the live task (text or voice)
