@@ -815,6 +815,998 @@ def _observation_link(entry, request_id=None, received_ms=None):
     }
 
 
+# ================== week11: 多源证据 → 派生状态 → 交互上下文（规则引擎 v1.0） ==================
+# 三层解释链（任务书 Week11 核心）：
+#   ① observations        —— 原始证据：谁、在什么时刻、观测到了什么（IMU 三轴 / 画面灰度 /
+#                            AI 标签与置信度 / 板端心跳 / 定位解），每行都带来源与采集时间戳；
+#   ② derived_states      —— 由下面这张【有限规则表 CTX_RULES】推导出的状态，每条都回指
+#                            rule_id + evidence_ids（可审计：为什么这么说，一眼看得到）；
+#   ③ interaction_context —— 最终呈现给用户的解释：已知事实（可溯源）+ 待确认信息 + 歧义追问（选择题）。
+# 硬性纪律（与 week7~week10 一脉相承）：
+#   * 硬件观测(origin=sensor) 与 模型推断(origin=model/inference) 分层标注，UI 不得混装；
+#   * 证据不足就如实说“证据不足”，绝不用别的源的“新鲜”掩盖本源的缺失；
+#   * “摄像头被挡”只推出“画面不可用/疑似遮挡”，不得升格成“设备损坏”（must_not_claim 强制列出）；
+#   * 运动（IMU 剧烈震动）与“视野正常”（AI 判正常画面）可以同时成立 → 冲突解决为
+#     “设备正在移动，但视野正常”：既不升级为危险、也不判定为故障；
+#   * 唯一允许说“故障”的情形是板端自报 IMU fail（规则 R2）。
+RULE_VERSION = "v1.0"
+
+# ---- 规则参数（集中一处；前端一律从 /api/context.policy 取，绝不写死任何阈值）----
+CTX_MOTION_WINDOW_SAMPLES = 12      # 运动判定窗口：最近 N 条【真实】采样（SIM 预热点不参与）
+CTX_MOTION_STILL_RATIO = 0.06       # Δ|a| / 基线 ≤ 6%  → 基本静止
+CTX_MOTION_SHAKE_RATIO = 0.18       # Δ|a| / 基线 > 18% → 剧烈震动（中间区间为“明显移动/晃动”）
+CTX_MOTION_MIN_SAMPLES = 2          # 少于 2 条真实采样 → 不给运动结论（证据不足就明说）
+CTX_VISION_VALID_SEC = 120.0        # 画面结论有效期：超时只能说“没有新画面”，不得引用旧结论
+CTX_ANSWER_SILENCE_SEC = 300.0      # 同一追问已作答后 5 分钟内不再问（用户已经给过答案）
+CTX_SNOOZE_SEC = 60.0               # 用户选“不确定/稍后”后的静默期
+CTX_QUESTION_MIN_INTERVAL = 60.0    # 同一追问重复弹窗的最小间隔（防 2s 轮询刷屏）
+CTX_MAX_QUESTIONS = 2               # 一次最多呈现 2 条待确认追问（避免连环打扰）
+CTX_ANSWER_KEEP = 40                # 保留最近 N 次用户澄清（谁、什么时候确认的，可追溯）
+CTX_VISION_LABEL_ORIGIN_MANUAL = "用户人工纠正"
+print(f"【上下文规则】引擎版本 {RULE_VERSION} · 运动判定窗口 {CTX_MOTION_WINDOW_SAMPLES} 条真实采样 · "
+      f"静止 ≤{CTX_MOTION_STILL_RATIO:.0%} / 剧烈 >{CTX_MOTION_SHAKE_RATIO:.0%} · 画面结论有效期 {CTX_VISION_VALID_SEC:.0f}s")
+
+
+def _ctx_clock(ms):
+    """epoch 毫秒 → 'HH:MM:SS'（证据行的时间戳前缀，与前端本地时钟同一时区口径）。"""
+    if not ms:
+        return None
+    return time.strftime('%H:%M:%S', time.localtime(int(ms) / 1000.0))
+
+
+def _imu_motion(now=None):
+    """从【最近的真实采样】推导运动程度（只读，不改变任何状态）。
+
+    * metric   = |a| = sqrt(ax²+ay²+az²)；判定只看【相对波动】，单位无关：
+                 baseline = 窗口内 |a| 的中位数（兼容板端 g / m²·s⁻¹ 两种口径），
+                 Δ|a| = 窗口内相对基线的最大偏离，ratio = Δ|a| / baseline；
+    * level    = still（ratio ≤ 6%）/ moving（6%~18%）/ shaking（>18%）/ no_data（真实采样不足）；
+    * 只统计 source == "device" 的点：板端没在传时 SIM 预热点绝不会被当成“设备在动”。
+    """
+    now = time.time() if now is None else now
+    with imu_lock:
+        win = [dict(s) for s in imu_history
+               if s.get("source") == "device" and None not in (s.get("ax"), s.get("ay"), s.get("az"))]
+    win = win[-CTX_MOTION_WINDOW_SAMPLES:]
+    latest = dict(win[-1]) if win else None
+    if latest:
+        latest["collected_at"] = _ms_str(latest.get("collected_at_ms"))
+        latest["received_at"] = _ms_str(latest.get("received_at_ms"))
+        latest["time"] = _ctx_clock(latest.get("received_at_ms"))
+    base = {
+        "level": "no_data", "label": "无运动证据（未收到真实采样）",
+        "samples": len(win), "window_samples": CTX_MOTION_WINDOW_SAMPLES,
+        "baseline": None, "deviation": None, "ratio": None, "span_sec": None,
+        "latest": latest, "source": "device", "exclude_simulated": True,
+        "thresholds": {"still_ratio": CTX_MOTION_STILL_RATIO,
+                       "shake_ratio": CTX_MOTION_SHAKE_RATIO,
+                       "min_samples": CTX_MOTION_MIN_SAMPLES},
+        "metric": "|a| = √(ax²+ay²+az²)；Δ|a| = 窗口内相对基线的最大偏离；ratio = Δ|a| / 基线（无量纲）",
+        "note": "运动量只能说明“设备在动”，不能说明是谁在动、也不能说明设备损坏 —— 证据不足时不给结论。",
+    }
+    if len(win) < CTX_MOTION_MIN_SAMPLES:
+        return base
+    mags = [math.sqrt(s["ax"] ** 2 + s["ay"] ** 2 + s["az"] ** 2) for s in win]
+    srt = sorted(mags)
+    baseline = srt[len(srt) // 2] if len(srt) % 2 else (srt[len(srt) // 2 - 1] + srt[len(srt) // 2]) / 2.0
+    dev = max(abs(m - baseline) for m in mags)
+    ratio = (dev / baseline) if baseline > 1e-6 else 0.0
+    if ratio <= CTX_MOTION_STILL_RATIO:
+        level, label = "still", "基本静止"
+    elif ratio <= CTX_MOTION_SHAKE_RATIO:
+        level, label = "moving", "明显移动/晃动"
+    else:
+        level, label = "shaking", "剧烈震动"
+    base.update({
+        "level": level, "label": label,
+        "baseline": round(baseline, 4), "deviation": round(dev, 4), "ratio": round(ratio, 4),
+        "span_sec": round(float(win[-1].get("t", 0)) - float(win[0].get("t", 0)), 1),
+        "first_time": _ctx_clock(win[0].get("received_at_ms")),
+        "last_time": _ctx_clock(win[-1].get("received_at_ms")),
+        "age_sec": _obs_age_sec(win[-1].get("received_at_ms") / 1000.0, now),
+    })
+    return base
+
+
+def _vision_evidence(request_id=None, filename=None, now=None):
+    """画面这一路的证据（硬件灰度与模型标签分开标注，绝不混装）。
+
+    verdict（判定权 100% 来自 week7 遮挡初判 + week8 置信度，本函数不新增任何猜测）：
+      ok          —— 有可用画面且 AI 判为常规场景（置信度达标）
+      obstructed  —— 画面不可用（平均灰度 < BLOCKED_MAX_GRAY / <500B 空帧 / 板端报错）
+      uncertain   —— AI 置信度 < INFER_LOW_CONF：模型自己说“不确定”
+      no_frame    —— 本次采集失败（空帧/超时/设备错误），根本没有画面
+      error       —— 图片无法解码 / 原图已清理
+      expired     —— 有历史结论但超过 CTX_VISION_VALID_SEC：只能说“没有新画面”
+      unknown     —— 还没有任何画面证据
+    """
+    now = time.time() if now is None else now
+    entry = (ledger_find_any(request_id=request_id or None, filename=filename or None)
+             if (request_id or filename) else ledger_find_any())
+    v = _prompt_verdict(entry=entry)
+    rid = v.get("request_id") or request_id or (entry or {}).get("request_id")
+    received_ms = (entry or {}).get("received_at_ms") or (entry or {}).get("ts_ms")
+    collected_ms = (entry or {}).get("collected_at_ms")
+    age = _obs_age_sec(None if received_ms is None else received_ms / 1000.0, now)
+    fresh = (age is not None) and (age <= CTX_VISION_VALID_SEC)
+    corrected = bool((entry or {}).get("ai_corrected"))
+    reason = v.get("reason")
+    if not entry or not received_ms:
+        verdict = "unknown"
+    elif not fresh:
+        verdict = "expired"
+    elif reason == "blocked":
+        verdict = "obstructed"
+    elif reason == "no_image":
+        verdict = "no_frame"
+    elif reason == "low_confidence":
+        verdict = "uncertain"
+    elif reason == "infer_error":
+        verdict = "error"
+    else:
+        verdict = "ok"
+    verdict_label = {
+        "ok": "画面可用（AI 判为常规场景）",
+        "obstructed": "画面不可用（疑似镜头遮挡/过暗）",
+        "uncertain": "模型无法确定画面内容（置信度不足）",
+        "no_frame": "本次未收到有效画面（空帧/采集失败）",
+        "error": "画面无法解码（原图可能已清理）",
+        "expired": "没有新画面（历史结论已过有效期 %ds，不作当前结论）" % int(CTX_VISION_VALID_SEC),
+        "unknown": "尚无画面证据（还没抓拍过）",
+    }[verdict]
+    return {
+        "verdict": verdict,
+        "verdict_label": verdict_label,
+        "usable": verdict == "ok",
+        "fresh": fresh,
+        "age_sec": None if age is None else round(age, 1),
+        "valid_sec": CTX_VISION_VALID_SEC,
+        "request_id": rid,
+        "filename": v.get("filename") or (entry or {}).get("name"),
+        "capture_state": v.get("task_state"),
+        # ---- 硬件观测（sensor）----
+        "gray": v.get("avg_gray"),
+        "gray_threshold": BLOCKED_MAX_GRAY,
+        "dark_ratio": (entry or {}).get("dark_ratio"),
+        "size": (entry or {}).get("size"),
+        "size_threshold": BLOCKED_MIN_SIZE,
+        "blocked": bool(v.get("blocked")),
+        "collected_at": None if not collected_ms else _ms_str(collected_ms),
+        "collected_at_ms": collected_ms,
+        "collected_at_source": (entry or {}).get("collected_at_source") or "unknown",
+        "received_at": None if not received_ms else _ms_str(received_ms),
+        "received_at_ms": received_ms,
+        "time": _ctx_clock(received_ms),
+        # ---- 模型推断（model）----
+        "label": v.get("label"),
+        "label_origin": CTX_VISION_LABEL_ORIGIN_MANUAL if corrected else "week8-lite-vision 模型",
+        "score": v.get("score"),
+        "score_is_accuracy": False,       # 硬性约束：未校准分数绝不写成准确率
+        "low_conf_threshold": INFER_LOW_CONF,
+        "ai_status": "success" if corrected else (entry or {}).get("ai_status"),
+        "engine": (entry or {}).get("ai_engine") or INFER_ENGINE,
+        "corrected": corrected,
+        "alt_label": (v.get("alt") or {}).get("label") if v.get("alt") else None,
+        "reason": reason,
+        "detail": v.get("detail"),
+        "note": "灰度/尺寸/遮挡初判是【硬件观测】；AI 标签与置信度是【模型推断】—— 两者在 UI 上必须分开呈现。",
+    }
+
+
+def _ctx_evidence_items(obs, motion, vision, now):
+    """① 第一层：原始证据行。每行 = 来源 + 采集时间 + 观测值 + origin(sensor/model)。
+
+    origin=sensor → 硬件/链路观测；origin=model → 视觉模型推断（带置信度，标注未校准）。
+    板上没有的字段一律不编造：没有采样就不出 IMU 行，没有画面就不出灰度行。
+    """
+    items = []
+    lats = motion.get("latest") or {}
+    if lats:
+        items.append({
+            "id": "imu_latest", "layer": "observation", "origin": "sensor",
+            "origin_label": "硬件观测", "source": "IMU 加速度计（QMA6100P）",
+            "ts_ms": lats.get("received_at_ms"), "time": lats.get("time"),
+            "collected_at": lats.get("collected_at"), "received_at": lats.get("received_at"),
+            "text": "%s - ACC X=%s Y=%s Z=%s（板端采集 %s）" % (
+                lats.get("time") or "--:--:--", lats.get("ax"), lats.get("ay"), lats.get("az"),
+                lats.get("collected_at") or "未上报采集时间"),
+        })
+    thr = motion.get("thresholds") or {}
+    if motion.get("level") != "no_data":
+        items.append({
+            "id": "imu_motion", "layer": "observation", "origin": "sensor",
+            "origin_label": "硬件观测",
+            "source": "IMU 加速度计（%d 条真实采样推导）" % motion.get("samples", 0),
+            "ts_ms": lats.get("received_at_ms"), "time": motion.get("last_time"),
+            "text": "%s - 运动量 Δ|a|=%s / 基线 %s = %s（静止 ≤%s%% · 剧烈 >%s%%）→ %s" % (
+                motion.get("last_time") or "--:--:--", motion.get("deviation"), motion.get("baseline"),
+                ("%.1f%%" % (motion["ratio"] * 100)) if motion.get("ratio") is not None else "--",
+                int(thr.get("still_ratio", 0) * 100), int(thr.get("shake_ratio", 0) * 100),
+                motion.get("label")),
+        })
+    if vision.get("gray") is not None:
+        items.append({
+            "id": "vision_gray", "layer": "observation", "origin": "sensor",
+            "origin_label": "硬件观测", "source": "摄像头画面统计（灰度 / 尺寸）",
+            "ts_ms": vision.get("received_at_ms"), "time": vision.get("time"),
+            "collected_at": vision.get("collected_at"), "received_at": vision.get("received_at"),
+            "text": "%s - 画面平均灰度 %s（阈值 <%s → 画面不可用）· 尺寸 %s B（<%s B 视为空帧）%s" % (
+                vision.get("time") or "--:--:--", vision.get("gray"), vision.get("gray_threshold"),
+                vision.get("size"), vision.get("size_threshold"),
+                "→ 遮挡初判成立" if vision.get("blocked") else "（无遮挡初判）"),
+        })
+    if vision.get("label") or vision.get("verdict") in ("uncertain", "no_frame", "expired"):
+        items.append({
+            "id": "vision_label", "layer": "observation", "origin": "model",
+            "origin_label": "模型推断", "source": "视觉 AI 引擎 %s" % vision.get("engine"),
+            "ts_ms": vision.get("received_at_ms"), "time": vision.get("time"),
+            "text": "%s - AI 标签「%s」置信度 %s（来源 %s · 未校准分数≠准确率）%s" % (
+                vision.get("time") or "--:--:--", vision.get("label") or "—（拒识，未给标签）",
+                ("%.2f" % vision["score"]) if vision.get("score") is not None else "--",
+                vision.get("label_origin"),
+                ("；模型最接近的描述「%s」" % vision["alt_label"]) if vision.get("alt_label") else ""),
+        })
+    cam = obs.get("camera_state") or {}
+    items.append({
+        "id": "camera_link", "layer": "observation", "origin": "sensor",
+        "origin_label": "硬件观测", "source": "摄像头 / 抓拍链路",
+        "ts_ms": cam.get("last_time_ms"), "time": _ctx_clock(cam.get("last_time_ms")),
+        "text": "%s - 最近成功画面 %s（%s）· 最近失败 %s%s" % (
+            _ctx_clock(cam.get("last_time_ms")) or "--:--:--",
+            cam.get("last_time") or "从未",
+            "从未收到" if cam.get("age_sec") is None else ("%.1fs 前" % cam["age_sec"]),
+            cam.get("last_fail_time") or "无",
+            ("（原因 %s）" % cam.get("fail_reason")) if cam.get("fail_reason") else ""),
+    })
+    dev = obs.get("device_state") or {}
+    items.append({
+        "id": "network_heartbeat", "layer": "observation", "origin": "sensor",
+        "origin_label": "硬件观测", "source": "板端心跳 / HTTP 轮询",
+        "ts_ms": dev.get("last_seen_ms"), "time": _ctx_clock(dev.get("last_seen_ms")),
+        "text": "%s - 板端心跳 %s（窗口 %ss）→ %s · IP %s · RSSI %s" % (
+            _ctx_clock(dev.get("last_seen_ms")) or "--:--:--",
+            "从未收到" if dev.get("age_sec") is None else ("%.1fs 前" % dev["age_sec"]),
+            dev.get("window_sec"),
+            "网络在线" if dev.get("online") else "网络不通/设备离线",
+            dev.get("ip") or "--", dev.get("rssi")),
+    })
+    loc = obs.get("location_state") or {}
+    hist = loc.get("historical") or {}
+    items.append({
+        "id": "location_fix", "layer": "observation", "origin": "sensor",
+        "origin_label": "硬件观测", "source": "定位 GNSS",
+        "ts_ms": loc.get("collected_at_ms") or loc.get("received_at_ms"),
+        "time": _ctx_clock(loc.get("collected_at_ms")),
+        "text": ("%s - 本次位置解 %s,%s（采集 %s）" % (
+            _ctx_clock(loc.get("collected_at_ms")) or "--:--:--",
+            loc.get("latitude"), loc.get("longitude"), loc.get("collected_at")))
+        if loc.get("fix") else
+        ("%s - 本次无位置解（no_fix，严格为空）；历史位置 %s（仅参考，不代表本次）" % (
+            _ctx_clock(loc.get("received_at_ms") or hist.get("collected_at_ms")) or "--:--:--",
+            ("%s,%s @ %s" % (hist.get("latitude"), hist.get("longitude"), hist.get("collected_at")))
+            if hist.get("available") else "无")),
+    })
+    return items
+
+
+# ---- 有限规则表（② 第二层）：每条规则 = 条件(when) → 派生状态(derived) + 严重度 ----
+# 规则是【有限且可审计】的：/api/context 会把实际命中的规则整条回传，前端直接展示“为什么这么说”。
+CTX_RULES = [
+    {"rule_id": "R1", "name": "设备心跳中断",
+     "when": "距上次板端心跳 > %.0fs（DEVICE_ONLINE_WINDOW）" % DEVICE_ONLINE_WINDOW,
+     "derived": "device_offline", "severity": "warning"},
+    {"rule_id": "R2", "name": "板端自报 IMU 故障（唯一允许说“故障”的规则）",
+     "when": "imu_state.status == 'fail'", "derived": "imu_hardware_fault", "severity": "warning"},
+    {"rule_id": "R3", "name": "运动 + 视野正常（冲突解决：运动 ≠ 危险 ≠ 故障）",
+     "when": "IMU 运动 level ∈ {moving, shaking} 且 画面 verdict == 'ok'（证据新鲜）",
+     "derived": "device_moving_vision_ok", "severity": "info"},
+    {"rule_id": "R4", "name": "运动 + 画面不可用",
+     "when": "IMU 运动 level ∈ {moving, shaking} 且 画面 verdict ∈ {obstructed, uncertain, no_frame, error}",
+     "derived": "moving_with_unusable_frame", "severity": "notice"},
+    {"rule_id": "R5", "name": "仅画面一路不可用（其它源正常）",
+     "when": "网络在线 且 IMU 未判运动 且 画面 verdict ∈ {obstructed, uncertain}",
+     "derived": "camera_obstructed_but_system_ok", "severity": "notice"},
+    {"rule_id": "R6", "name": "定位观测陈旧 / 本次无位置解",
+     "when": "location_state.status ∈ {stale, offline, no_data, fail} 或 fix == False",
+     "derived": "stale_location", "severity": "notice"},
+    {"rule_id": "R7", "name": "网络在线但传感器无新数据",
+     "when": "网络在线 且 imu_state.status ∈ {stale, no_data, offline}",
+     "derived": "network_ok_but_no_sensor_data", "severity": "notice"},
+    {"rule_id": "R8", "name": "各源新鲜且画面正常",
+     "when": "网络在线 且 IMU online 且 画面 verdict == 'ok'",
+     "derived": "system_ok", "severity": "info"},
+    {"rule_id": "R9", "name": "证据不足",
+     "when": "没有任何可用的源观测（未抓拍 / 未收到采样 / 未心跳）",
+     "derived": "insufficient_evidence", "severity": "info"},
+]
+CTX_RULE_MAP = {r["rule_id"]: r for r in CTX_RULES}
+CTX_SEVERITY_RANK = {"warning": 3, "notice": 2, "info": 1}
+CTX_SEVERITY_LABEL = {"warning": "需处理", "notice": "待确认", "info": "信息"}
+
+
+def _ctx_state(rule_id, status_label, explanation, evidence_ids, confidence, confidence_note,
+               not_claimed=None, source_note=None):
+    """② 第二层单条派生状态：一律标注 origin=inference（推断），并回指命中规则与证据 id。"""
+    rule = CTX_RULE_MAP[rule_id]
+    return {
+        "id": rule["derived"],
+        "rule_id": rule_id,
+        "rule_name": rule["name"],
+        "rule_when": rule["when"],
+        "rule_version": RULE_VERSION,
+        "layer": "derived",
+        "origin": "inference",
+        "origin_label": "系统推断",
+        "severity": rule["severity"],
+        "severity_label": CTX_SEVERITY_LABEL.get(rule["severity"], rule["severity"]),
+        "status_label": status_label,
+        "explanation": explanation,
+        "evidence_ids": list(evidence_ids),
+        "confidence": confidence,                 # high / medium / low（依据新鲜度，不是概率）
+        "confidence_note": confidence_note,
+        "not_claimed": list(not_claimed or []),   # 明示“本结论【没有】断言什么”
+        "source_note": source_note,
+    }
+
+
+def _ctx_ratio_txt(motion):
+    return ("%.1f%%" % (motion["ratio"] * 100)) if motion.get("ratio") is not None else "--"
+
+
+def _ctx_derive(obs, motion, vision, now=None):
+    """② 第二层：按【有限规则表 CTX_RULES】把多源观测推导成派生状态。
+
+    * 允许【多条状态同时成立】（例：“设备正在移动”+“定位陈旧”），不做单一状态的粗暴覆盖；
+    * 返回 (states, applied_rules, primary)：primary = 严重度最高的一条（同级取先命中的）。
+    """
+    imu = obs.get("imu_state") or {}
+    dev = obs.get("device_state") or {}
+    loc = obs.get("location_state") or {}
+    level, v = motion.get("level"), vision.get("verdict")
+    moving, v_fresh, net_ok = level in ("moving", "shaking"), bool(vision.get("fresh")), bool(dev.get("online"))
+    m_num = "Δ|a|=%s / 基线 %s = %s" % (motion.get("deviation"), motion.get("baseline"),
+                                         _ctx_ratio_txt(motion))
+    v_txt = "%s（阈值：灰度 <%s 或 <%s B 空帧 → 不可用；置信度 <%s → 拒识）" % (
+        vision.get("verdict_label"), vision.get("gray_threshold"), vision.get("size_threshold"),
+        vision.get("low_conf_threshold"))
+    states = []
+
+    if not net_ok:
+        age = dev.get("age_sec")
+        states.append(_ctx_state(
+            "R1", "设备心跳中断（网络不通）",
+            "距上次板端心跳%s（窗口 %ss）→ 网络这一路证据已失效。此时其余源显示的都是【历史观测】："
+            "IMU 最近采样 %s、最近成功画面 %s —— 历史值只作参考，绝不冒充当前状态。"
+            % ("从未收到" if age is None else " %.1fs" % age, dev.get("window_sec"),
+               imu.get("last_time") or "从未", (obs.get("camera_state") or {}).get("last_time") or "从未"),
+            ["network_heartbeat", "imu_latest", "camera_link"], "high",
+            "链路层事实（心跳超窗），无需模型参与判定",
+            not_claimed=["不是设备损坏", "未收到心跳期间的数据一律按历史观测量对待"]))
+    if imu.get("status") == "fail":
+        states.append(_ctx_state(
+            "R2", "IMU 板端自报故障",
+            "板端明确上报 IMU 故障（%s，自 %s）。这是【板端自己的判断】，不是云端推断 —— "
+            "上下文里只有这一条允许出现“故障”字样，其余源的状态不受影响。"
+            % (imu.get("fail_detail") or "未给出原因", _ctx_clock(imu.get("fail_since_ms")) or "--:--:--"),
+            ["imu_motion", "imu_latest"], "high", "来源为设备自述（板端上报即事实）",
+            not_claimed=["不是整机损坏", "不代表摄像头或网络两路异常"]))
+    if moving and v == "ok" and v_fresh:
+        states.append(_ctx_state(
+            "R3", "设备正在移动，但视野正常",
+            "IMU 观测到%s（%s，窗口 %s 条真实采样）；同时最近一张画面被 AI 判为常规场景"
+            "（标签「%s」置信度 %s，采集时间 %s）。两条证据【并不冲突】："
+            "运动只说明设备在动，既不是危险、也不是摄像头故障；画面正常说明视野没有被遮挡。"
+            % (motion.get("label"), m_num, motion.get("samples"),
+               vision.get("label") or "—",
+               ("%.2f" % vision["score"]) if vision.get("score") is not None else "--",
+               vision.get("time") or "--:--:--"),
+            ["imu_motion", "vision_label", "vision_gray"], "high" if net_ok else "medium",
+            "两个源都新鲜时判为高置信（IMU 观测年龄 %ss，画面证据年龄 %ss）"
+            % (imu.get("age_sec"), vision.get("age_sec")),
+            not_claimed=["不是危险状态", "不是设备故障", "不需要维修或更换硬件"],
+            source_note="冲突解决：运动证据与“视野正常”同时成立 → 只描述为“正在移动”，不升级告警"))
+    if moving and v_fresh and v in ("obstructed", "uncertain", "no_frame", "error"):
+        states.append(_ctx_state(
+            "R4", "设备在移动，且画面这一路不可用",
+            "IMU 观测到%s（%s）；画面这一路给出不可用结论：%s。"
+            "两个源同时异常时，优先按“移动中视角被挡 / 画面未取到”解释，而不是一次性判定整机故障。"
+            % (motion.get("label"), m_num, v_txt),
+            ["imu_motion", "vision_gray", "vision_label"], "medium",
+            "画面证据年龄 %ss（有效期内）；IMU 观测年龄 %ss" % (vision.get("age_sec"), imu.get("age_sec")),
+            not_claimed=["不是设备损坏", "画面里具体被什么挡住无法从灰度/特征判断"]))
+    if net_ok and level in ("still", "no_data") and v in ("obstructed", "uncertain"):
+        states.append(_ctx_state(
+            "R5", "摄像头这一路不可用，但系统其余部分正常",
+            "网络在线、IMU %s，只有画面这一路给出不可用结论：%s。"
+            "这是【单一证据源异常】—— 按“视角 / 光照 / 对焦问题”解释，不包装成“设备损坏”。"
+            % ("无运动异常（%s）" % motion.get("label") if level == "still" else "暂无运动证据", v_txt),
+            ["vision_gray", "vision_label", "network_heartbeat"] + (["imu_motion"] if level == "still" else []),
+            "medium", "画面证据年龄 %ss（来源：%s）" % (vision.get("age_sec"), vision.get("label_origin")),
+            not_claimed=["不是设备损坏/硬件故障", "不是整机离线", "画面里有什么物体、被什么挡住均未判定"],
+            source_note="示例派生状态：camera_obstructed_but_system_ok（任务书 Week11 用词）"))
+    loc_status = loc.get("status")
+    if loc_status in ("stale", "offline", "no_data", "fail") or not loc.get("fix"):
+        hist = loc.get("historical") or {}
+        states.append(_ctx_state(
+            "R6", "定位观测陈旧 / 本次无位置解（stale_location）",
+            "定位源状态 %s：%s。本次 latitude/longitude 严格为空，界面不得用历史位置冒充当前位置"
+            "（历史位置 %s，仅作参考）。"
+            % (loc_status or "unknown", loc.get("hint") or "本次无位置解",
+               ("%s,%s @ %s" % (hist.get("latitude"), hist.get("longitude"), hist.get("collected_at")))
+               if hist.get("available") else "无"),
+            ["location_fix"], "high" if loc_status in ("no_data", "fail") else "medium",
+            "定位观测年龄 %s（阈值：%ss 陈旧 / %ss 丢失）"
+            % ("无（从未有过位置解）" if loc.get("age_sec") is None else "%.1fs" % loc["age_sec"],
+               loc.get("stale_threshold_sec"), loc.get("offline_threshold_sec")),
+            not_claimed=["当前位置", "设备是否移动过位置（无位置解时无法判断）"]))
+    if net_ok and imu.get("status") in ("stale", "no_data", "offline"):
+        states.append(_ctx_state(
+            "R7", "网络在线，但传感器没有新数据",
+            "板端心跳正常（%.1fs 前），但 IMU 状态为 %s（%s）—— 网络连通不等于传感器有数据，"
+            "二者必须分开陈述。"
+            % (dev.get("age_sec") or 0.0, imu.get("status"), imu.get("hint") or "无新采样"),
+            ["network_heartbeat", "imu_latest"], "high",
+            "心跳与 IMU 采样是两个独立事实（心跳新鲜、采样陈旧）",
+            not_claimed=["不是网络故障", "不是 IMU 硬件故障（除非板端自报 fail）"]))
+    if not states:
+        if net_ok and imu.get("status") == "online" and v == "ok" and v_fresh:
+            states.append(_ctx_state(
+                "R8", "各源新鲜且画面正常",
+                "网络在线、IMU 数据新鲜（%ss 前）、最近画面被 AI 判为常规场景（置信度 %s）—— 当前无需处理。"
+                % (imu.get("age_sec"), ("%.2f" % vision["score"]) if vision.get("score") is not None else "--"),
+                ["imu_motion", "vision_label", "network_heartbeat"], "high",
+                "三个独立源同时新鲜且结论一致",
+                not_claimed=["不代表画面内容一定正确（置信度≠准确率）", "不代表没有未被观测到的风险"]))
+        else:
+            states.append(_ctx_state(
+                "R9", "证据不足，暂不下结论",
+                "当前没有可用的源观测：未抓拍到画面 / 未收到 IMU 采样 / 未收到板端心跳 —— "
+                "证据不足时只如实陈述“没有数据”，绝不编造状态。",
+                ["network_heartbeat"], "low", "缺少观测，任何结论都不可靠",
+                not_claimed=["设备状态", "画面内容", "是否在线"]))
+    applied = [{"rule_id": s["rule_id"], "name": s["rule_name"], "when": s["rule_when"],
+                "derived": s["id"], "severity": s["severity"]} for s in states]
+    primary = max(states, key=lambda s: CTX_SEVERITY_RANK.get(s["severity"], 1))
+    return states, applied, primary
+
+
+def _ctx_conflicts(obs, motion, vision, states, now=None):
+    """冲突解决（任务书要点②）：把“看起来互相矛盾”的两条证据显式列出，并给出统一口径。
+
+    核心纪律：运动 ≠ 危险 ≠ 故障；“摄像头被挡” ≠ “设备损坏”。
+    返回 [{id, between, wording, resolution, resolved_by, claimed_fault, requires_user_input}]。
+    """
+    imu = obs.get("imu_state") or {}
+    dev = obs.get("device_state") or {}
+    loc = obs.get("location_state") or {}
+    level, v = motion.get("level"), vision.get("verdict")
+    ids = {s["id"] for s in states}
+    out = []
+    if level in ("moving", "shaking") and v == "ok" and vision.get("fresh"):
+        out.append({
+            "id": "motion_vs_vision",
+            "between": ["imu_motion=%s" % level, "vision=%s" % v],
+            "wording": "设备正在移动，但视野正常",
+            "resolution": "IMU 判运动（Δ|a|/基线 = %s）与“画面正常”是两条独立证据，并不矛盾："
+                          "运动只说明设备在动，画面正常说明视野没被挡住 —— 因此既不升级为危险、"
+                          "也不判定为故障（规则 R3）。" % _ctx_ratio_txt(motion),
+            "resolved_by": "R3",
+            "claimed_fault": False,
+            "requires_user_input": level == "shaking",
+        })
+    if not dev.get("online") and (imu.get("status") in ("online", "stale") or vision.get("fresh")):
+        out.append({
+            "id": "offline_but_fresh",
+            "between": ["network_heartbeat=offline", "imu/vision=fresh"],
+            "wording": "网络中断，但最后一帧观测仍新鲜",
+            "resolution": "心跳已超出 %ss 窗口 → 网络不可达；此时 IMU / 画面显示的是【历史观测】。"
+                          "两者同时成立时只按“历史值”呈现，禁止当作当前状态（规则 R1）。"
+                          % dev.get("window_sec"),
+            "resolved_by": "R1",
+            "claimed_fault": False,
+            "requires_user_input": False,
+        })
+    if imu.get("status") == "fail" and v == "ok" and vision.get("fresh"):
+        out.append({
+            "id": "imu_fault_vs_vision_ok",
+            "between": ["imu_state=fail", "vision=ok"],
+            "wording": "IMU 报故障，但画面正常",
+            "resolution": "故障来自板端自述，只作用于 IMU 这一路；画面与网络两路证据不受影响，"
+                          "因此不能说“整机损坏”（规则 R2）。",
+            "resolved_by": "R2",
+            "claimed_fault": True,
+            "requires_user_input": True,
+        })
+    if "stale_location" in ids and "device_moving_vision_ok" in ids:
+        out.append({
+            "id": "moving_vs_location",
+            "between": ["imu_motion=%s" % level, "location=%s" % (loc.get("status") or "unknown"),
+                        "vision=%s" % v],
+            "wording": "设备在移动、视野正常，但当前位置未知",
+            "resolution": "移动与“视野正常”不冲突；位置未知是定位这一路没有新解，与设备是否损坏无关"
+                          " —— 只陈述“无位置解”，不用历史位置顶替（规则 R6）。",
+            "resolved_by": "R6",
+            "claimed_fault": False,
+            "requires_user_input": False,
+        })
+    return out
+
+
+# ---- ③ 第三层：交互追问（选择题）状态：记录“问过几次 / 用户怎么答的”，防重复打扰 ----
+context_lock = threading.Lock()
+context_answers = deque(maxlen=CTX_ANSWER_KEEP)     # 最近 N 次用户澄清（可追溯“是谁确认的”）
+context_quest_state = {}                            # question_id -> {asked_count, last_ask_ms, choice, choice_ms, snooze_until_ms}
+
+
+def _ctx_question(question_id, kind, question, because, evidence_ids, options,
+                  request_id=None, filename=None):
+    """③ 第三层单条追问：一定是【选择题】（用户一次点击即可消解歧义），并绑定证据与对象。"""
+    return {
+        "question_id": question_id,
+        "kind": kind,
+        "layer": "interaction",
+        "question": question,
+        "because": because,
+        "evidence_ids": list(evidence_ids),
+        "options": [dict(o) for o in options],
+        "request_id": request_id,
+        "filename": filename,
+        "answer_endpoint": "/api/context_answer",
+        "answer_body": {"question_id": question_id, "choice": "<options[].value>", "request_id": request_id},
+        "rule_version": RULE_VERSION,
+    }
+
+
+def _ctx_questions(obs, motion, vision, states, conflicts, now=None):
+    """③ 第三层：只在【存在歧义】时才追问；已作答 / 已 snooze / 超额的会被压制成 ask=False
+    （但依然回传，前端能看到“为什么这次没再问”，与 week9 的冷却口径一致）。"""
+    now_ms = int((time.time() if now is None else now) * 1000)
+    dev = obs.get("device_state") or {}
+    loc = obs.get("location_state") or {}
+    ids = {s["id"] for s in states}
+    level, v = motion.get("level"), vision.get("verdict")
+    qs = []
+    # ① 遮挡歧义（任务书给定示例）
+    if v in ("obstructed", "uncertain") and vision.get("fresh"):
+        qs.append(_ctx_question(
+            "q_occlusion_%s" % (vision.get("filename") or vision.get("request_id") or "latest"),
+            "occlusion",
+            "摄像头似乎被挡住了，是您有意遮挡还是需要重新抓拍？",
+            "画面这一路给出不可用结论：%s。但“被挡住/过暗”可能是有意遮挡，也可能只是光照、对焦或视角问题 —— "
+            "灰度与像素特征无法区分，只有您能确认（规则 R5/R4）。" % vision.get("verdict_label"),
+            ["vision_gray", "vision_label"],
+            [
+                {"value": "intentional_occlusion", "label": "🙈 是我有意遮挡的", "effect": "note_only",
+                 "description": "记录为“人工确认的有意遮挡”：不再追问，也不再建议重拍"},
+                {"value": "need_retake", "label": "📷 需要重新抓拍", "effect": "retake",
+                 "description": "立即发起一次新采集（retake_of = 本次 request_id，可逐条溯源）"},
+                {"value": "not_sure", "label": "🤔 我先检查一下", "effect": "snooze",
+                 "description": "%d 秒内不再追问（黄条与徽标照旧显示，不打扰）" % int(CTX_SNOOZE_SEC)},
+            ],
+            request_id=vision.get("request_id"), filename=vision.get("filename")))
+    # ② 运动歧义：运动量只有“多大”，没有“为什么”
+    if level in ("moving", "shaking"):
+        qs.append(_ctx_question(
+            "q_motion_none", "motion",
+            "检测到设备%s（Δ|a|/基线 = %s），是您在有意移动设备吗？"
+            % (motion.get("label"), _ctx_ratio_txt(motion)),
+            "IMU 只告诉我们运动量，无法识别主体与原因：可能是有人搬动，也可能是桌面震动或无意碰撞"
+            "（规则 R3）。画面结论与它无关，绝不会因此判定为故障。",
+            ["imu_motion"],
+            [
+                {"value": "intentional_move", "label": "🚶 是我在有意搬动/移动", "effect": "note_only",
+                 "description": "记录为“人工确认的移动”，后续动作不受影响"},
+                {"value": "accidental_bump", "label": "💥 无意碰撞/放置抖动", "effect": "note_only",
+                 "description": "记录为“非预期扰动”，建议下一次评估时让设备静止"},
+                {"value": "not_sure", "label": "🤔 不确定", "effect": "snooze",
+                 "description": "%d 秒内不再追问" % int(CTX_SNOOZE_SEC)},
+            ]))
+    # ③ 定位歧义：这次到底有没有位置数据
+    if "stale_location" in ids:
+        qs.append(_ctx_question(
+            "q_location_none", "location",
+            "本次没有可用的位置数据（定位状态 %s）。是否把这次记录标记为“本次无位置”？"
+            % (loc.get("status") or "unknown"),
+            "定位这一路：%s。历史位置只作参考，界面不会用它冒充本次位置（规则 R6）。"
+            % (loc.get("hint") or "无新定位观测"),
+            ["location_fix"],
+            [
+                {"value": "accept_no_fix", "label": "📍 确认“本次无位置”", "effect": "note_only",
+                 "description": "记录为“用户已确认本次无位置”，不再追问"},
+                {"value": "retry_location", "label": "📡 等下次采集再上报", "effect": "retry_location",
+                 "description": "等待下一次抓拍时由板端重新上报定位（绝不使用历史位置顶替）"},
+                {"value": "not_sure", "label": "🤔 稍后再说", "effect": "snooze",
+                 "description": "%d 秒内不再追问" % int(CTX_SNOOZE_SEC)},
+            ]))
+    # ④ 心跳中断：只能确认“收不到心跳”，不能断言断电
+    if "device_offline" in ids:
+        qs.append(_ctx_question(
+            "q_device_offline_none", "device_offline",
+            "已 %s 未收到板端心跳，需要我做什么吗？" % (
+                "从未收到心跳" if dev.get("age_sec") is None else ("%.1f 秒" % dev["age_sec"])),
+            "心跳中断只说明【收不到心跳】（网络不可达 / 板端未工作），不能断言设备断电或损坏（规则 R1）。",
+            ["network_heartbeat"],
+            [
+                {"value": "check_device", "label": "🔌 我去检查电源与网络", "effect": "note_only",
+                 "description": "记录为“人工去核查”，入站数据一到即自动恢复正常"},
+                {"value": "retry_later", "label": "⏳ 稍后自动重试", "effect": "snooze",
+                 "description": "%d 秒内不再追问（心跳恢复后告警会立刻消失）" % int(CTX_SNOOZE_SEC)},
+                {"value": "not_sure", "label": "🤔 不确定", "effect": "snooze",
+                 "description": "%d 秒内不再追问" % int(CTX_SNOOZE_SEC)},
+            ]))
+    return _ctx_question_gate(qs, now_ms)
+
+
+def _ctx_question_gate(qs, now_ms):
+    """追问闸门（防打扰）：已作答(CTX_ANSWER_SILENCE_SEC) / 已 snooze / 超出 CTX_MAX_QUESTIONS 的
+    一律压制成 ask=False，但条目依然回传 —— 前端能看到“这次为什么没再问”。
+
+    返回 (questions, answers)：answers = 最近 CTX_ANSWER_KEEP 次用户澄清记录。
+    """
+    with context_lock:
+        st = {k: dict(x) for k, x in context_quest_state.items()}
+        answers = [dict(a) for a in context_answers]
+    out, rank = [], 0
+    for q in qs:
+        rec = st.get(q["question_id"]) or {}
+        asked_n, last_ask = int(rec.get("asked_count") or 0), rec.get("last_ask_ms")
+        if rec.get("choice") and rec.get("choice_ms") \
+                and (now_ms - int(rec["choice_ms"])) < int(CTX_ANSWER_SILENCE_SEC * 1000):
+            left = int((CTX_ANSWER_SILENCE_SEC * 1000 - (now_ms - int(rec["choice_ms"]))) / 1000)
+            ask, why = False, "已作答「%s」（%d 秒内不再追问）" % (rec.get("choice_label") or rec["choice"], left)
+        elif rec.get("snooze_until_ms") and int(rec["snooze_until_ms"]) > now_ms:
+            ask, why = False, "用户选择稍后再问（剩余 %.0f 秒）" % ((int(rec["snooze_until_ms"]) - now_ms) / 1000.0)
+        elif rank >= CTX_MAX_QUESTIONS:
+            ask, why = False, "本次最多同时追问 %d 条，该问题排队等待" % CTX_MAX_QUESTIONS
+        else:
+            ask, why = True, None
+        if ask and (not last_ask or (now_ms - int(last_ask)) >= int(CTX_QUESTION_MIN_INTERVAL * 1000)):
+            last_ask, asked_n = now_ms, asked_n + 1
+            with context_lock:
+                st2 = context_quest_state.setdefault(q["question_id"], {})
+                st2["last_ask_ms"], st2["asked_count"] = last_ask, asked_n
+        if ask:
+            rank += 1
+        q.update({
+            "ask": ask,
+            "suppressed_reason": why,
+            "asked_count": asked_n,
+            "last_asked_at": _ctx_clock(last_ask) if last_ask else None,
+            "answered_choice": rec.get("choice"),
+            "answered_choice_label": rec.get("choice_label"),
+            "answered_at": _ctx_clock(rec["choice_ms"]) if rec.get("choice_ms") else None,
+            "dedup_key": "%s|%s" % (q["question_id"], (q["because"] or "")[:24]),
+        })
+        out.append(q)
+    out.sort(key=lambda x: (not x["ask"], x["kind"]))     # 需要用户回答的排在最前面
+    return out, answers
+
+
+def _ctx_fact(fid, text, origin, evidence_ids, ts_ms=None, rule_id=None, severity=None):
+    """③ 第三层“已知事实”单条：一句人话 + origin（谁说的）+ 可回溯的证据 id 与时间。"""
+    return {
+        "id": fid, "text": text, "origin": origin,
+        "origin_label": {"sensor": "硬件观测", "model": "模型推断", "inference": "系统推断"}.get(origin, origin),
+        "evidence_ids": list(evidence_ids),
+        "time": _ctx_clock(ts_ms), "ts_ms": ts_ms,
+        "rule_id": rule_id, "severity": severity,
+    }
+
+
+def _ctx_unknowns(obs, motion, vision, states):
+    """③ 第三层“待确认信息”：把【本次没有被观测到】的东西明确列出来，避免用户以为是已知的。"""
+    imu = obs.get("imu_state") or {}
+    loc = obs.get("location_state") or {}
+    ids = {s["id"] for s in states}
+    unknown = []
+    if motion.get("level") in ("moving", "shaking"):
+        unknown.append("谁在移动设备（IMU 只给运动量，不识别主体，也不解释原因）")
+    if vision.get("verdict") in ("obstructed", "uncertain", "no_frame", "error"):
+        unknown.append("画面里被什么挡住 / 画面内容（灰度与像素特征都无法判定）")
+    if "stale_location" in ids or not loc.get("fix"):
+        unknown.append("本次设备位置（本次无位置解；历史位置只是参考，不代表本次）")
+    if "device_offline" in ids:
+        unknown.append("板端是否真的断电（只能确认“收不到心跳”）")
+    if imu.get("status") == "fail":
+        unknown.append("IMU 故障的具体成因（仅板端自述，云端无法进一步定位）")
+    if not unknown:
+        unknown.append("是否还有未被当前传感器覆盖的情况（各源结论一致，但不等于没有被观测到的风险）")
+    return unknown
+
+
+def _ctx_known_facts(obs, motion, vision, states):
+    """③ 第三层：已知事实 = 硬件观测 + 模型推断 + 系统推断，三类分开标注、逐条可回溯。"""
+    imu = obs.get("imu_state") or {}
+    dev = obs.get("device_state") or {}
+    loc = obs.get("location_state") or {}
+    facts = []
+    # ---- 硬件/链路观测（sensor）----
+    if motion.get("level") == "no_data":
+        facts.append(_ctx_fact("fact_motion", "IMU：还没有可用的真实采样，运动程度不下结论", "sensor",
+                               ["imu_motion"]))
+    else:
+        facts.append(_ctx_fact("fact_motion", "IMU：%s（Δ|a|/基线 = %s，窗口 %s 条真实采样）" % (
+            motion.get("label"), _ctx_ratio_txt(motion), motion.get("samples")), "sensor", ["imu_motion"],
+            (motion.get("latest") or {}).get("received_at_ms")))
+    if vision.get("verdict") == "unknown":
+        facts.append(_ctx_fact("fact_gray", "画面：本次没有任何画面证据（未抓拍 / 未入库）", "sensor",
+                               ["vision_gray"]))
+    else:
+        facts.append(_ctx_fact(
+            "fact_gray", "画面（硬件观测）：平均灰度 %s（阈值 <%s 判遮挡）、尺寸 %s B（阈值 <%s）、采集源 %s" % (
+                vision.get("gray"), vision.get("gray_threshold"), vision.get("size"),
+                vision.get("size_threshold"), vision.get("collected_at_source")),
+            "sensor", ["vision_gray"], vision.get("collected_at_ms")))
+    facts.append(_ctx_fact("fact_net", "链路：板端心跳%s（窗口 %ss）" % (
+        ("从未收到" if dev.get("age_sec") is None else "%.1fs 前，%s" % (
+            dev["age_sec"], "在线" if dev.get("online") else "已超出窗口判定为不通")), dev.get("window_sec")),
+        "sensor", ["network_heartbeat"], dev.get("last_seen_ms")))
+    facts.append(_ctx_fact("fact_loc", "定位：状态 %s，本次位置 %s" % (
+        loc.get("status") or "unknown",
+        ("%s, %s" % (loc.get("latitude"), loc.get("longitude"))) if loc.get("fix") else "无位置解（不使用历史位置）"),
+        "sensor", ["location_fix"], loc.get("collected_at_ms")))
+    # ---- 模型推断（model）----
+    if vision.get("label"):
+        facts.append(_ctx_fact("fact_label", "模型（%s）：标签「%s」，分数 %s（未校准，不等于准确率）" % (
+            vision.get("label_origin"), vision.get("label"),
+            ("%.2f" % vision["score"]) if vision.get("score") is not None else "--"),
+            "model", ["vision_label"], vision.get("received_at_ms")))
+    else:
+        facts.append(_ctx_fact("fact_label", "模型：本次没有可用标签（%s）" % (
+            vision.get("detail") or vision.get("verdict_label")), "model", ["vision_label"]))
+    # ---- 系统推断（inference）：原样带 rule_id，前端一眼看到“结论出自哪条规则”----
+    for s in states:
+        facts.append(_ctx_fact("fact_" + s["id"], "【推断 %s】%s" % (s["rule_id"], s["status_label"]),
+                               "inference", s["evidence_ids"], rule_id=s["rule_id"], severity=s["severity"]))
+    return {"items": facts, "count": len(facts),
+            "counts": {"sensor": len([f for f in facts if f["origin"] == "sensor"]),
+                       "model": len([f for f in facts if f["origin"] == "model"]),
+                       "inference": len([f for f in facts if f["origin"] == "inference"])},
+            "note": "已知事实按来源分层：硬件观测 / 模型推断 / 系统推断 —— 三者不得混装成一句结论。"}
+
+
+def _ctx_policy():
+    """规则参数与规则表：/api/context.policy 的统一出口（前端一律从这里取，绝不写死阈值）。"""
+    return {
+        "rule_version": RULE_VERSION,
+        "evidence_layers": ["observations", "derived_states", "interaction_context"],
+        "motion": {
+            "window_samples": CTX_MOTION_WINDOW_SAMPLES,
+            "still_ratio": CTX_MOTION_STILL_RATIO,
+            "shake_ratio": CTX_MOTION_SHAKE_RATIO,
+            "min_samples": CTX_MOTION_MIN_SAMPLES,
+            "scope": "只统计 source=device 的真实采样；SIM 预热点不参与（避免把预热点当成“设备在动”）",
+            "metric": "Δ|a| / median(|a|)：无量纲，兼容板端 g 与 m/s² 两种单位",
+            "note": "运动量只说明“设备在动”，不说明是谁在动、也不代表危险或故障。",
+        },
+        "vision_evidence": {
+            "valid_sec": CTX_VISION_VALID_SEC,
+            "gray_block_max": BLOCKED_MAX_GRAY,
+            "empty_frame_bytes": BLOCKED_MIN_SIZE,
+            "low_conf": INFER_LOW_CONF,
+            "engine": INFER_ENGINE,
+            "score_is_accuracy": False,
+            "note": "灰度/尺寸/遮挡初判是硬件观测；标签与分数是模型推断（未校准，≠ 准确率）。",
+        },
+        "heartbeat": {"window_sec": DEVICE_ONLINE_WINDOW,
+                      "note": "网络在线 ≠ 传感器有数据，二者分开陈述（规则 R7）。"},
+        "imu_freshness": {"stale_sec": IMU_STALE_SECONDS, "offline_sec": IMU_OFFLINE_SECONDS},
+        "location": {"stale_sec": LOCATION_STALE_SECONDS, "offline_sec": LOCATION_OFFLINE_SECONDS,
+                     "note": "本次无位置解时严格给 null，历史位置只作参考（规则 R6）。"},
+        "questions": {
+            "answer_silence_sec": CTX_ANSWER_SILENCE_SEC,
+            "snooze_sec": CTX_SNOOZE_SEC,
+            "min_interval_sec": CTX_QUESTION_MIN_INTERVAL,
+            "max_questions": CTX_MAX_QUESTIONS,
+            "answer_keep": CTX_ANSWER_KEEP,
+            "style": "只问选择题（一次点击即可消解歧义）；选项 effect ∈ {note_only, retake, retry_location, snooze}",
+            "note": "已作答 / 已 snooze / 超出上限的追问会被压制，但仍回传 ask=False + suppressed_reason。",
+        },
+        "severity_rank": CTX_SEVERITY_RANK,
+        "severity_label": CTX_SEVERITY_LABEL,
+        "must_not_claim": [
+            "摄像头遮挡/画面不可用 ⇒ 不得说成“设备损坏 / 硬件故障”（规则 R5）",
+            "只有板端自报 IMU fail 时才允许出现“故障”字样（规则 R2）",
+            "AI 置信度不是准确率（score_is_accuracy = False）",
+            "运动量不说明主体与原因，也不代表危险（规则 R3）",
+            "网络在线 ≠ 传感器有数据（规则 R7）",
+            "历史值（位置 / 画面结论 / 采样）不得冒充当前状态",
+        ],
+        "rules": [{"rule_id": r["rule_id"], "name": r["name"], "when": r["when"], "derived": r["derived"],
+                   "severity": r["severity"], "severity_label": CTX_SEVERITY_LABEL.get(r["severity"])}
+                  for r in CTX_RULES],
+    }
+
+
+def _ctx_summary(primary, states, motion, vision, conflicts):
+    """③ 交互上下文的一句话总结：主结论 → 运动/画面两路口径 → 其他同时成立的状态 → 冲突解决。"""
+    parts = ["主结论：%s（规则 %s · %s）" % (primary["status_label"], primary["rule_id"], primary["severity_label"])]
+    parts.append("IMU 运动口径：%s" % motion.get("label"))
+    parts.append("画面口径：%s" % vision.get("verdict_label"))
+    others = [s["status_label"] for s in states if s["id"] != primary["id"]]
+    if others:
+        parts.append("同时成立的其他状态：%s" % "；".join(others))
+    if conflicts:
+        parts.append("冲突解决：%s" % "；".join(c["wording"] for c in conflicts))
+    return "。".join(parts) + "。"
+
+
+def _ctx_build(request_id=None, filename=None, now=None):
+    """三层上下文快照（/api/context 与 /api/context_answer 共用同一份口径，避免两处规则跑偏）。
+
+    * 默认绑定【最近一次采集】；也可指定 request_id / filename 精确到某一次（可溯源）；
+    * 只读：本函数不修改任何传感器状态，只汇总（追问计数在 _ctx_question_gate 内维护）。
+    """
+    now = time.time() if now is None else now
+    obs = _current_observation(now)
+    motion = _imu_motion(now)
+    vision = _vision_evidence(request_id=request_id, filename=filename, now=now)
+    items = _ctx_evidence_items(obs, motion, vision, now)
+    states, applied, primary = _ctx_derive(obs, motion, vision, now)
+    conflicts = _ctx_conflicts(obs, motion, vision, states, now)
+    questions, answers = _ctx_questions(obs, motion, vision, states, conflicts, now)
+    facts = _ctx_known_facts(obs, motion, vision, states)
+    unknown = _ctx_unknowns(obs, motion, vision, states)
+    askable = [q for q in questions if q["ask"]]
+    ms = int(now * 1000)
+    return {
+        "status": "ok",
+        "rule_version": RULE_VERSION,
+        "generated_at": _ms_str(ms),
+        "generated_at_ms": ms,
+        "server_time": _ms_str(ms),
+        "topic": {
+            "request_id": vision.get("request_id") or request_id,
+            "filename": vision.get("filename") or filename,
+            "bound_to_latest": not (request_id or filename),
+            "note": "上下文默认绑定最近一次采集；可用 ?request_id= / ?filename= 精确指定某一次（week11 可溯源要求）。",
+        },
+        "layers": [
+            {"key": "observations", "title": "① 原始证据",
+             "desc": "硬件观测与模型推断分开列：每行 = 来源 + 采集/接收时间 + 观测值 + origin"},
+            {"key": "derived_states", "title": "② 系统推理",
+             "desc": "按有限规则表（R1~R9）推导：每条都回指 rule_id 与 evidence_ids，可审计"},
+            {"key": "interaction_context", "title": "③ 交互上下文",
+             "desc": "已知事实（分层标注）+ 待确认信息 + 歧义追问（选择题，可 snooze）"},
+        ],
+        "observations": {
+            "items": items,
+            "count": len(items),
+            "counts": {"sensor": len([i for i in items if i["origin"] == "sensor"]),
+                       "model": len([i for i in items if i["origin"] == "model"])},
+            "imu_motion": motion,
+            "vision": vision,
+            "imu_state": obs.get("imu_state"),
+            "camera_state": obs.get("camera_state"),
+            "location_state": obs.get("location_state"),
+            "device_state": obs.get("device_state"),
+            "freshness_policy": obs.get("policy"),
+            "sensor_role_hint": obs.get("network_but_no_data"),
+            "note": "本层只陈述“谁、在什么时刻、观测到什么”；AI 标签属模型推断，必须标 origin=model。",
+        },
+        "derived_states": {
+            "items": states,
+            "count": len(states),
+            "applied_rules": applied,
+            "primary": primary,
+            "primary_id": primary["id"],
+            "primary_label": primary["status_label"],
+            "primary_severity": primary["severity"],
+            "primary_severity_label": primary["severity_label"],
+            "conflicts": conflicts,
+            "conflict_count": len(conflicts),
+            "rule_version": RULE_VERSION,
+            "note": "派生状态一律 origin=inference；允许多条同时成立，不做单一状态覆盖；severity 只表达“是否需要人处理”，不是危险等级。",
+        },
+        "interaction_context": {
+            "headline": primary["status_label"],
+            "headline_id": primary["id"],
+            "headline_severity": primary["severity"],
+            "headline_severity_label": primary["severity_label"],
+            "summary": _ctx_summary(primary, states, motion, vision, conflicts),
+            "known_facts": facts,
+            "pending_confirmation": unknown,
+            "questions": questions,
+            "askable_count": len(askable),
+            "answers": answers,
+            "answer_count": len(answers),
+            "must_not_claim": [
+                "摄像头遮挡/画面不可用 ⇒ 不是设备损坏（只说“画面这一路不可用，疑似遮挡”）",
+                "运动 ⇒ 不是危险、不是故障（运动量只说明设备在动）",
+                "AI 置信度 ⇒ 不是准确率",
+                "网络在线 ⇒ 不等于传感器有数据",
+                "历史观测（位置 / 画面结论 / 采样）⇒ 不等于当前状态",
+            ],
+            "note": "只问选择题；已作答 / 已静默 / 超过上限的追问会被压制成 ask=False，但依然回传并可解释原因。",
+        },
+        "policy": _ctx_policy(),
+    }
+
+
+def record_context_answer(question_id, choice, note=None, request_id=None, filename=None):
+    """登记用户对追问的回答（唯一入口；沿用 week9 纪律：回答必须绑定【当前仍待确认】的追问）。
+
+    返回 dict：status ∈ {ok, expired, bad_choice}；ok 时附 next_action 供前端执行（重拍等）。
+    """
+    snap = _ctx_build(request_id=request_id, filename=filename)
+    qs = (snap.get("interaction_context") or {}).get("questions") or []
+    q = next((x for x in qs if x.get("question_id") == question_id), None)
+    if q is None:
+        return {"status": "expired", "question_id": question_id, "questions": qs,
+                "msg": "该追问在当前上下文中已不存在（证据已变化）—— 请以最新上下文为准，本次回答不记录。",
+                "rule_version": RULE_VERSION}
+    if q.get("answered_choice"):
+        return {"status": "expired", "question_id": question_id, "questions": qs,
+                "msg": "该追问已作答（%s）—— 不重复记录。" % (q.get("answered_choice_label") or q["answered_choice"]),
+                "rule_version": RULE_VERSION}
+    opt = next((o for o in (q.get("options") or []) if o.get("value") == choice), None)
+    if opt is None:
+        return {"status": "bad_choice", "question_id": question_id, "questions": qs,
+                "msg": "选项非法：%s（合法选项 %s）" % (choice, [o["value"] for o in (q.get("options") or [])]),
+                "rule_version": RULE_VERSION}
+    now_ms = int(time.time() * 1000)
+    rec = {"question_id": question_id, "kind": q.get("kind"), "question": q.get("question"),
+           "choice": choice, "choice_label": opt.get("label"), "effect": opt.get("effect"),
+           "note": note, "request_id": q.get("request_id"), "filename": q.get("filename"),
+           "answered_at": _ms_str(now_ms), "answered_at_ms": now_ms, "rule_version": RULE_VERSION}
+    with context_lock:
+        st = context_quest_state.setdefault(question_id, {})
+        st["choice"], st["choice_ms"], st["choice_label"] = choice, now_ms, opt.get("label")
+        st["asked_count"] = st.get("asked_count") or 0
+        if opt.get("effect") == "snooze":
+            st["snooze_until_ms"] = now_ms + int(CTX_SNOOZE_SEC * 1000)
+        context_answers.append(rec)
+    entry = ledger_find_any(request_id=q.get("request_id"), filename=q.get("filename")) \
+        if (q.get("request_id") or q.get("filename")) else None
+    if entry:
+        # 只给已有记录【追加字段】（ledger_save_ai 语义：绝不新建记录）
+        ledger_save_ai(entry, ctx_question_id=question_id, ctx_question=q.get("question"),
+                       ctx_choice=choice, ctx_choice_label=opt.get("label"), ctx_effect=opt.get("effect"),
+                       ctx_note=note, ctx_answered_at=_ms_str(now_ms), ctx_answered_at_ms=now_ms,
+                       ctx_rule_version=RULE_VERSION)
+    next_action = None
+    if opt.get("effect") == "retake":
+        next_action = {"type": "retake", "command": "triggerCapture",
+                       "request_id": q.get("request_id"), "filename": q.get("filename"),
+                       "note": "前端发起一次新采集（retake_of = 原 request_id），不复用旧画面、不覆盖旧记录"}
+    elif opt.get("effect") == "retry_location":
+        next_action = {"type": "retry_location", "command": None,
+                       "note": "无需前端动作：下一次采集时由板端重新上报定位；本次仍严格显示“无位置解”"}
+    print(f"【上下文追问】{_ctx_clock(now_ms)} {question_id} → {choice}（{opt.get('label')}，effect={opt.get('effect')}）")
+    return {"status": "ok", "question_id": question_id, "choice": choice, "choice_label": opt.get("label"),
+            "effect": opt.get("effect"), "answered_at": _ms_str(now_ms), "answered_at_ms": now_ms,
+            "next_action": next_action, "answer": rec, "ledger_updated": bool(entry),
+            "msg": "已记录用户确认：%s" % opt.get("label"), "rule_version": RULE_VERSION,
+            "context": _ctx_build(request_id=request_id, filename=filename)}
+
+
+@app.route("/api/context")
+def api_context():
+    """week11: 三层上下文快照（只读）——原始证据 / 派生状态 / 交互上下文 + 规则参数 policy。
+
+    默认绑定最近一次采集；?request_id= 或 ?filename= 可精确指定某一次（可溯源）。
+    """
+    return jsonify(_ctx_build(request_id=request.args.get("request_id") or None,
+                              filename=request.args.get("filename") or None))
+
+
+@app.route("/api/context_answer", methods=["POST"])
+def api_context_answer():
+    """week11: 登记用户对追问的回答（选择题）。过期/非法 ⇒ 409/400，绝不“记一次假回答”。"""
+    data = request.get_json(silent=True) or request.form or {}
+    qid = (data.get("question_id") or "").strip()
+    choice = (data.get("choice") or "").strip()
+    if not qid or not choice:
+        return jsonify({"status": "bad_request", "rule_version": RULE_VERSION,
+                        "msg": "question_id 与 choice 均为必填（追问只接受选择题答案）"}), 400
+    res = record_context_answer(
+        qid, choice, note=data.get("note"),
+        request_id=data.get("request_id") or request.args.get("request_id"),
+        filename=data.get("filename") or request.args.get("filename"))
+    code = 200 if res["status"] == "ok" else (409 if res["status"] == "expired" else 400)
+    return jsonify(res), code
+
+
 def check_timeout():
     """推进 week7 单张采集状态机（/api/status 与设备/AI 路径都会调用）。
       ACCEPTED --(板端 2s 冷却结束)--> COLLECTING（“采集中...”）
