@@ -116,6 +116,27 @@ AI_LABELS = [
 print(f"【视觉推理】引擎 {INFER_ENGINE} 就绪 · 特征后端 "
       f"{'opencv' if _CV2_AVAILABLE else 'pillow+numpy'} · 拒识阈值 {INFER_LOW_CONF}")
 
+# ---------------- week9: 视觉事件触发的【主动询问】(Proactive Prompt) + 冷却 ----------------
+# 任务书要求：当视觉引擎判定“画面不可用”时（遮挡 / 置信度 < 0.4 / 空帧），系统必须【主动询问】
+# 用户是否重拍，并处理【确认】/【忽略】与【冷却】：
+#   1) 判定依据全部来自真实数据：week7 的遮挡初判（平均灰度 < 40 或 < 500B 空帧）、
+#      week8 的置信度（< INFER_LOW_CONF 拒识）、以及采集失败（空帧/无图片）—— 不编造任何结论；
+#   2) 用户点“忽略”后 PROMPT_COOLDOWN_SECONDS(30s) 内【不再弹窗】（黄条/徽章照旧显示，
+#      后端只累加 suppressed 计数并打日志），避免系统反复打扰；
+#   3) 每次询问都带 prompt_id = "pr_<request_id>"，动作请求必须与 request_id 匹配，
+#      否则按“已过期”拒绝（409）→ 绝不给 A 照片弹窗却重拍 B；
+#   4) 用户动作写回 photos_ledger.json 的新字段 user_action = confirmed_retake / ignored_retake。
+PROMPT_COOLDOWN_SECONDS = 30.0     # 用户忽略后的静默期（任务书硬性要求 30s）
+PROMPT_REASK_SECONDS = 60.0        # 同一张画面已询问且用户未操作 → 该窗口内不重复弹窗（防 2s 轮询刷屏）
+PROMPT_VOICE_TEXT = "画面无法识别，是否重拍？"   # 浏览器 TTS 播报文案（权限不允许时只保留弹窗文字）
+# 询问文案：原因 → (标题, 正文)。只描述画面级特征（亮度/置信度/空帧），不含编造的物体与坐标。
+PROMPT_TEXT = {
+    "blocked": ("识别到画面过暗/模糊", "⚠️ 识别到画面过暗/模糊（疑似遮挡）。是否立即重新抓拍？"),
+    "low_confidence": ("识别置信度不足", "⚠️ 视觉模型无法确定画面内容（置信度偏低）。是否立即重新抓拍？"),
+    "infer_error": ("画面无法解码", "⚠️ 视觉推理不可用（图片无法解码或已清理）。是否立即重新抓拍？"),
+    "no_image": ("未收到有效画面", "⚠️ 本次未收到有效画面（空帧/采集失败）。是否立即重新抓拍？"),
+}
+
 task_state = {
     "task_id": None,
     "status": "IDLE",  # IDLE, PENDING, ACCEPTED, COLLECTING, COMPLETED, TIMEOUT, FAIL
@@ -130,6 +151,9 @@ task_state = {
     "deadline": None,         # 采集硬截止时刻（created_at + CAPTURE_TIMEOUT_SECONDS）
     "fail_reason": None,      # timeout / offline / device_error
     "result": None,           # 成功时的元数据（大小 / 平均灰度 / 是否遮挡）
+    # ---- week9: 主动询问 → 重拍的溯源字段（本次采集是谁建议重拍的） ----
+    "retake_of": None,        # 源自哪一次采集（被判定“画面不可用”的 request_id）
+    "prompt_id": None,        # 源自哪一次主动询问（"pr_<request_id>"）
 }
 device_info = {
     "ip": None,        # learned from device poll/upload requests (remote_addr)
@@ -146,6 +170,51 @@ capture_gate = {
     "locked_until": 0.0,      # 锁定截止时刻（time.time() 基准，便于前端倒计时）
     "last_fail": None,        # {"reason": ..., "detail": ..., "ts_ms": ...}
 }
+
+# ---------------- week9: 主动询问门控（30s 冷却 + 去重 + 已处理记录） ----------------
+prompt_lock = threading.Lock()
+prompt_gate = {
+    "cooldown_until": 0.0,     # 静默期截止（time.time() 基准）→ 期间不弹窗，只后台记录
+    "last_action": None,       # ignored_retake / confirmed_retake
+    "last_action_ts_ms": None,
+    "last_request_id": None,   # 最近一次动作关联的采集 request_id
+    "last_prompt_id": None,    # 最近一次动作关联的 prompt_id
+    "suppressed": 0,           # 冷却期内被压制（不弹窗、仅记录）的【不同画面】数量
+    "suppressed_ids": set(),   # 已计入 suppressed 的 request_id（同一张画面反复轮询只计一次）
+    "suppressed_last": None,   # {"request_id": ..., "reason": ..., "ts_ms": ...}
+    "asked": {},               # request_id -> {"prompt_id":..., "ts":..., "reason":...}（防重复弹窗）
+    "handled": {},             # request_id -> 用户动作（已处理过的画面不再询问）
+    "counters": {"checked": 0, "ask": 0, "confirmed": 0, "ignored": 0},
+}
+
+
+def _prompt_state():
+    """主动询问门控快照：冷却到期惰性解锁（不需要后台线程），供前端显示倒计时。"""
+    now = time.time()
+    with prompt_lock:
+        if prompt_gate["cooldown_until"] and now >= prompt_gate["cooldown_until"]:
+            prompt_gate["cooldown_until"] = 0.0          # 静默期结束 → 恢复可询问
+            print("【主动询问·冷却结束】静默期已过 → 恢复“画面不可用即询问重拍”")
+        rem = max(0.0, prompt_gate["cooldown_until"] - now)
+        return {
+            "cooldown_active": rem > 0,
+            "cooldown_remaining": round(rem, 1),
+            "cooldown_seconds": PROMPT_COOLDOWN_SECONDS,
+            "reask_seconds": PROMPT_REASK_SECONDS,
+            "last_action": prompt_gate["last_action"],
+            "last_action_ts_ms": prompt_gate["last_action_ts_ms"],
+            "last_request_id": prompt_gate["last_request_id"],
+            "last_prompt_id": prompt_gate["last_prompt_id"],
+            "suppressed": prompt_gate["suppressed"],
+            "suppressed_last": prompt_gate["suppressed_last"],
+            "counters": dict(prompt_gate["counters"]),
+        }
+
+
+def _prompt_cooldown_active():
+    """当前是否处于“用户已忽略 → 不再打扰”的静默期。"""
+    with prompt_lock:
+        return prompt_gate["cooldown_until"] > time.time()
 
 def check_timeout():
     """推进 week7 单张采集状态机（/api/status 与设备/AI 路径都会调用）。
@@ -295,6 +364,9 @@ def _capture_public():
         "lock_remaining": gate["locked_remaining"],
         "lock_seconds": gate["lock_seconds"],
         "consecutive_fails": gate["consecutive_fails"],
+        # week9: 本次采集是否由【主动询问】建议的重拍而来（溯源，防串台）
+        "retake_of": ts.get("retake_of"),
+        "prompt_id": ts.get("prompt_id"),
     }
 
 def photo_avg_gray(path):
@@ -685,7 +757,7 @@ def ledger_add(name, size, **extra):
 
 def ledger_add_attempt(request_id, task_id, trigger, ok, reason=None, detail=None,
                        name=None, size=0, blocked=False, avg_gray=None, dark_ratio=None,
-                       unusable=False, ts_ms=None, state=None):
+                       unusable=False, ts_ms=None, state=None, retake_of=None, prompt_id=None):
     """week7: 记录一次【真实硬件采集】的成败。
     成功 → status=stored（有图片文件）；失败 → status=failed（无图片文件，元数据保留）。
     两种记录都带 request_id 与毫秒级时间戳，满足“图像与请求强关联”的溯源要求。
@@ -710,6 +782,12 @@ def ledger_add_attempt(request_id, task_id, trigger, ok, reason=None, detail=Non
         "reason": reason,
         "detail": detail,
     }
+    # week9: 本次采集若源自【主动询问】建议的重拍 → 记录来源（谁建议的、哪次询问），
+    # 这样画廊里能一眼看出“这张是忽略/确认重拍链路里的哪一张”，也不会与其它采集串台。
+    if retake_of:
+        entry["retake_of"] = retake_of
+    if prompt_id:
+        entry["prompt_id"] = prompt_id
     with ledger_lock:
         ledger.append(entry)
         if len(ledger) > 200:
@@ -756,6 +834,26 @@ def ledger_save_ai(entry, **fields):
     return entry
 
 
+def ledger_find_any(request_id=None, filename=None):
+    """week9: 比 ledger_find_entry 更宽松的定位（允许命中「无图片的采集失败记录」）。
+    week8 的推理/纠正入口语义保持不变；主动询问需要把 user_action 写到失败卡片上，
+    而失败记录 name=None，week8 的定位会跳过它。"""
+    with ledger_lock:
+        items = list(ledger)
+    if filename:
+        for e in reversed(items):
+            if e.get("name") == filename:
+                return e
+        return None
+    if request_id:
+        for e in reversed(items):
+            if e.get("request_id") == request_id:
+                return e
+        return None
+    for e in reversed(items):
+        if e.get("name") and e.get("status") == "stored":
+            return e
+    return None
 def _ai_public(entry, cached=False):
     """推理结果的对外视图：人工纠正优先展示，并把“置信度≠准确率”一路带到前端。"""
     if not entry:
@@ -826,6 +924,254 @@ def infer_photo_entry(entry, force=False, source="api"):
     return _ai_public(entry)
 
 
+# ---------------- week9: 主动询问（画面不可用 → 询问是否重拍）核心逻辑 ----------------
+def _prompt_verdict(entry=None, request_id=None, filename=None, cap=None):
+    """统一判定“本次画面是否不可用”，全部依据真实数据（不编造任何结论/物体名/位置）：
+      blocked        → week7 遮挡初判（平均灰度 < 40、< 500B 空帧、板端报错）
+      low_confidence → week8 置信度 < INFER_LOW_CONF(0.4) 且用户尚未人工纠正
+      infer_error    → 图片无法解码 / 原图已清理
+      no_image       → 本次采集失败（空帧/超时/设备错误），根本没有可用画面
+    返回判定明细，供 /api/prompt_check 与 /api/status 共用。"""
+    cap = cap if cap is not None else _capture_public()
+    entry = entry or {}
+    rid = request_id or entry.get("request_id") or cap.get("request_id")
+    fname = filename or entry.get("name")
+    state = cap.get("state")
+    blocked = bool(entry.get("blocked") or entry.get("unusable"))
+    if not blocked and (not entry or entry.get("request_id") == cap.get("request_id")):
+        # 台账无遮挡标记时回落到本次采集状态（板端报错/空帧同样会置 blocked/unusable）
+        blocked = bool(cap.get("blocked") or cap.get("unusable"))
+    ai_status = entry.get("ai_status")
+    ai_score = entry.get("ai_score")
+    corrected = bool(entry.get("ai_corrected"))
+    # 无图片的采集失败记录（空帧/设备报错）：reason 必须如实说“没有可用画面”，而不是“遮挡”
+    no_file = bool(entry) and (not entry.get("name") or entry.get("status") == "failed")
+    unusable, reason, detail = False, "ok", None
+    if no_file:
+        unusable, reason = True, "no_image"
+        detail = entry.get("detail") or entry.get("reason") or "本次采集未产生可用画面"
+    elif blocked:
+        unusable, reason = True, "blocked"
+        detail = entry.get("detail") or cap.get("detail") or "画面偏黑/疑似遮挡（week7 遮挡初判）"
+    elif corrected:
+        reason, detail = "ok", "用户已人工修正标签 → 画面已被理解，不再打扰"
+    elif ai_status == "low_confidence" or (ai_score is not None and float(ai_score) < INFER_LOW_CONF):
+        unusable, reason = True, "low_confidence"
+        detail = f"最高置信度 {ai_score} < 拒识阈值 {INFER_LOW_CONF}"
+    elif ai_status == "error":
+        unusable, reason = True, "infer_error"
+        detail = entry.get("ai_msg") or "图片无法解码或已被清理"
+    elif not entry:
+        if state in ("TIMEOUT", "FAIL"):
+            unusable, reason = True, "no_image"
+            detail = cap.get("detail") or cap.get("fail_reason") or "未收到有效画面（空帧/超时）"
+        else:
+            detail = "本次画面可用（无遮挡，置信度达标）"
+    gray = entry.get("avg_gray")
+    if gray is None:
+        gray = cap.get("avg_gray")
+    # 拒识（low_confidence）时 ai_label 为空 → 用 week8 的 ai_alt 作为“模型最接近的描述”，
+    # 供用户在弹窗里判断要不要重拍（依然只描述画面特征，不编造物体名与位置）
+    alt = entry.get("ai_alt") or {}
+    label = entry.get("ai_label_manual") if corrected else entry.get("ai_label")
+    if not label and alt.get("label"):
+        label = alt.get("label")
+    return {
+        "unusable": unusable, "reason": reason, "detail": detail,
+        "request_id": rid, "filename": fname,
+        "blocked": bool(blocked), "avg_gray": gray,
+        "score": ai_score,
+        "alt": alt or None,
+        "label": label,
+        "task_state": state,
+    }
+
+
+def evaluate_proactive_prompt(request_id=None, filename=None, register=True, source="front"):
+    """week9 决策：本次是否要【主动询问重拍】，以及是否被冷却/去重压制。
+    register=True  → 登记“已询问”（否则前端 2s 轮询会把弹窗刷屏）；
+    register=False → 只读快照（/api/status 用），不改变任何门控计数。"""
+    rid = str(request_id or "").strip() or None
+    fname = str(filename or "").strip() or None
+    entry = ledger_find_any(request_id=rid, filename=fname) if (rid or fname) else ledger_find_entry()
+    v = _prompt_verdict(entry=entry, request_id=rid, filename=fname)
+    rid = v["request_id"]
+    now = time.time()
+    pstate = _prompt_state()
+    res = {
+        "status": "ok",
+        "ask": False,
+        "reason": v["reason"],
+        "unusable": v["unusable"],
+        "title": None, "msg": None, "note": None,
+        "voice": PROMPT_VOICE_TEXT,
+        "detail": v["detail"],
+        "request_id": rid, "filename": v["filename"],
+        "prompt_id": ("pr_" + rid) if rid else None,
+        "label": v["label"], "score": v["score"], "threshold": INFER_LOW_CONF,
+        "alt": v["alt"],
+        "blocked": v["blocked"], "avg_gray": v["avg_gray"], "task_state": v["task_state"],
+        "cooldown_seconds": PROMPT_COOLDOWN_SECONDS,
+        "cooldown_active": pstate["cooldown_active"],
+        "cooldown_remaining": pstate["cooldown_remaining"],
+        "reask_seconds": PROMPT_REASK_SECONDS,
+        "suppressed": pstate["suppressed"],
+        "last_action": pstate["last_action"],
+        "user_action": (entry or {}).get("user_action"),
+        "source": source,
+        "ts_ms": int(now * 1000),
+    }
+    if register:
+        with prompt_lock:
+            prompt_gate["counters"]["checked"] += 1
+    if not v["unusable"]:
+        return res                     # 画面可用 → 不询问（黄条/徽章等 week7/8 反馈保持不变）
+    with prompt_lock:
+        handled = prompt_gate["handled"].get(rid)
+        cooling = prompt_gate["cooldown_until"] > now
+        asked = prompt_gate["asked"].get(rid)
+        recent_ask = bool(asked) and (now - float(asked.get("ts") or 0)) < PROMPT_REASK_SECONDS
+        if handled:
+            res["reason"] = "handled"
+            res["note"] = f"用户已处理该画面（{handled}），不再重复询问"
+        elif cooling:
+            # 硬性要求：用户刚点“忽略” → 30s 内即使再次判定不可用也【不弹窗】，只在后台记录
+            res["reason"] = "cooldown"
+            res["note"] = (f"用户刚选择忽略 → 静默 {PROMPT_COOLDOWN_SECONDS:.0f}s 内不弹窗，"
+                           f"仅后台记录（黄条/徽章照旧显示）")
+            if register and rid and rid not in prompt_gate["suppressed_ids"]:
+                # 同一张画面在冷却期内被反复轮询只计一次（计数=被压制的不同画面数，不虚高）
+                prompt_gate["suppressed_ids"].add(rid)
+                prompt_gate["suppressed"] += 1
+                prompt_gate["suppressed_last"] = {"request_id": rid, "reason": v["reason"],
+                                                  "ts_ms": int(now * 1000)}
+                if len(prompt_gate["suppressed_ids"]) > 256:
+                    prompt_gate["suppressed_ids"] = set(
+                        list(prompt_gate["suppressed_ids"])[-128:])
+        elif recent_ask:
+            res["reason"] = "already_asked"
+            res["note"] = f"同一张画面 {PROMPT_REASK_SECONDS:.0f}s 内已询问过 → 不重复弹窗"
+        else:
+            title, msg = PROMPT_TEXT.get(v["reason"],
+                                         ("画面不可用", "⚠️ 画面不可用。是否立即重新抓拍？"))
+            res.update(ask=True, title=title, msg=msg)
+            if register:
+                prompt_gate["asked"][rid] = {"prompt_id": res["prompt_id"], "ts": now,
+                                             "reason": v["reason"]}
+                prompt_gate["counters"]["ask"] += 1
+                if len(prompt_gate["asked"]) > 128:
+                    keep = sorted(prompt_gate["asked"].items(),
+                                  key=lambda kv: float(kv[1].get("ts") or 0))[-64:]
+                    prompt_gate["asked"] = dict(keep)
+        res["cooldown_active"] = cooling
+        res["cooldown_remaining"] = round(max(0.0, prompt_gate["cooldown_until"] - now), 1)
+        res["suppressed"] = prompt_gate["suppressed"]
+    if register:
+        if res["ask"]:
+            print(f"【主动询问】request_id={rid or '-'} 判定画面不可用（{res['reason']}：{res['detail']}）"
+                  f" → 下发询问「{res['msg']}」（prompt_id={res['prompt_id']}）")
+        elif res["reason"] == "cooldown":
+            print(f"【主动询问·冷却压制】request_id={rid or '-'} 画面仍不可用（{v['reason']}），"
+                  f"静默期剩余 {res['cooldown_remaining']:.1f}s → 不弹窗，仅后台记录"
+                  f"（累计压制 {res['suppressed']} 次）")
+        elif res["reason"] == "already_asked":
+            print(f"【主动询问·去重】request_id={rid or '-'} {PROMPT_REASK_SECONDS:.0f}s 内已询问过 → 不重复弹窗")
+    return res
+
+
+PROMPT_ACTION_ALIASES = {
+    "confirmed_retake": "confirmed_retake", "confirm": "confirmed_retake",
+    "confirmed": "confirmed_retake", "retake": "confirmed_retake",
+    "yes": "confirmed_retake", "ok": "confirmed_retake", "accept": "confirmed_retake",
+    "ignored_retake": "ignored_retake", "ignore": "ignored_retake",
+    "ignored": "ignored_retake", "no": "ignored_retake",
+    "reject": "ignored_retake", "dismiss": "ignored_retake",
+}
+
+
+def submit_prompt_action(action, prompt_id=None, request_id=None, filename=None, note=None,
+                         source="front"):
+    """week9: 处理用户对【主动询问】的动作（确认重拍 / 忽略 + 冷却），返回 (payload, http_code)。
+    强关联校验：prompt_id 必须等于 "pr_<request_id>"，否则按“询问已过期”拒绝（409）——
+    从根上杜绝“给 A 照片弹窗，结果重拍的是 B”。动作写回台账 user_action 字段。"""
+    act = PROMPT_ACTION_ALIASES.get(str(action or "").strip().lower())
+    if not act:
+        return {"status": "error", "action": action,
+                "msg": "action 必须是 confirmed_retake（确认重拍）或 ignored_retake（忽略）"}, 400
+    rid = str(request_id or "").strip() or None
+    pid = str(prompt_id or "").strip() or None
+    fname = str(filename or "").strip() or None
+    if not rid and pid and pid.startswith("pr_"):
+        rid = pid[3:]                      # 只回传 prompt_id 也能定位到那次采集
+    entry = ledger_find_any(request_id=rid, filename=fname) if (rid or fname) else None
+    if entry and not rid:
+        rid = entry.get("request_id")
+    expect_pid = ("pr_" + rid) if rid else None
+    if pid and expect_pid and pid != expect_pid:
+        print(f"【主动询问·过期】prompt_id={pid} 与 request_id={rid} 不匹配 → 拒绝动作（防串台）")
+        return {"status": "stale", "action": act, "request_id": rid, "prompt_id": pid,
+                "expected_prompt_id": expect_pid,
+                "msg": "该询问已过期（prompt_id 与 request_id 不匹配），已忽略"}, 409
+    if entry is None:
+        return {"status": "not_found", "action": act, "request_id": rid,
+                "prompt_id": pid or expect_pid,
+                "msg": "找不到该询问对应的采集记录（request_id 已过期或从未落台账）"}, 404
+
+    now = time.time()
+    fields = {
+        "user_action": act,
+        "user_action_ts_ms": int(now * 1000),
+        "user_action_prompt_id": pid or expect_pid,
+        "user_action_source": source or "front",
+    }
+    if act == "ignored_retake":
+        fields["prompt_cooldown_until_ms"] = int((now + PROMPT_COOLDOWN_SECONDS) * 1000)
+        fields["prompt_cooldown_seconds"] = PROMPT_COOLDOWN_SECONDS
+    if note:
+        fields["user_action_note"] = str(note)[:120]
+    ledger_save_ai(entry, **fields)           # 追加字段到原记录，绝不新建记录
+
+    with prompt_lock:
+        prompt_gate["last_action"] = act
+        prompt_gate["last_action_ts_ms"] = int(now * 1000)
+        prompt_gate["last_request_id"] = rid
+        prompt_gate["last_prompt_id"] = pid or expect_pid
+        prompt_gate["handled"][rid] = act
+        if act == "ignored_retake":
+            prompt_gate["cooldown_until"] = now + PROMPT_COOLDOWN_SECONDS
+            prompt_gate["counters"]["ignored"] += 1
+        else:
+            prompt_gate["counters"]["confirmed"] += 1
+        if len(prompt_gate["handled"]) > 128:
+            for k in list(prompt_gate["handled"].keys())[:-64]:
+                prompt_gate["handled"].pop(k, None)
+    if act == "ignored_retake":
+        print(f"【主动询问·忽略】request_id={rid} → 台账 user_action=ignored_retake，"
+              f"进入 {PROMPT_COOLDOWN_SECONDS:.0f}s 静默期（期间画面不可用也不弹窗，仅后台记录）")
+    else:
+        print(f"【主动询问·确认重拍】request_id={rid} → 台账 user_action=confirmed_retake，"
+              f"前端将立即发起新的单张采集（新 request_id，带 retake_of={rid} 溯源）")
+    cap = _capture_public()
+    return {
+        "status": "ok",
+        "action": act,
+        "request_id": rid,
+        "filename": entry.get("name"),
+        "prompt_id": pid or expect_pid,
+        "user_action": act,
+        "cooldown_seconds": PROMPT_COOLDOWN_SECONDS,
+        "cooldown_active": act == "ignored_retake",
+        "cooldown_remaining": PROMPT_COOLDOWN_SECONDS if act == "ignored_retake" else 0.0,
+        "cooldown_until_ms": (int((now + PROMPT_COOLDOWN_SECONDS) * 1000)
+                              if act == "ignored_retake" else None),
+        "task_state": cap.get("state"),
+        "ts_ms": int(now * 1000),
+        "msg": (f"已记录：用户忽略重拍建议（{PROMPT_COOLDOWN_SECONDS:.0f}s 内不再弹窗）"
+                if act == "ignored_retake" else "已记录：用户确认重拍"),
+        "prompt_state": _prompt_state(),
+    }, 200
+
+
 # ---------------- API: control plane ----------------
 @app.route('/api/trigger_capture', methods=['POST'])
 def trigger_capture():
@@ -838,6 +1184,9 @@ def trigger_capture():
     d = request.get_json(silent=True) or {}
     source = (d.get("source") or request.args.get('source') or 'web').strip() or 'web'
     rid = (d.get("request_id") or "").strip() or _mint_capture_id()
+    # week9: 本次采集若是【主动询问】建议的重拍，则记录来源（溯源，绝不与其它采集串台）
+    retake_of = (d.get("retake_of") or "").strip() or None
+    prompt_id = (d.get("prompt_id") or "").strip() or None
 
     gate = _capture_gate_state()
     if gate["locked"]:
@@ -874,7 +1223,7 @@ def trigger_capture():
                         "msg": fail_msg,
                         "capture": _capture_public()}), 200
 
-    ok, tid = create_capture_task(source, rid)
+    ok, tid = create_capture_task(source, rid, retake_of=retake_of, prompt_id=prompt_id)
     if not ok:
         return jsonify({"status": "busy", "ok": False, "request_id": rid,
                         "msg": "⏳ 上一次采集尚未结束，请稍候",
@@ -882,6 +1231,7 @@ def trigger_capture():
 
     return jsonify({"status": "ok", "ok": True, "task_id": tid, "request_id": rid,
                     "state": "PENDING", "timeout_s": CAPTURE_TIMEOUT_SECONDS,
+                    "retake_of": retake_of, "prompt_id": prompt_id,
                     "capture": _capture_public()}), 200
 
 @app.route('/api/device/ack', methods=['POST'])
@@ -917,6 +1267,9 @@ def upload_photo():
         active_request_id = task_state.get("request_id")
         active_task_id = task_state.get("task_id")
         active_trigger = task_state.get("trigger_source") or "web"
+        # week9: 本次上传若是主动询问建议的重拍 → 把来源写进台账（溯源，防串台）
+        active_retake_of = task_state.get("retake_of") if active else None
+        active_prompt_id = task_state.get("prompt_id") if active else None
 
     trigger = request.form.get('trigger', 'web') or 'web'
     if trigger == 'web' and active and active_trigger in ('timer', 'ai_chat'):
@@ -1001,7 +1354,8 @@ def upload_photo():
     # 图片与请求强关联落台账（含毫秒时间戳 + 遮挡判定）
     entry = ledger_add_attempt(rid, tid, trigger, ok=True, name=filename, size=actual_size,
                                blocked=blocked, avg_gray=avg_gray, dark_ratio=dark_ratio,
-                               detail=detail, ts_ms=ms, state="COMPLETED")
+                               detail=detail, ts_ms=ms, state="COMPLETED",
+                               retake_of=active_retake_of, prompt_id=active_prompt_id)
 
     # ---- week8: 采集成功即自动做一次真实视觉推理（毫秒级），并把结果写回台账 ----
     # 这样画廊/采集面板无需额外请求就能显示可理解的反馈；前端仍会调用 /api/infer_image（命中缓存）。
@@ -1094,6 +1448,13 @@ def list_photos():
             "ai_low_conf_threshold": e.get("ai_low_conf_threshold", INFER_LOW_CONF),
             "ai_ts_ms": e.get("ai_ts_ms"),
             "ai_cost_ms": e.get("ai_cost_ms"),
+            # ---- week9: 主动询问的用户动作（照片卡片上要显示“用户已忽略重拍建议”） ----
+            "user_action": e.get("user_action"),
+            "user_action_ts_ms": e.get("user_action_ts_ms"),
+            "user_action_prompt_id": e.get("user_action_prompt_id"),
+            "prompt_cooldown_until_ms": e.get("prompt_cooldown_until_ms"),
+            "retake_of": e.get("retake_of"),          # 本次采集源自哪次采集（主动询问建议的重拍）
+            "prompt_id": e.get("prompt_id"),          # 源自哪次主动询问
             "url": f"/photos/{e['name']}" if has_file else None,
         })
     return jsonify({"photos": out[:60]})
@@ -1160,6 +1521,49 @@ def correct_label():
     res["msg"] = "已记录人工修正"
     return jsonify(res), 200
 
+@app.route('/api/prompt_check', methods=['POST'])
+def prompt_check():
+    """week9: 前端在抓拍完成/状态刷新时询问后端——本次画面是否需要【主动询问重拍】。
+    入参 JSON：{"request_id": "cap_...", "filename": "photo_....jpg"(可选),
+                "force": true(可选，跳过“同一张画面已询问过”的去重)}
+    返回：ask=true/false + reason(blocked / low_confidence / infer_error / no_image /
+          ok / cooldown / already_asked / handled) + msg/voice（弹窗与浏览器 TTS 文案）
+          + prompt_id（用户动作必须回传它，天然防串台） + 冷却状态（cooldown_*）。
+    画面不可用的依据全部来自后端真实数据（week7 遮挡灰度 / week8 置信度 / 空帧），
+    前端传来的 score/blocked 一律不采信。"""
+    d = request.get_json(silent=True) or {}
+    rid = str(d.get("request_id") or request.args.get("request_id") or "").strip()
+    fname = str(d.get("filename") or request.args.get("filename") or "").strip()
+    if fname and os.path.basename(fname) != fname:
+        return jsonify({"status": "error", "msg": "filename 非法（不允许路径）"}), 400
+    raw_force = d.get("force", request.args.get("force", ""))
+    force = str(raw_force).lower() in ("1", "true", "yes", "on")
+    if force and rid:
+        with prompt_lock:                 # 用户手动触发检查 → 清掉该 request_id 的“已询问”去重标记
+            prompt_gate["asked"].pop(rid, None)
+    res = evaluate_proactive_prompt(request_id=rid or None, filename=fname or None,
+                                    register=True, source="api")
+    res["forced"] = force
+    return jsonify(res), 200
+
+
+@app.route('/api/prompt_action', methods=['POST'])
+def prompt_action():
+    """week9: 用户对【主动询问】的动作：confirmed_retake（🔄 确认重拍）/ ignored_retake（❌ 忽略）。
+    入参 JSON：{"action": "...", "prompt_id": "pr_...", "request_id": "cap_...", "filename": 可选}
+    动作写回 photos_ledger.json（user_action / user_action_ts_ms / prompt_cooldown_*）；
+    忽略 → 启动 PROMPT_COOLDOWN_SECONDS(30s) 静默期，期间画面不可用也不弹窗（仅后台记录）。
+    prompt_id 与 request_id 不匹配 → 409 过期（防串台）。"""
+    d = request.get_json(silent=True) or {}
+    payload, code = submit_prompt_action(
+        d.get("action") or request.args.get("action"),
+        prompt_id=d.get("prompt_id") or request.args.get("prompt_id"),
+        request_id=d.get("request_id") or request.args.get("request_id"),
+        filename=d.get("filename") or request.args.get("filename"),
+        note=d.get("note"), source=(d.get("source") or "front"))
+    return jsonify(payload), code
+
+
 @app.route('/api/status', methods=['GET'])
 def get_status():
     check_timeout()
@@ -1193,6 +1597,20 @@ def get_status():
     data["ai_labels"] = list(AI_LABELS)
     data["ai_engine"] = INFER_ENGINE
     data["ai_low_conf_threshold"] = INFER_LOW_CONF
+    # ---- week9: 主动询问决策（只读快照，register=False 不改变门控计数）+ 冷却状态 + 策略 ----
+    data["prompt"] = evaluate_proactive_prompt(request_id=cap.get("request_id"),
+                                               filename=cap.get("photo"),
+                                               register=False, source="status")
+    data["prompt_state"] = _prompt_state()
+    data["prompt_policy"] = {
+        "cooldown_seconds": PROMPT_COOLDOWN_SECONDS,     # 用户忽略后的静默期
+        "reask_seconds": PROMPT_REASK_SECONDS,           # 同一张画面不重复弹窗的窗口
+        "low_conf_threshold": INFER_LOW_CONF,            # 置信度拒识阈值（<0.4 → 询问重拍）
+        "blocked_max_gray": BLOCKED_MAX_GRAY,            # 遮挡初判阈值（灰度 < 40 → 画面不可用）
+        "blocked_min_size": BLOCKED_MIN_SIZE,            # 空帧阈值（<500B）
+        "voice": PROMPT_VOICE_TEXT,                      # 浏览器 TTS 播报文案
+        "actions": ["confirmed_retake", "ignored_retake"],
+    }
     with timer_lock:
         data["timer_running"] = timer_state["running"]
         data["timer_current_batch"] = timer_state["current_batch"]
@@ -1216,11 +1634,12 @@ timer_state = {
 }
 _timer_stop_evt = None
 
-def create_capture_task(source, request_id=None):
+def create_capture_task(source, request_id=None, retake_of=None, prompt_id=None):
     """Shared task creation (web button / timer scheduler / AI chat).
     Refuses when board is still busy so a task id is never overwritten.
     week7: 每次下发绑定 request_id + 毫秒时间戳 + 10s 硬截止；先把 latest_photo 清空，
-    避免上一张旧图被误当成这一次的采集结果。"""
+    避免上一张旧图被误当成这一次的采集结果。
+    week9: retake_of/prompt_id 记录“本次重拍源自哪次主动询问”，用于溯源与防串台。"""
     with lock:
         if task_state["status"] in ("PENDING", "ACCEPTED", "COLLECTING"):
             return False, "busy"
@@ -1240,9 +1659,12 @@ def create_capture_task(source, request_id=None):
             "fail_reason": None,
             "result": None,
             "latest_photo": None,              # 清空旧图 → 前端不可能拿到上一张糊弄
+            "retake_of": retake_of or None,    # week9: 主动询问建议的重拍来源
+            "prompt_id": prompt_id or None,
         })
         print(f"【任务创建】下发拍照指令，任务ID: {tid}，触发源: {source}，"
-              f"request_id: {rid}（{CAPTURE_TIMEOUT_SECONDS:.0f}s 内必须收到图片）")
+              f"request_id: {rid}（{CAPTURE_TIMEOUT_SECONDS:.0f}s 内必须收到图片）"
+              + (f"，重拍来源: retake_of={retake_of}" if retake_of else ""))
     return True, tid
 
 def timer_scheduler_loop(interval, max_batches, stop_evt):

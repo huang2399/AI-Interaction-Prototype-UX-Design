@@ -172,6 +172,43 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
 .ai-line{margin-top:7px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;}
 .btn-mini{padding:4px 8px; font-size:11px; border-radius:7px; border:1px solid var(--line); background:var(--card2); color:var(--dim); cursor:pointer; font-weight:600;}
 .btn-mini:hover{filter:brightness(1.3); color:var(--txt);}
+/* ---- week9: 主动询问（画面不可用 → 弹窗询问是否重拍）与 30s 冷却 ---- */
+.prompt-mask{position:fixed; inset:0; z-index:60; display:none; align-items:center; justify-content:center;
+  padding:18px; background:rgba(2,6,23,.72); backdrop-filter:blur(3px);}
+.prompt-mask.show{display:flex; animation:prompt-fade .18s ease-out;}
+@keyframes prompt-fade{from{opacity:0;} to{opacity:1;}}
+@keyframes prompt-pop{from{transform:translateY(12px) scale(.97); opacity:0;} to{transform:none; opacity:1;}}
+.prompt-card{width:100%; max-width:440px; border-radius:14px; overflow:hidden; border:1px solid rgba(251,191,36,.55);
+  background:linear-gradient(165deg,#182033,#0e1524); box-shadow:0 22px 70px rgba(0,0,0,.65), 0 0 0 1px rgba(251,191,36,.12);
+  animation:prompt-pop .22s cubic-bezier(.2,.9,.3,1.15);}
+.prompt-head{display:flex; align-items:center; gap:9px; padding:13px 15px; font-size:14px; font-weight:800;
+  color:var(--yellow); background:rgba(251,191,36,.13); border-bottom:1px solid rgba(251,191,36,.32);}
+.prompt-head .prompt-kind{margin-left:auto; font-size:10.5px; font-weight:600; color:var(--dim2);
+  font-family:Consolas,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:190px;}
+.prompt-body{padding:14px 15px 4px; font-size:13.5px; line-height:1.7; color:var(--txt);}
+.prompt-body b{color:var(--yellow);}
+.prompt-hint{margin-top:7px; font-size:12px; color:var(--dim2); line-height:1.6;}
+.prompt-meta{margin-top:9px; font-size:10.5px; line-height:1.75; color:var(--dim2);
+  font-family:Consolas,monospace; word-break:break-all;}
+.prompt-btns{display:flex; gap:10px; padding:12px 15px 15px;}
+.prompt-btn{flex:1; padding:12px 10px; font-size:14px; font-weight:800; letter-spacing:.3px; border-radius:10px;
+  cursor:pointer; border:2px solid transparent; transition:transform .12s, filter .15s;}
+.prompt-btn.retry{color:#062b1c; background:linear-gradient(135deg,#34d399,#22d3ee);
+  border-color:rgba(52,211,153,.75); box-shadow:0 0 20px rgba(52,211,153,.3);}
+.prompt-btn.ignore{color:var(--dim); background:var(--card2); border-color:var(--line);}
+.prompt-btn:hover{transform:translateY(-1px); filter:brightness(1.08);}
+.prompt-btn:disabled{opacity:.5; cursor:not-allowed; transform:none; filter:none;}
+.prompt-line{display:flex; align-items:center; gap:7px; margin-top:8px; padding-top:8px;
+  border-top:1px dashed var(--line); font-size:11.5px; color:var(--dim2); flex-wrap:wrap;}
+.prompt-dot{width:8px; height:8px; border-radius:50%; background:var(--dim2); flex:0 0 auto;}
+.prompt-dot.ready{background:var(--green); box-shadow:0 0 8px rgba(52,211,153,.7);}
+.prompt-dot.ask{background:var(--yellow); box-shadow:0 0 10px rgba(251,191,36,.85); animation:pulse-step 1.2s ease-in-out infinite;}
+.prompt-dot.cool{background:var(--cyan); box-shadow:0 0 9px rgba(34,211,238,.75);}
+.prompt-tts{margin-left:auto; display:inline-flex; align-items:center; gap:5px; font-size:11px;
+  color:var(--dim2); cursor:pointer; user-select:none; white-space:nowrap;}
+.prompt-tts input{accent-color:var(--cyan); cursor:pointer;}
+.tag-ignored{background:rgba(148,163,184,.16); color:var(--dim); border:1px solid var(--line);}
+.pcard-ignored{border-color:rgba(148,163,184,.42);}
 .btn-capture.locked{background:linear-gradient(135deg,#475569,#334155); color:var(--dim); cursor:not-allowed; box-shadow:none; opacity:.85;}
 .btn-capture.locked:hover{transform:none; box-shadow:none;}
 .tag-fail{background:rgba(248,113,113,.15); color:var(--red); border:1px solid rgba(248,113,113,.45);}
@@ -230,6 +267,15 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
         <button class="btn" onclick="cancelLabelFix()">取消</button>
       </div>
       <div class="ai-meta" id="ai_meta">引擎 -- · 分数由真实像素特征计算，未经标注集校准（是“置信度”，不是准确率）</div>
+      <!-- week9: 主动询问状态行（画面不可用 → 弹窗询问是否重拍；用户忽略后 30s 冷却不再弹窗）+ 浏览器语音播报开关 -->
+      <div class="prompt-line" id="prompt_line"
+           title="主动询问策略：遮挡 / 置信度 &lt; 0.4 / 空帧 → 弹窗询问是否重拍；用户点“忽略”后 30s 内不再弹窗（仅后台记录）">
+        <span class="prompt-dot ready" id="prompt_dot"></span>
+        <span id="prompt_line_txt">🔔 主动询问：就绪（画面不可用时弹窗询问是否重拍）</span>
+        <label class="prompt-tts" title="开启后用浏览器语音播报“画面无法识别，是否重拍？”（浏览器不支持或未授权时自动跳过，仅保留弹窗文字）">
+          <input type="checkbox" id="prompt_tts_toggle" checked onchange="promptTtsToggle(this.checked)">🔊 语音播报
+        </label>
+      </div>
       <div class="hint">提示：下发后指令进入云端队列，单板模组在下一次轮询（约 2s）抓拍；状态会依次走到 <b>PENDING → ACCEPTED → 采集中...</b>，
         <b>10 秒</b>内未收到图片即如实报“采集失败”（不会显示上一张旧图）；连续 2 次失败会锁定抓拍 30 秒。</div>
     </div>
@@ -331,6 +377,24 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
     </div>
   </section>
 </main>
+<!-- week9: 主动询问交互框（视觉判定“画面不可用”时弹出；与本次采集 request_id/prompt_id 强绑定） -->
+<div class="prompt-mask" id="prompt_mask" role="dialog" aria-modal="true" aria-labelledby="prompt_title">
+  <div class="prompt-card">
+    <div class="prompt-head">
+      <span>⚠️</span><span id="prompt_title">识别到画面过暗/模糊</span>
+      <span class="prompt-kind" id="prompt_kind">--</span>
+    </div>
+    <div class="prompt-body">
+      <div id="prompt_msg">是否立即重新抓拍？</div>
+      <div class="prompt-hint" id="prompt_hint">点“忽略”后 30 秒内不再弹窗（期间仅后台记录，不打扰）。</div>
+      <div class="prompt-meta" id="prompt_meta">--</div>
+    </div>
+    <div class="prompt-btns">
+      <button class="prompt-btn retry" id="prompt_retry_btn" onclick="promptConfirmRetake()">🔄 确认重拍</button>
+      <button class="prompt-btn ignore" id="prompt_ignore_btn" onclick="promptIgnore()">❌ 忽略</button>
+    </div>
+  </div>
+</div>
 <div id="toast" class="toast"></div>
 <script>
 const $ = id => document.getElementById(id);
@@ -515,11 +579,13 @@ function clearCaptureLock(){
 }
 
 // ---- 立即抓拍：每次点击 = 一次真实硬件采集（带 request_id 与 10s 兜底）----
-function triggerCapture(){
+// week9: retakeOf/promptId 由【主动询问→确认重拍】传入，用于把“这次重拍源自哪次询问”写进台账
+function triggerCapture(retakeOf, promptId){
   if (_capLockRemaining > 0){ showToast('err', '设备离线，抓拍已锁定 · ' + _capLockRemaining + 's'); return; }
   const btn = $('capture_btn');
   if (btn && btn.disabled) return;
 
+  hideProactivePrompt();               // week9: 上一次询问属于旧 request_id → 直接撤下（防串台）
   const rid = newCaptureId();          // 本次采集的 request_id（落到台账/画廊，可逐条溯源）
   _capRid = rid;
   _capState = 'PENDING';
@@ -531,10 +597,14 @@ function triggerCapture(){
   updateCapturePreview([]);            // 清空预览：面板只认 rid 对应的图片
   startCaptureWatchdog();
   renderCaptureState();
-  console.log('[CAPTURE] dispatch request_id=' + rid);
+  console.log('[CAPTURE] dispatch request_id=' + rid
+    + (retakeOf ? ' (retake of ' + retakeOf + ')' : ''));
 
+  const payload = {request_id: rid, source: 'web'};
+  if (retakeOf) payload.retake_of = retakeOf;    // week9: 主动询问建议的重拍来源（溯源）
+  if (promptId) payload.prompt_id = promptId;
   fetch('/api/trigger_capture', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({request_id: rid, source: 'web'})})
+        body: JSON.stringify(payload)})
     .then(r => r.json().then(j => ({code: r.status, j: j})))
     .then(res => {
       const d = res.j || {};
@@ -607,22 +677,23 @@ function updateCapturePreview(photos){
   }
   if (mine.status === 'stored' && mine.url){
     const bad = !!(mine.blocked || mine.unusable);   // week7 fix(Bug1): 遮挡/空帧都要标黄
-    if (!_capResult || _capResult.name !== mine.name){
-      box.innerHTML = '<img src="' + mine.url + '" alt="本次采集">'
-        + '<span class="cap-tag' + (bad ? ' warn' : '') + '">'
-        + (bad ? '⚠️ 画面不可用 · ' : '') + esc(mine.name) + '</span>';
-    }
+    const changed = (!_capResult || _capResult.name !== mine.name);
     _capResult = mine;
     _capBlocked = bad;
     if (mine.avg_gray != null) _capAvgGray = mine.avg_gray;
     _capState = 'COMPLETED';
     clearCaptureWatchdog();
+    // week9: 预览写成独立函数 → 用户点“忽略”后（user_action 变化）也能立刻重绘标记
+    if (changed || _capPreviewDirty) paintCapturePreview(mine);
     // week8: 本次采集的新图片 → 自动触发一次 AI 识别（后端已推理过则命中缓存）
     if (!_aiAutoPulled[mine.name]){
       _aiAutoPulled[mine.name] = true;
       console.log('[AI] 抓拍完成 → 自动推理 ' + mine.name);
       inferPhoto(mine.name, null, false).then(a => { if (a) refresh(); }).catch(() => {});
     }
+    // week9: 抓拍完成 → 让后端判定“画面是否可用”，不可用即弹【主动询问重拍】
+    //（依据由后端从台账/推理结果重算，与本次 request_id 强绑定，绝不串台）
+    proactivePromptCheck({ request_id: _capRid, filename: mine.name });
   } else if (mine.status === 'failed'){
     _capResult = mine;
     _capBlocked = !!(mine.unusable || mine.blocked);   // <500B/空帧 → 黄色遮挡告警
@@ -631,8 +702,23 @@ function updateCapturePreview(photos){
     _capState = 'FAIL';
     clearCaptureWatchdog();
     box.innerHTML = '❌ 本次采集未产生图片（request_id <span class="mono">' + esc(_capRid) + '</span>）';
+    // week9: 空帧/未收到画面同样是“画面不可用” → 主动询问是否重拍（设备被锁定时不打扰）
+    if (_capLockRemaining <= 0) proactivePromptCheck({ request_id: _capRid });
   }
   renderCaptureState();
+}
+
+// week9: 本次采集预览的绘制（week7 遮挡标黄 + week9 “已忽略重拍建议”标记）
+function paintCapturePreview(mine){
+  const box = $('capture_preview'); if (!box || !mine) return;
+  if (!mine.url){ _capPreviewDirty = false; return; }   // 失败记录没有图 → 保留“未产生图片”文案
+  const bad = !!(mine.blocked || mine.unusable);
+  const ignored = isIgnoredRetake(mine);
+  box.innerHTML = '<img src="' + mine.url + '" alt="本次采集">'
+    + '<span class="cap-tag' + (bad ? ' warn' : '') + '">'
+    + (bad ? '⚠️ 画面不可用 · ' : '') + (ignored ? '🚫 已忽略重拍建议 · ' : '')
+    + esc(mine.name) + '</span>';
+  _capPreviewDirty = false;
 }
 
 // ================= week8: 视觉推理（置信度，非准确率）+ 人工纠正 =================
@@ -823,6 +909,274 @@ function reInfer(name){
     else showToast('err', a.msg || 'AI 推理失败');
     refresh();
   });
+}
+
+// ================= week9: 视觉事件触发【主动询问】(Proactive Prompt) + 冷却 =================
+// 硬性要求：
+//   1) 抓拍完成后若判定“画面不可用”（遮挡 / 置信度 < 0.4 / 空帧）→ 弹出交互询问框：
+//      【🔄 确认重拍】【❌ 忽略】；
+//   2) 确认重拍 → 关闭弹窗并【立刻发起一次新的单张采集】（新 request_id，带 retake_of 溯源）；
+//   3) 忽略 → 关闭弹窗 + 该照片卡片打“用户已忽略重拍建议”标记（写台账 user_action=ignored_retake），
+//      后端进入 30s 冷却：期间即使再次判定不可用也【不再弹窗】，只在后台记录（黄条/徽章照旧）；
+//   4) 询问/动作全部与 request_id + prompt_id 强绑定，绝不给 A 照片弹窗却重拍 B；
+//   5) 可选的浏览器语音播报（TTS）：不支持/未授权/被拦截 → 自动跳过，仅保留弹窗文字。
+const PROMPT_TTS_KEY = 'prompt_tts_enabled';
+let _pro = null;                 // 最近一次 /api/prompt_check 决策（后端权威）
+let _proShown = {};              // 已弹过窗的 prompt_id（防 2s 轮询重复弹窗）
+let _proIgnored = {};            // 本地即时标记：filename / "rid:<request_id>" → 已忽略重拍
+let _proState = {cooldown_active:false, cooldown_remaining:0, cooldown_seconds:30,
+                 reask_seconds:60, suppressed:0, last_action:null};
+let _proPolicy = {cooldown_seconds:30, low_conf_threshold:0.4, voice:'画面无法识别，是否重拍？'};
+let _proCooldownTimer = null;    // 冷却倒计时（仅用于 UI 显示）
+let _proCooldownUntil = 0;       // 本地冷却截止（毫秒）
+let _proActing = false;          // 防重复点击
+let _proTtsOn = true;            // 浏览器语音播报开关
+let _galleryPhotos = [];         // 最近一次画廊数据（忽略标记需要立刻重绘）
+let _capPreviewDirty = false;    // 采集预览需要重绘（“已忽略重拍建议”标记变化时置位）
+
+function promptTtsInit(){
+  try{
+    const v = localStorage.getItem(PROMPT_TTS_KEY);
+    _proTtsOn = (v === null) ? true : (v === '1');
+  }catch(e){ _proTtsOn = true; }
+  const cb = $('prompt_tts_toggle'); if (cb) cb.checked = _proTtsOn;
+}
+function promptTtsToggle(on){
+  _proTtsOn = !!on;
+  try{ localStorage.setItem(PROMPT_TTS_KEY, on ? '1' : '0'); }catch(e){}
+  showToast('ok', on ? '🔊 已开启浏览器语音播报（TTS）' : '🔇 已关闭浏览器语音播报');
+}
+// 语音播报：浏览器不支持 / 未授权 / 自动播放被拦截 → 静默跳过（只保留弹窗文字）
+function promptSpeak(text){
+  if (!_proTtsOn) return false;
+  if (!('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') return false;
+  const say = text || '画面无法识别，是否重拍？';
+  try{
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(say);
+    u.lang = 'zh-CN'; u.rate = 1.02; u.pitch = 1.0;
+    const busy = _voiceSpeaking || _voiceProcessing || _voiceRecording;   // 别抢正在进行的语音交互
+    u.onend = function(){ if (!busy) voiceUiIdle('🔊 语音播报完成 · IDLE'); };
+    u.onerror = function(){ console.warn('[PROMPT] 浏览器 TTS 播报失败（弹窗文字照常显示）'); };
+    if (!busy) voiceUiIdle('🔊 语音播报：' + say.slice(0, 22), 'speaking');
+    window.speechSynthesis.speak(u);
+    console.log('[PROMPT] 浏览器语音播报: ' + say);
+    return true;
+  }catch(e){
+    console.warn('[PROMPT] 浏览器语音播报不可用（已跳过，仅保留弹窗文字）:', e && e.message);
+    return false;
+  }
+}
+// 冷却倒计时（UI）：后端仍是权威，这里只做平滑显示
+function startProCooldown(secs){
+  const s = Math.max(1, Math.ceil(secs || 30));
+  _proCooldownUntil = Date.now() + s * 1000;
+  _proState.cooldown_active = true;
+  _proState.cooldown_remaining = s;
+  if (_proCooldownTimer) clearInterval(_proCooldownTimer);
+  _proCooldownTimer = setInterval(function(){
+    const left = Math.round((_proCooldownUntil - Date.now()) / 1000);
+    _proState.cooldown_remaining = Math.max(0, left);
+    if (left <= 0){
+      clearInterval(_proCooldownTimer); _proCooldownTimer = null;
+      _proState.cooldown_active = false;
+      console.log('[PROMPT] 冷却结束 → 恢复“画面不可用即弹窗询问重拍”');
+    }
+    renderPromptLine();
+  }, 1000);
+  renderPromptLine();
+}
+// 把后端返回的 prompt_state 同步到本地（冷却期间不重置倒计时，避免 2s 轮询抖动）
+function _applyPromptState(st){
+  if (!st) return;
+  if (st.cooldown_seconds) _proState.cooldown_seconds = st.cooldown_seconds;
+  if (st.reask_seconds) _proState.reask_seconds = st.reask_seconds;
+  if (st.suppressed != null) _proState.suppressed = st.suppressed;
+  if (st.last_action) _proState.last_action = st.last_action;
+  if (st.cooldown_active && st.cooldown_remaining > 0){
+    if (!_proCooldownTimer) startProCooldown(st.cooldown_remaining);
+  } else if (!_proCooldownTimer){
+    _proState.cooldown_active = false;
+    _proState.cooldown_remaining = 0;
+    renderPromptLine();
+  }
+}
+function renderPromptLine(){
+  const dot = $('prompt_dot'), txt = $('prompt_line_txt');
+  const st = _proState || {};
+  const rid = _pro && _pro.request_id ? _pro.request_id : null;
+  let cls = 'ready', s = '';
+  if (st.cooldown_active && st.cooldown_remaining > 0){
+    cls = 'cool';
+    s = '🔔 主动询问：已忽略重拍建议 · 冷却中 <span class="mono">(' + Math.ceil(st.cooldown_remaining)
+      + 's 后恢复；期间只后台记录不弹窗)</span>';
+  } else if (_pro && _pro.ask){
+    cls = 'ask';
+    s = '🔔 主动询问：<b>等待确认是否重拍</b> <span class="mono">(request_id ' + esc(rid || '--') + ')</span>';
+  } else if (st.last_action === 'ignored_retake'){
+    s = '🔔 主动询问：就绪（上次已忽略，冷却已结束）';
+  } else {
+    s = '🔔 主动询问：就绪（画面不可用 → 弹窗询问是否重拍；忽略后 '
+      + (st.cooldown_seconds || 30) + 's 内不弹窗）';
+  }
+  if (st.suppressed) s += ' <span class="mono">· 冷却期内已压制 ' + st.suppressed + ' 次（仅后台记录）</span>';
+  if (dot) dot.className = 'prompt-dot ' + cls;
+  if (txt) txt.innerHTML = s;
+}
+
+// ---- 弹窗控制 ----
+function hideProactivePrompt(){
+  const m = $('prompt_mask'); if (m) m.classList.remove('show');
+}
+function showProactivePrompt(res){
+  if (!res || !res.ask) return;
+  const key = res.prompt_id || res.request_id;
+  if (key) _proShown[key] = Date.now();
+  const m = $('prompt_mask'), title = $('prompt_title'), msg = $('prompt_msg');
+  const hint = $('prompt_hint'), meta = $('prompt_meta'), kind = $('prompt_kind');
+  if (title) title.innerText = res.title || '画面不可用';
+  if (msg){
+    let t = esc(res.msg || '⚠️ 画面不可用。是否立即重新抓拍？');
+    if (res.label){
+      t += '<div class="prompt-hint">模型最接近的描述：<b>' + esc(res.label) + '</b>（置信度 '
+        + ((res.score != null) ? Number(res.score).toFixed(2) : '--') + '）</div>';
+    }
+    msg.innerHTML = t;
+  }
+  if (hint){
+    hint.innerText = '点“忽略”后 ' + (res.cooldown_seconds || 30) + ' 秒内不再弹窗（期间仅后台记录，不打扰）。'
+      + (res.detail ? '判定依据：' + res.detail : '');
+  }
+  if (kind) kind.innerText = (res.reason || '--') + ' · ' + (res.request_id || '--');
+  if (meta){
+    meta.innerHTML = 'request_id <span class="mono">' + esc(res.request_id || '--')
+      + '</span><br>prompt_id <span class="mono">' + esc(res.prompt_id || '--')
+      + '</span> · 拒识阈值 ' + ((res.threshold != null) ? res.threshold : 0.4)
+      + ' · 任务状态 ' + esc(res.task_state || '--');
+  }
+  const rb = $('prompt_retry_btn'), ib = $('prompt_ignore_btn');
+  if (rb) rb.disabled = false;
+  if (ib) ib.disabled = false;
+  if (m) m.classList.add('show');
+  if (rb){ try{ rb.focus(); }catch(e){} }
+  promptSpeak(res.voice || _proPolicy.voice || '画面无法识别，是否重拍？');
+  console.log('[PROMPT] 弹出主动询问 · reason=' + res.reason + ' request_id=' + res.request_id
+    + ' prompt_id=' + res.prompt_id + '（忽略后 ' + (res.cooldown_seconds || 30) + 's 内不再弹窗）');
+  renderPromptLine();
+}
+// ---- 询问后端：本次画面是否需要主动询问（判定权完全在后端，前端不自行判定“不可用”）----
+function proactivePromptCheck(opts){
+  const o = opts || {};
+  const body = {};
+  if (o.request_id) body.request_id = o.request_id;
+  if (o.filename) body.filename = o.filename;
+  if (o.force) body.force = true;
+  if (!body.request_id && !body.filename) return Promise.resolve(null);
+  return fetch('/api/prompt_check', {method:'POST', headers:{'Content-Type':'application/json'},
+                                     body: JSON.stringify(body)})
+    .then(r => r.json().then(j => ({ok: r.ok, j: j})).catch(() => ({ok: r.ok, j: {}})))
+    .then(res => {
+      const d = res.j || {};
+      if (!d || d.status !== 'ok') return null;
+      _pro = d;
+      if (d.cooldown_seconds) _proState.cooldown_seconds = d.cooldown_seconds;
+      if (d.reask_seconds) _proState.reask_seconds = d.reask_seconds;
+      if (d.suppressed != null) _proState.suppressed = d.suppressed;
+      if (d.last_action) _proState.last_action = d.last_action;
+      const key = d.prompt_id || d.request_id;
+      if (d.ask && key && !_proShown[key]) showProactivePrompt(d);
+      else renderPromptLine();
+      return d;
+    })
+    .catch(() => null);
+}
+
+// ---- 用户动作：prompt_id + request_id 一起回传（后端校验匹配，过期即拒绝 → 防串台）----
+function promptAction(action){
+  if (_proActing) return Promise.resolve(null);
+  const p = _pro || {};
+  _proActing = true;
+  const rb = $('prompt_retry_btn'), ib = $('prompt_ignore_btn');
+  if (rb) rb.disabled = true;
+  if (ib) ib.disabled = true;
+  return fetch('/api/prompt_action', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action: action, prompt_id: p.prompt_id || undefined,
+                            request_id: p.request_id || undefined,
+                            filename: p.filename || undefined, source: 'web'})})
+    .then(r => r.json().then(j => ({ok: r.ok, j: j})).catch(() => ({ok: r.ok, j: {}})))
+    .then(res => {
+      const d = res.j || {};
+      _proActing = false;
+      if (rb) rb.disabled = false;
+      if (ib) ib.disabled = false;
+      if (!res.ok || d.status !== 'ok'){
+        console.warn('[PROMPT] 动作被拒绝: ' + (d.status || res.ok) + ' ' + (d.msg || ''));
+        showToast('err', d.msg || '操作失败，请重试');
+        return null;
+      }
+      if (d.prompt_state) _applyPromptState(d.prompt_state);
+      return d;
+    })
+    .catch(() => {
+      _proActing = false;
+      if (rb) rb.disabled = false;
+      if (ib) ib.disabled = false;
+      showToast('err', '操作失败（网络错误）');
+      return null;
+    });
+}
+// 【🔄 确认重拍】→ 关弹窗 + 立刻发起一次新的单张采集（新 request_id，带 retake_of 溯源）
+function promptConfirmRetake(){
+  const p = _pro || {};
+  const curRid = _capRid || (_capResult && _capResult.request_id) || null;
+  if (p.request_id && curRid && p.request_id !== curRid){
+    // 面板已切到别的采集 → 这条询问过期，绝不用它去重拍别人的画面
+    hideProactivePrompt();
+    showToast('err', '该询问已过期（采集 request_id 已切换），请对最新画面重新抓拍');
+    console.warn('[PROMPT] confirmed_retake 被拦截：询问 request_id=' + p.request_id
+      + ' ≠ 当前面板 request_id=' + curRid);
+    return;
+  }
+  const rid = p.request_id || curRid || null;
+  const pid = p.prompt_id || null;
+  promptAction('confirmed_retake').then(d => {
+    hideProactivePrompt();
+    if (!d) return;
+    showToast('ok', '🔄 已确认重拍 · 立即发起新的单张采集');
+    console.log('[PROMPT] confirmed_retake → 立刻重新抓拍（retake_of=' + (rid || '-') + '）');
+    triggerCapture(rid, pid);
+  });
+}
+// 【❌ 忽略】→ 关弹窗 + 卡片打“用户已忽略重拍建议”标记 + 进入 30s 冷却（后端权威）
+function promptIgnore(){
+  const p = _pro || {};
+  const name = p.filename || (_capResult && _capResult.name) || null;
+  promptAction('ignored_retake').then(d => {
+    hideProactivePrompt();
+    if (!d) return;
+    markIgnoredLocally(p.request_id, name);
+    startProCooldown(d.cooldown_seconds || 30);
+    showToast('ok', '❌ 已忽略重拍建议 · ' + (d.cooldown_seconds || 30) + 's 内不再弹窗（仅后台记录）');
+    refresh();
+  });
+}
+// 本地即时打标：采集预览 / 画廊卡片立刻显示“用户已忽略重拍建议”（不必等下一次 2s 轮询）
+function markIgnoredLocally(rid, name){
+  if (name) _proIgnored[name] = true;
+  if (rid) _proIgnored['rid:' + rid] = true;
+  if (_capResult && (name ? _capResult.name === name : _capResult.request_id === rid)){
+    _capResult.user_action = 'ignored_retake';
+    _capPreviewDirty = true;
+    paintCapturePreview(_capResult);
+  }
+  renderCaptureState();
+  if (_galleryPhotos && _galleryPhotos.length) renderGallery(_galleryPhotos);
+}
+// 某张照片是否已被用户忽略重拍建议（台账 user_action 或本地即时标记任一命中）
+function isIgnoredRetake(p){
+  if (!p) return false;
+  if (p.user_action === 'ignored_retake') return true;
+  return !!(_proIgnored[p.name] || (p.request_id && _proIgnored['rid:' + p.request_id]));
 }
 
 function sendAck(){ fetch('/api/device/ack',{method:'POST'}).then(r=>r.json()).then(()=>{ $('ack_btn').style.display='none'; showToast('ok','已确认收到'); }).catch(()=>showToast('err','ACK发送失败')); }
@@ -1055,14 +1409,31 @@ function updateStatus(st){
       _ai = st.ai; renderAiPanel();
     }
   }
+  // week9: 主动询问（Proactive Prompt）——策略/冷却状态以后端为权威；未弹过的询问可由状态轮询兜底弹出
+  if (st.prompt_policy) _proPolicy = st.prompt_policy;
+  if (st.prompt_state) _applyPromptState(st.prompt_state);
+  if (st.prompt){
+    if (st.prompt.ask && st.prompt.request_id && st.prompt.request_id === _capRid){
+      const key = st.prompt.prompt_id || st.prompt.request_id;
+      if (!_proShown[key]){ _pro = st.prompt; showProactivePrompt(st.prompt); }
+    } else if (!_pro || st.prompt.ts_ms >= (_pro.ts_ms || 0)){
+      _pro = st.prompt;
+      renderPromptLine();
+    }
+  }
   if (st.last_update){ const age=Math.max(0,Math.round(Date.now()/1000-st.last_update)); $('task_age').innerText='更新于 '+age+'s 前'; }
 }
 // week8: 画廊卡片上的 AI 徽章（成功=绿色 / 拒识=黄色 / 人工修正=紫色）+ 纠正与重算按钮
+// week9: 若用户对这次采集选择了【忽略重拍建议】→ 卡片上打上灰底标记（台账 user_action 溯源）
 function aiCardLine(p){
   let html = '<div class="ai-line">' + aiBadgeHtml(aiFromPhoto(p));
   if (p.status === 'stored'){
     html += '<button class="btn-mini" title="人工纠正该图的标签" onclick="pickFixTarget(\'' + esc(p.name) + '\')">✏️ 纠正</button>'
           + '<button class="btn-mini" title="强制重新推理" onclick="reInfer(\'' + esc(p.name) + '\')">♻️ 重新识别</button>';
+  }
+  if (isIgnoredRetake(p)){
+    html += '<span class="tag tag-ignored" title="用户在主动询问中选择了忽略；该采集 30 秒内不再弹窗询问，'
+          + '但画面不可用的判定仍如实保留">🚫 用户已忽略重拍建议</span>';
   }
   return html + '</div>';
 }
@@ -1083,13 +1454,14 @@ function renderGallery(photos){
       const reason = p.reason==='timeout' ? '设备超时（10s 内未收到图片）'
                    : p.reason==='offline' ? '设备未联机（指令未下发）'
                    : (p.detail || p.reason || '采集失败');
-      return '<div class="pcard pcard-fail">'+
+      return '<div class="pcard pcard-fail'+(isIgnoredRetake(p)?' pcard-ignored':'')+'">'+
         '<div class="placeholder fail"><div class="icon">❌</div><div>采集失败 · 未产生图片</div><div>'+esc(reason)+'</div></div>'+
         '<div class="pmeta">'+
           '<div class="prow"><span class="pname">'+esc(when.slice(0,10))+' 采集失败</span><span class="tag tag-fail">失败</span></div>'+
           '<div class="prow psub"><span>🕒 '+esc(when)+'</span></div>'+
           '<div class="prow psub"><span>🎯 '+esc(trig)+'</span></div>'+
           '<div class="prow psub"><span class="mono" title="request_id">🔗 '+rid+'</span></div>'+
+          (isIgnoredRetake(p) ? '<div class="prow"><span class="tag tag-ignored" title="用户在主动询问中选择忽略；30 秒内不再弹窗">🚫 用户已忽略重拍建议</span></div>' : '')+
         '</div></div>';
     }
     const tag = p.status==='stored' ? '<span class="tag tag-stored">已入库</span>' : '<span class="tag tag-cleaned">已清理</span>';
@@ -1099,7 +1471,7 @@ function renderGallery(photos){
       : '<div class="placeholder"><div class="icon">📦</div><div>配额到期已清除原图</div><div>元数据与哈希完整保留</div></div>';
     const sizeTxt = p.status==='stored' ? fmtSize(p.size) : '已清理';
     const grayTxt = (p.avg_gray != null) ? ('灰度 '+p.avg_gray) : '';
-    return '<div class="pcard'+(p.blocked?' pcard-warn':'')+'">'+thumb+
+    return '<div class="pcard'+(p.blocked?' pcard-warn':'')+(isIgnoredRetake(p)?' pcard-ignored':'')+'">'+thumb+
       '<div class="pmeta"><div class="prow"><span class="pname" title="'+esc(p.name)+'">'+esc(p.name)+'</span>'+tag+'</div>'+
       '<div class="prow psub"><span>🕒 '+esc(when)+'</span><span>'+sizeTxt+'</span></div>'+
       '<div class="prow psub"><span>🎯 '+esc(trig)+'</span>'+(grayTxt?'<span>'+grayTxt+'</span>':'')+'</div>'+
@@ -1122,6 +1494,8 @@ function refresh(){
           if (cap.avg_gray != null) _capAvgGray = cap.avg_gray;
           renderCaptureState();
           showToast('err', '⚠️ 画面可能被遮挡或采集失败，请检查');
+          // week9: 遮挡/偏黑 = 画面不可用 → 让后端判定是否【主动询问重拍】（黄条照旧保留）
+          proactivePromptCheck({ request_id: _capRid, filename: cap.photo || null });
         } else showToast('ok','✅ 本次采集完成 · 图片已入库');
       }
       else if (st.status==='TIMEOUT'||st.status==='FAIL') showToast('err','❌ 采集失败：设备超时/错误');
@@ -1129,6 +1503,7 @@ function refresh(){
   }).catch(()=>updateStatus({status:'OFFLINE'}));
   fetch('/api/photos').then(r=>r.json()).then(d=>{
     const all=d.photos||[];
+    _galleryPhotos = all;             // week9: 忽略标记需要立刻重绘画廊
     renderGallery(all);
     updateCapturePreview(all);        // week7: 只认本次 request_id 的图片
     autoInferNew(all);                // week8: 新卡片出现 → 自动调用 /api/infer_image
@@ -1138,6 +1513,7 @@ function refresh(){
 }
 setInterval(()=>{ $('clock').innerText=fmtClock(Date.now()/1000); }, 1000);
 initChart(); updateImu(); refresh(); renderCaptureState(); renderAiPanel();   // week7/8: 采集面板 + AI 面板初始化
+promptTtsInit(); renderPromptLine();                                        // week9: 主动询问状态行 + 浏览器 TTS 开关
 setInterval(updateImu, 1000);
 setInterval(refresh, 2000);
 
