@@ -1441,16 +1441,24 @@ def _ctx_question_gate(qs, now_ms):
     """追问闸门（防打扰）：已作答(CTX_ANSWER_SILENCE_SEC) / 已 snooze / 超出 CTX_MAX_QUESTIONS 的
     一律压制成 ask=False，但条目依然回传 —— 前端能看到“这次为什么没再问”。
 
+    week12 增加一层【用户偏好】闸门：偏好 never_ask（关闭主动提醒）时，所有追问一律 ask=False
+    （依然回传问题与 suppressed_reason：只展示、不打扰，绝不静默吞掉歧义）。
+
     返回 (questions, answers)：answers = 最近 CTX_ANSWER_KEEP 次用户澄清记录。
     """
     with context_lock:
         st = {k: dict(x) for k, x in context_quest_state.items()}
         answers = [dict(a) for a in context_answers]
+    pref = pref_current()                  # week12：追问之前同样先查偏好（唯一权威在后端）
+    pref_off = not pref["popup"]
+    pref_why = "用户偏好「关闭主动提醒」（%s）→ 只展示不追问" % _pref_tag(pref)
     out, rank = [], 0
     for q in qs:
         rec = st.get(q["question_id"]) or {}
         asked_n, last_ask = int(rec.get("asked_count") or 0), rec.get("last_ask_ms")
-        if rec.get("choice") and rec.get("choice_ms") \
+        if pref_off:
+            ask, why = False, pref_why
+        elif rec.get("choice") and rec.get("choice_ms") \
                 and (now_ms - int(rec["choice_ms"])) < int(CTX_ANSWER_SILENCE_SEC * 1000):
             left = int((CTX_ANSWER_SILENCE_SEC * 1000 - (now_ms - int(rec["choice_ms"]))) / 1000)
             ask, why = False, "已作答「%s」（%d 秒内不再追问）" % (rec.get("choice_label") or rec["choice"], left)
@@ -1601,6 +1609,8 @@ def _ctx_policy():
             "answer_keep": CTX_ANSWER_KEEP,
             "style": "只问选择题（一次点击即可消解歧义）；选项 effect ∈ {note_only, retake, retry_location, snooze}",
             "note": "已作答 / 已 snooze / 超出上限的追问会被压制，但仍回传 ask=False + suppressed_reason。",
+            "preference": pref_current(),          # week12: 追问的第 0 层闸门（用户偏好）
+            "preference_note": "week12：never_ask ⇒ 所有追问 ask=False（只展示、不打扰）；其余偏好照旧受静默期与去重约束。",
         },
         "severity_rank": CTX_SEVERITY_RANK,
         "severity_label": CTX_SEVERITY_LABEL,
@@ -1710,6 +1720,8 @@ def _ctx_build(request_id=None, filename=None, now=None):
             "askable_count": len(askable),
             "answers": answers,
             "answer_count": len(answers),
+            "preference": pref_current(),                 # week12: 这份快照是在哪份偏好下生成的（可追溯）
+            "preference_note": "追问闸门第 0 层就是用户偏好：never_ask ⇒ 所有追问 ask=False（只展示、不打扰）。",
             "must_not_claim": [
                 "摄像头遮挡/画面不可用 ⇒ 不是设备损坏（只说“画面这一路不可用，疑似遮挡”）",
                 "运动 ⇒ 不是危险、不是故障（运动量只说明设备在动）",
@@ -1756,6 +1768,20 @@ def record_context_answer(question_id, choice, note=None, request_id=None, filen
         if opt.get("effect") == "snooze":
             st["snooze_until_ms"] = now_ms + int(CTX_SNOOZE_SEC * 1000)
         context_answers.append(rec)
+    # week12: 记住用户这次澄清了什么（写进决策日志；与 week9 的动作同属“用户偏好/记忆”一条时间线）
+    _eff_note = {"snooze": "%d 秒内不再追问该问题" % int(CTX_SNOOZE_SEC),
+                 "retake": "需要重拍这张画面", "retry_location": "等下一次采集重新上报定位",
+                 "note_only": "已记录为已知事实（不再追问）"}
+    pref_remember("answered_question",
+                  "用户回答了追问「%s」→ 系统记住：%s" % (q.get("question"), opt.get("label")),
+                  detail="effect=%s（%s）· request_id=%s"
+                         % (opt.get("effect"), _eff_note.get(opt.get("effect"), "已记录"),
+                            q.get("request_id") or "-"),
+                  request_id=q.get("request_id"), save=(opt.get("effect") != "snooze"))
+    if opt.get("effect") == "snooze":
+        pref_remember("snoozed",
+                      "系统已记住：用户选择“稍后再说”（%d 秒内不再追问该问题）" % int(CTX_SNOOZE_SEC),
+                      detail="question_id=%s" % question_id, request_id=q.get("request_id"), save=True)
     entry = ledger_find_any(request_id=q.get("request_id"), filename=q.get("filename")) \
         if (q.get("request_id") or q.get("filename")) else None
     if entry:
@@ -1805,6 +1831,549 @@ def api_context_answer():
         filename=data.get("filename") or request.args.get("filename"))
     code = 200 if res["status"] == "ok" else (409 if res["status"] == "expired" else 400)
     return jsonify(res), code
+
+
+# ================== week12: 用户交互提醒偏好（记住用户选择 · 版本化 · 可回退） ==================
+# 任务书要点与本文件的口径：
+#   * 偏好 = 用户对“何时可以打扰我”的显式选择，不是模型参数 → 单独持久化（server/preferences.json）、
+#     单独版本化；（台账 photos_ledger.json 是“一次采集一条”的记录，放全局配置会让 week7/8/10/11 的
+#     台账消费者多出特判，故不整合进台账）
+#   * 每次【内容变化】都会产生一个新的 config_version（v2、v3…），历史版本一律保留 → 既能“撤回上一次修改”，
+#     也能“回退到任意历史版本”；
+#   * v1 永远是【系统默认配置】= low_conf_only：点“恢复默认” = 偏好回到 low_conf_only 且 config_version 重置为 v1；
+#   * 后端唯一权威：/api/prompt_check 在【弹窗之前】必须先查这份偏好 —— never_ask ⇒ 只亮黄条 + 后台记录，绝不弹窗；
+#   * 与既有防打扰策略的关系写死在 payload.effect 里：never_ask 连 week11 追问也一并关闭（只展示不追问），
+#     always_ask 不受 week9 的 30s 静默期与“同一张画面去重”限制（用户明确要求“总提醒”）。
+PREF_FILE = os.path.join(_BASE_DIR, 'preferences.json')   # 独立配置文件（原子写入，重启不丢）
+PREF_VERSION_DEFAULT = "v1"                               # 默认配置的版本号（“恢复默认”回到这里）
+PREF_DEFAULT = "low_conf_only"                            # 默认偏好：仅在置信度极低时提醒
+PREF_KEEP_EVENTS = 80                                     # 决策日志持久化上限
+PREF_SHOW_EVENTS = 24                                     # 面板一次展示多少条
+PREF_KEEP_HISTORY = 30                                    # 版本历史保留条数
+
+# 三个选项：popup=False 表示“只亮黄条 + 后台记录”，而【不是】“不再检测”。
+PREF_CHOICES = {
+    "always_ask": {
+        "value": "always_ask", "label": "🔔 总是提醒",
+        "short": "总是提醒（不受静默期限制）",
+        "desc": "只要判定“画面不可用”（遮挡 / 置信度极低 / 空帧）就弹窗询问是否重拍；"
+                "不受“用户刚点忽略”的 30s 静默期与同一张画面去重限制（用户明确要求总提醒）。",
+        "popup": True, "respect_cooldown": False,
+    },
+    "low_conf_only": {
+        "value": "low_conf_only", "label": "🟡 仅在置信度极低时提醒（默认）",
+        "short": "仅在置信度极低时提醒",
+        "desc": "只在“真的看不清画面”时才弹窗（疑似遮挡 / 置信度 < 0.4 拒识 / 空帧 / 解码失败）；"
+                "week9 的静默期与同一张画面去重照旧生效 —— 不做多余打扰。",
+        "popup": True, "respect_cooldown": True,
+    },
+    "never_ask": {
+        "value": "never_ask", "label": "🔕 关闭主动提醒（只亮黄条）",
+        "short": "关闭主动提醒",
+        "desc": "任何情况下都不弹窗，也不发起 week11 追问；判定结果照旧展示（黄条 + 徽章 + 后台记录），"
+                "并保留“这次为什么不打扰”的原因，绝不静默吞掉结论。",
+        "popup": False, "respect_cooldown": False,
+    },
+}
+PREF_ORDER = ["always_ask", "low_conf_only", "never_ask"]
+PREF_MEMORY_KEYS = [
+    ("saved", "保存偏好次数"),
+    ("restore_default", "恢复默认次数"),
+    ("undo", "撤回上一次修改次数"),
+    ("rollback", "回退到历史版本次数"),
+    ("confirmed_retake", "用户确认重拍"),
+    ("ignored_retake", "用户忽略重拍建议"),
+    ("corrected_label", "人工纠正 AI 标签"),
+    ("answered_question", "回答 week11 追问"),
+    ("snoozed", "选择“稍后再说”"),
+    ("ask", "实际弹窗次数"),
+    ("blocked_by_pref", "因偏好被压制的打扰"),
+]
+PREF_SOURCE_LABEL = {"default": "系统默认", "user": "用户保存", "restore_default": "恢复默认",
+                     "undo": "撤回上一次修改", "rollback": "回退历史版本"}
+
+pref_lock = threading.Lock()
+pref_state = {
+    "config_version": PREF_VERSION_DEFAULT,
+    "preference": PREF_DEFAULT,
+    "source": "default",
+    "updated_at": None,
+    "updated_at_ms": None,
+    "note": "系统默认配置（v1）：仅在置信度极低时提醒",
+    "rev": 0,                 # 修改序号（单调递增；日志与历史按它排序）
+    "history": [],            # [{"rev","config_version","preference","previous_*","changed_at","source","note"}]
+    "events": [],             # 决策日志（用户修改 / 触发判定 / 查偏好 / 决定 / 用户动作）
+    "memory": {},             # 见 PREF_MEMORY_KEYS
+    "last_decision": None,    # 最近一次“要不要打扰”的完整链路（含 chain，可逐条回放）
+    "writes": 0,              # 落盘次数（持久化可见性，供面板显示）
+}
+
+
+def pref_current():
+    """决策前必查的最小快照（每次现读，绝不用缓存值判断“要不要打扰用户”）。"""
+    with pref_lock:
+        v = pref_state["preference"]
+        c = PREF_CHOICES.get(v) or PREF_CHOICES[PREF_DEFAULT]
+        return {
+            "preference": v,
+            "config_version": pref_state["config_version"],
+            "label": c["label"], "short": c["short"], "desc": c["desc"],
+            "popup": bool(c["popup"]), "respect_cooldown": bool(c["respect_cooldown"]),
+            "source": pref_state["source"], "updated_at": pref_state["updated_at"],
+            "is_default": v == PREF_DEFAULT, "note": pref_state["note"],
+            "rev": pref_state["rev"],
+        }
+
+
+def _pref_tag(pref):
+    """一句可审计的偏好口径：「配置 v2『关闭主动提醒』（来源：用户保存 · 12:01:33）」。"""
+    src = PREF_SOURCE_LABEL.get(pref.get("source"), pref.get("source") or "未知")
+    c = PREF_CHOICES.get(pref.get("preference")) or PREF_CHOICES[PREF_DEFAULT]
+    extra = (" · " + pref["updated_at"]) if pref.get("updated_at") else ""
+    return "配置 %s「%s」（来源：%s%s）" % (pref.get("config_version"), c["short"], src, extra)
+
+
+def _pref_public_choice(v):
+    c = dict(PREF_CHOICES[v])
+    c["is_default"] = (v == PREF_DEFAULT)
+    return c
+
+
+def _pref_trim_locked():
+    if len(pref_state["events"]) > PREF_KEEP_EVENTS:
+        pref_state["events"] = pref_state["events"][-PREF_KEEP_EVENTS:]
+    if len(pref_state["history"]) > PREF_KEEP_HISTORY:
+        pref_state["history"] = pref_state["history"][-PREF_KEEP_HISTORY:]
+
+
+def _pref_event_locked(kind, text, detail=None, request_id=None, dedup_key=None, **extra):
+    """登记一条日志（须持锁）。同一 dedup_key 3s 内重复 ⇒ 只留第一条（2s 轮询不刷屏）。"""
+    ts = int(time.time() * 1000)
+    if dedup_key:
+        for e in pref_state["events"][-4:]:
+            if e.get("dedup_key") == dedup_key and (ts - int(e.get("ts_ms") or 0)) < 3000:
+                return e
+    ev = {"id": "pe_%d_%d" % (ts, len(pref_state["events"])), "ts_ms": ts, "time": _ctx_clock(ts),
+          "kind": kind, "text": text, "detail": detail, "request_id": request_id, "dedup_key": dedup_key,
+          "config_version": pref_state["config_version"], "preference": pref_state["preference"]}
+    ev.update(extra)
+    pref_state["events"].append(ev)
+    _pref_trim_locked()
+    return ev
+
+
+def _pref_remember_locked(key, text=None, detail=None, request_id=None, **extra):
+    """记住用户的选择（台账式计数）+ 记一条“系统记住了什么”（须持锁）。"""
+    mem = pref_state["memory"]
+    mem[key] = int(mem.get(key) or 0) + 1
+    ev = None
+    if text:
+        ev = _pref_event_locked("user_action", text, detail=detail, request_id=request_id,
+                                memory_key=key, memory_count=mem[key], **extra)
+    return {"key": key, "count": mem[key], "event": ev}
+
+
+def pref_remember(key, text=None, detail=None, request_id=None, save=True, **extra):
+    """对外入口：记住一次用户选择（可选立即落盘）。"""
+    with pref_lock:
+        r = _pref_remember_locked(key, text=text, detail=detail, request_id=request_id, **extra)
+        if save:
+            _pref_save_locked()
+        return r
+
+
+def _pref_payload_locked():
+    """要落盘的内容（schema_version 是文件格式版本；config_version 是偏好配置版本，两者不同）。"""
+    return {
+        "schema_version": 1,
+        "config_version": pref_state["config_version"],
+        "preference": pref_state["preference"],
+        "source": pref_state["source"],
+        "updated_at": pref_state["updated_at"],
+        "updated_at_ms": pref_state["updated_at_ms"],
+        "note": pref_state["note"],
+        "rev": pref_state["rev"],
+        "history": [dict(h) for h in pref_state["history"]],
+        "events": [dict(e) for e in pref_state["events"]],
+        "memory": dict(pref_state["memory"]),
+        "last_decision": json.loads(json.dumps(pref_state["last_decision"])),
+        "saved_at": _ctx_clock(int(time.time() * 1000)),
+    }
+
+
+def _pref_save_locked():
+    """原子落盘（临时文件 + os.replace）：偏好必须“重启/断电也不丢”。须持锁调用。"""
+    tmp = PREF_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_pref_payload_locked(), f, ensure_ascii=False, indent=2)
+        os.replace(tmp, PREF_FILE)
+        pref_state["writes"] = int(pref_state.get("writes") or 0) + 1
+        return True
+    except Exception as e:                     # 磁盘只读 / 路径异常绝不拖垮主流程
+        print("【偏好·落盘失败】%s（本次偏好仅存内存，重启会丢）" % e)
+        return False
+
+
+def pref_save():
+    with pref_lock:
+        return _pref_save_locked()
+
+
+def _pref_load():
+    """启动时载入偏好；文件缺失/损坏 ⇒ 用默认 v1 并写出一份（默认配置同样可持久化）。"""
+    if os.path.exists(PREF_FILE):
+        try:
+            with open(PREF_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            with pref_lock:
+                v = str(d.get("preference") or "")
+                if v in PREF_CHOICES:
+                    pref_state["preference"] = v
+                pref_state["config_version"] = str(d.get("config_version") or PREF_VERSION_DEFAULT)
+                pref_state["source"] = str(d.get("source") or "default")
+                pref_state["updated_at"] = d.get("updated_at")
+                pref_state["updated_at_ms"] = d.get("updated_at_ms")
+                pref_state["note"] = str(d.get("note") or ("已从 %s 载入" % os.path.basename(PREF_FILE)))
+                pref_state["rev"] = int(d.get("rev") or 0)
+                pref_state["history"] = [h for h in (d.get("history") or [])
+                                         if isinstance(h, dict)][-PREF_KEEP_HISTORY:]
+                pref_state["events"] = [e for e in (d.get("events") or [])
+                                        if isinstance(e, dict)][-PREF_KEEP_EVENTS:]
+                pref_state["memory"] = {str(k): int(x or 0) for k, x in dict(d.get("memory") or {}).items()}
+                pref_state["last_decision"] = (d.get("last_decision")
+                                               if isinstance(d.get("last_decision"), dict) else None)
+                _pref_trim_locked()
+                ver, cur, n = pref_state["config_version"], pref_state["preference"], len(pref_state["history"])
+            print("【用户偏好】已载入 %s：配置 %s · 偏好 %s · 历史 %d 个版本"
+                  % (PREF_FILE, ver, cur, n))
+            return True
+        except Exception as e:
+            print("【用户偏好·读取失败】%s → 改用默认配置 %s（并覆盖该文件）" % (e, PREF_VERSION_DEFAULT))
+    with pref_lock:
+        _pref_save_locked()
+    print("【用户偏好】未找到 %s → 建立默认配置 %s（%s）" % (PREF_FILE, PREF_VERSION_DEFAULT, PREF_DEFAULT))
+    return False
+
+
+def _pref_next_version_locked():
+    """下一个配置版本号 = 历史（含当前）里最大的 vN + 1；v1 只属于默认配置，修改一律 ≥ v2。"""
+    n = 0
+    for h in list(pref_state["history"]) + [{"config_version": pref_state["config_version"]}]:
+        cv = str(h.get("config_version") or "")
+        if cv[:1] == "v" and cv[1:].isdigit():
+            n = max(n, int(cv[1:]))
+    return "v%d" % max(2, n + 1)
+
+
+def _pref_apply_locked(new_pref, source, note):
+    """把偏好改成 new_pref：生成【新】config_version + 历史版本（须持锁）。返回 (entry, 旧版本号)。"""
+    cur, old_ver = pref_state["preference"], pref_state["config_version"]
+    new_ver = (PREF_VERSION_DEFAULT if (source == "restore_default" and new_pref == PREF_DEFAULT)
+               else _pref_next_version_locked())
+    ts = int(time.time() * 1000)
+    pref_state["rev"] = int(pref_state.get("rev") or 0) + 1
+    pref_state["config_version"] = new_ver
+    pref_state["preference"] = new_pref
+    pref_state["source"] = source
+    pref_state["updated_at"], pref_state["updated_at_ms"] = _ctx_clock(ts), ts
+    pref_state["note"] = note
+    entry = {"rev": pref_state["rev"], "config_version": new_ver, "preference": new_pref,
+             "previous_preference": cur, "previous_config_version": old_ver,
+             "changed_at": _ctx_clock(ts), "changed_at_ms": ts, "source": source,
+             "source_label": PREF_SOURCE_LABEL.get(source, source), "note": note}
+    pref_state["history"].append(entry)
+    _pref_trim_locked()
+    return entry, old_ver
+
+
+def _pref_previous_locked():
+    """最近一次“与当前偏好【内容不同】”的历史版本（撤回 / 回退的目标）。"""
+    cur = pref_state["preference"]
+    for h in reversed(pref_state["history"]):
+        if h.get("preference") != cur and h.get("preference") in PREF_CHOICES:
+            return h
+    return None
+
+
+def _pref_effect_block(c):
+    """把“这个偏好会怎么改变打扰行为”写清楚（前端直接显示，不自己解释）。"""
+    return {
+        "popup": bool(c["popup"]),
+        "respect_cooldown": bool(c["respect_cooldown"]),
+        "against_week9": ("弹窗之前必查本配置" if c["popup"] else "绝不弹窗：只亮黄条 / 徽章 + 后台记录"),
+        "against_week11": ("照旧追问（仍受静默期与去重约束）" if c["popup"]
+                           else "一并关闭：追问照旧展示，但 ask 一律为 False（只展示、不打扰）"),
+    }
+
+
+def pref_public(compact=False):
+    """偏好快照（GET/POST 同一份口径；compact=True 供 /api/status 用，不带完整日志）。"""
+    with pref_lock:
+        cur = pref_state["preference"]
+        c = PREF_CHOICES.get(cur) or PREF_CHOICES[PREF_DEFAULT]
+        hist = [dict(h) for h in pref_state["history"]]
+        events = [] if compact else [dict(e) for e in pref_state["events"][-PREF_SHOW_EVENTS:]]
+        mem = dict(pref_state["memory"])
+        ld = json.loads(json.dumps(pref_state["last_decision"])) if pref_state["last_decision"] else None
+        prev = _pref_previous_locked()
+        ts = int(time.time() * 1000)
+        return {
+            "status": "ok", "ts_ms": ts,
+            "config_version": pref_state["config_version"],
+            "preference": cur, "preference_label": c["label"], "preference_short": c["short"],
+            "desc": c["desc"], "is_default": cur == PREF_DEFAULT,
+            "default_preference": PREF_DEFAULT, "default_config_version": PREF_VERSION_DEFAULT,
+            "source": pref_state["source"],
+            "source_label": PREF_SOURCE_LABEL.get(pref_state["source"], pref_state["source"]),
+            "updated_at": pref_state["updated_at"], "updated_at_ms": pref_state["updated_at_ms"],
+            "note": pref_state["note"], "rev": pref_state["rev"],
+            "effect": _pref_effect_block(c),
+            "choices": [_pref_public_choice(v) for v in PREF_ORDER],
+            "memory": mem,
+            "memory_labels": dict(PREF_MEMORY_KEYS),
+            "memory_total": sum(int(x or 0) for x in mem.values()),
+            "history": list(reversed(hist))[:PREF_KEEP_HISTORY],
+            "history_count": len(hist),
+            "events": events, "event_count": len(pref_state["events"]),
+            "last_decision": ld,
+            "undo": {
+                "available": bool(prev),
+                "target_version": prev["config_version"] if prev else None,
+                "target_preference": prev["preference"] if prev else None,
+                "target_label": PREF_CHOICES[prev["preference"]]["short"] if prev else None,
+                "note": "撤回 = 回到上一次“内容不同”的配置，并生成一个【新】版本（历史一律保留，可再回退）",
+            },
+            "storage": {
+                "file": os.path.basename(PREF_FILE), "path": PREF_FILE, "format": "json",
+                "exists": os.path.exists(PREF_FILE), "writes": int(pref_state.get("writes") or 0),
+                "atomic": "临时文件 + os.replace（崩溃/断电不会写坏配置）",
+                "note": "偏好单独存 %s：台账 photos_ledger.json 是“一次采集一条”的记录，不适合放全局配置。"
+                        % os.path.basename(PREF_FILE),
+            },
+            "scope": "只影响本机这份偏好文件：不改变任何传感器判定与 week7/8/10/11 的结论，只改变“要不要打扰用户”。",
+        }
+
+
+def pref_set(preference, note=None, source="user"):
+    """保存偏好。幂等：与当前完全相同 ⇒ changed=False（不新建版本、不写盘）。返回 (payload, http_code)。"""
+    v = str(preference or "").strip()
+    if v not in PREF_CHOICES:
+        return {"status": "bad_request",
+                "msg": "非法偏好：%s（合法值 %s）" % (v or "(空)", PREF_ORDER),
+                "choices": [_pref_public_choice(x) for x in PREF_ORDER]}, 400
+    with pref_lock:
+        cur = pref_state["preference"]
+        if v == cur:
+            info = {"changed": False, "already": True,
+                    "msg": "当前偏好已经是「%s」（配置 %s），无需保存"
+                           % (PREF_CHOICES[cur]["short"], pref_state["config_version"])}
+        else:
+            c = PREF_CHOICES[v]
+            entry, old_ver = _pref_apply_locked(v, source, note or "用户在面板保存偏好")
+            _pref_event_locked(
+                "pref_change", "用户修改了偏好为「%s」" % c["short"],
+                detail="配置版本 %s → %s（%s）· 影响：此后每次弹窗之前都要先查这份偏好"
+                       % (old_ver, entry["config_version"], c["desc"]),
+                changed_by=source, from_preference=entry["previous_preference"], to_preference=v)
+            _pref_remember_locked(
+                "saved", "系统已记住：以后「%s」（%s）—— 每次打扰前都会先查这份偏好，随时可改、可撤回"
+                         % (c["short"], entry["config_version"]),
+                detail=note or "用户在面板保存偏好")
+            saved = _pref_save_locked()
+            info = {"changed": True, "already": False, "persisted": saved,
+                    "previous_config_version": old_ver,
+                    "previous_preference": entry["previous_preference"],
+                    "msg": "已保存偏好「%s」→ 配置版本 %s（上一版 %s 已进历史，可撤回 / 可回退）"
+                           % (c["short"], entry["config_version"], old_ver)}
+    payload = pref_public()
+    payload.update(info)
+    print("【用户偏好】%s" % info["msg"])
+    return payload, 200
+
+
+def pref_restore_default(note=None):
+    """恢复默认：偏好回到 low_conf_only，且 config_version 重置为 v1（任务书要求）。返回 (payload, code)。"""
+    with pref_lock:
+        cur, cur_ver = pref_state["preference"], pref_state["config_version"]
+        if cur == PREF_DEFAULT and cur_ver == PREF_VERSION_DEFAULT:
+            info = {"changed": False, "already": True,
+                    "msg": "当前已经是默认配置 v1（%s），无需恢复" % PREF_CHOICES[PREF_DEFAULT]["short"]}
+        else:
+            entry, old_ver = _pref_apply_locked(PREF_DEFAULT, "restore_default", note or "用户点击【恢复默认】")
+            _pref_event_locked(
+                "pref_change", "用户点击【恢复默认】→ 偏好回到「%s」" % PREF_CHOICES[PREF_DEFAULT]["short"],
+                detail="配置版本 %s → v1（默认配置的版本号就是 v1）· 历史版本 %s 仍保留，可回退" % (old_ver, old_ver),
+                changed_by="restore_default", from_preference=entry["previous_preference"],
+                to_preference=PREF_DEFAULT)
+            _pref_remember_locked("restore_default",
+                                  "系统已记住：用户会回到默认偏好（配置重置为 v1）", detail=note)
+            saved = _pref_save_locked()
+            info = {"changed": True, "already": False, "persisted": saved,
+                    "previous_config_version": old_ver,
+                    "previous_preference": entry["previous_preference"],
+                    "msg": "已恢复默认：偏好「%s」，配置版本重置为 v1（原配置 %s 仍在历史里，可回退）"
+                           % (PREF_CHOICES[PREF_DEFAULT]["short"], old_ver)}
+    payload = pref_public()
+    payload.update(info)
+    print("【用户偏好】%s" % info["msg"])
+    return payload, 200
+
+
+def pref_undo(note=None):
+    """撤回上一次修改：回到上一次“内容不同”的配置，并生成一个【新】版本。返回 (payload, code)。"""
+    with pref_lock:
+        target = _pref_previous_locked()
+        if target is None:
+            info = {"changed": False, "already": True,
+                    "msg": "没有可撤回的修改（当前仍是系统默认配置 v1）"}
+        else:
+            short = PREF_CHOICES[target["preference"]]["short"]
+            entry, old_ver = _pref_apply_locked(
+                target["preference"], "undo", note or "用户撤回上一次修改 → 回到配置 %s" % target["config_version"])
+            _pref_event_locked(
+                "pref_change", "用户撤回上一次修改 → 偏好回到「%s」" % short,
+                detail="目标历史版本 %s（%s · %s）→ 本次生成新版本 %s；历史版本一律保留"
+                       % (target["config_version"], target["changed_at"],
+                          PREF_SOURCE_LABEL.get(target.get("source"), target.get("source")),
+                          entry["config_version"]),
+                changed_by="undo", from_preference=entry["previous_preference"],
+                to_preference=target["preference"], undo_of=target["config_version"])
+            _pref_remember_locked("undo", "系统已记住：用户会撤回不满意的修改（本次回到「%s」· 配置 %s）"
+                                          % (short, entry["config_version"]), detail=note)
+            saved = _pref_save_locked()
+            info = {"changed": True, "already": False, "persisted": saved,
+                    "previous_config_version": old_ver,
+                    "previous_preference": entry["previous_preference"],
+                    "undo_of": target["config_version"],
+                    "msg": "已撤回上一次修改：偏好「%s」，新配置版本 %s（历史版本 %s 仍可回退）"
+                           % (short, entry["config_version"], target["config_version"])}
+    payload = pref_public()
+    payload.update(info)
+    print("【用户偏好】%s" % info["msg"])
+    return payload, 200
+
+
+def pref_rollback(version, note=None):
+    """回退到指定历史版本（版本号取自 history；不存在的版本 ⇒ 404 + 现有版本列表）。"""
+    v = str(version or "").strip()
+    with pref_lock:
+        target = None
+        for h in reversed(pref_state["history"]):
+            if str(h.get("config_version")) == v and h.get("preference") in PREF_CHOICES:
+                target = h
+                break
+        if target is None:
+            info = {"changed": False, "status": "not_found",
+                    "msg": "历史里没有配置版本 %s（现有版本 %s）"
+                           % (v or "(空)", [h.get("config_version") for h in pref_state["history"]][-8:] or ["v1"])}
+        elif target["preference"] == pref_state["preference"]:
+            info = {"changed": False, "already": True,
+                    "msg": "历史版本 %s 的偏好与当前一致（%s），无需回退"
+                           % (v, PREF_CHOICES[target["preference"]]["short"])}
+        else:
+            short = PREF_CHOICES[target["preference"]]["short"]
+            entry, old_ver = _pref_apply_locked(target["preference"], "rollback",
+                                                note or "用户回退到历史版本 %s" % v)
+            _pref_event_locked(
+                "pref_change", "用户回退到历史版本 %s → 偏好「%s」" % (v, short),
+                detail="配置版本 %s → %s（回退目标 %s · %s）；历史版本一律保留"
+                       % (old_ver, entry["config_version"], v, target["changed_at"]),
+                changed_by="rollback", from_preference=entry["previous_preference"],
+                to_preference=target["preference"], rollback_to=v)
+            _pref_remember_locked("rollback", "系统已记住：用户回退到 %s 的偏好「%s」（本次配置 %s）"
+                                              % (v, short, entry["config_version"]), detail=note)
+            saved = _pref_save_locked()
+            info = {"changed": True, "already": False, "persisted": saved,
+                    "previous_config_version": old_ver,
+                    "previous_preference": entry["previous_preference"],
+                    "rollback_to": v,
+                    "msg": "已回退到历史版本 %s：偏好「%s」，新配置版本 %s"
+                           % (v, short, entry["config_version"])}
+    payload = pref_public()
+    payload.update(info)
+    print("【用户偏好】%s" % info["msg"])
+    return payload, (404 if info.get("status") == "not_found" else 200)
+
+
+def pref_note_prompt_cycle(pref, rid, verdict_reason, action, decision_text, cooldown_remaining=None,
+                           memory_key=None, memory_text=None, memory_detail=None, stage="front",
+                           persist=True):
+    """week9 决策落账（register=True 时调用）：① 触发判定 ② 查偏好 ③ 决定 —— 三步全部写日志，
+    并生成可逐条回放的链路（chain / chain_text），回答“为什么这次没弹窗”。"""
+    with pref_lock:
+        if memory_key and memory_text:
+            _pref_remember_locked(memory_key, memory_text, detail=memory_detail, request_id=rid)
+        v_ev = _pref_event_locked("capture_verdict", "触发抓拍失败/画面不可用（%s）" % verdict_reason,
+                                  detail="request_id=%s" % (rid or "-"), request_id=rid,
+                                  dedup_key="verdict|%s|%s" % (rid or "-", verdict_reason))
+        c_ev = _pref_event_locked("pref_check", "系统检查偏好：%s" % _pref_tag(pref),
+                                  detail="弹窗之前必查：preference=%s → popup=%s"
+                                         % (pref["preference"], "是" if pref["popup"] else "否（只亮黄条 + 后台记录）"),
+                                  request_id=rid, dedup_key="check|%s" % (rid or "-"))
+        d_ev = _pref_event_locked("decision", decision_text, request_id=rid, action=action,
+                                  detail=("静默期剩余 %.1fs" % cooldown_remaining) if cooldown_remaining else None,
+                                  dedup_key="dec|%s|%s" % (rid or "-", action))
+        change = None
+        for e in reversed(pref_state["events"][:-3]):
+            if e.get("kind") == "pref_change":
+                change = e
+                break
+        chain = [{"time": change["time"], "text": change["text"]} if change
+                 else {"time": pref.get("updated_at") or _ctx_clock(int(time.time() * 1000)),
+                       "text": "沿用系统默认配置 v1（无修改记录）"}]
+        chain.append({"time": v_ev["time"], "text": v_ev["text"]})
+        chain.append({"time": c_ev["time"], "text": c_ev["text"]})
+        if cooldown_remaining:
+            chain.append({"time": d_ev["time"],
+                          "text": "静默期剩余 %.1fs（week9 冷却，本次未覆盖）" % cooldown_remaining})
+        chain.append({"time": d_ev["time"], "text": decision_text})
+        pref_state["last_decision"] = {
+            "ts_ms": d_ev["ts_ms"], "time": d_ev["time"], "request_id": rid, "stage": stage,
+            "verdict_reason": verdict_reason, "action": action,
+            "config_version": pref["config_version"], "preference": pref["preference"],
+            "preference_short": PREF_CHOICES[pref["preference"]]["short"],
+            "decision": decision_text,
+            "chain": chain,
+            "chain_text": " → ".join("%s %s" % (x["time"], x["text"]) for x in chain),
+        }
+        if persist:
+            _pref_save_locked()
+        return json.loads(json.dumps(pref_state["last_decision"]))
+
+
+@app.route("/api/preferences", methods=["GET", "POST"])
+def api_preferences():
+    """week12: 用户交互提醒偏好（GET 读取 / POST 修改），带 config_version 且持久化。
+
+    GET  → 当前偏好 + config_version + 三个可选项 + 影响说明 + 版本历史 + 决策日志 + 已记住的用户选择
+    POST → {"action": "save" | "restore_default" | "undo" | "rollback",
+            "preference": "always_ask" | "low_conf_only" | "never_ask",   # action=save 时必填
+            "version": "v2",                                              # action=rollback 时必填
+            "note": "可选备注"}
+           省略 action 但带 preference 时按 save 处理；每次内容变化都会产生【新】config_version。
+    """
+    if request.method == "GET":
+        return jsonify(pref_public())
+    d = request.get_json(silent=True) or request.form or {}
+    action = str(d.get("action") or ("save" if d.get("preference") else "")).strip().lower()
+    note = (str(d.get("note") or "").strip()[:120]) or None
+    if action in ("save", "set", "update"):
+        payload, code = pref_set(d.get("preference"), note=note, source="user")
+    elif action in ("restore_default", "default", "reset"):
+        payload, code = pref_restore_default(note=note)
+    elif action in ("undo", "revert"):
+        payload, code = pref_undo(note=note)
+    elif action in ("rollback", "history"):
+        payload, code = pref_rollback(d.get("version") or d.get("config_version"), note=note)
+    else:
+        return jsonify({"status": "bad_request", "rule_version": RULE_VERSION,
+                        "msg": "action 必须是 save / restore_default / undo / rollback（收到：%s）"
+                               % (action or "(空)")}), 400
+    return jsonify(payload), code
+
+
+_pref_load()                        # 启动即载入（不存在则写出默认 v1）；此后每次修改都会立即落盘
 
 
 def check_timeout():
@@ -2675,37 +3244,93 @@ def evaluate_proactive_prompt(request_id=None, filename=None, register=True, sou
     if register:
         with prompt_lock:
             prompt_gate["counters"]["checked"] += 1
+    # ---- week12: 弹窗【之前】先查用户偏好（后端唯一权威；前端只负责展示）----
+    pref = pref_current()
+    pref_note = _pref_tag(pref)
+    res.update({
+        "preference": pref["preference"], "preference_label": pref["label"],
+        "preference_short": pref["short"], "config_version": pref["config_version"],
+        "preference_source": pref["source"], "pref_popup_allowed": pref["popup"],
+        "pref_respect_cooldown": pref["respect_cooldown"], "verdict_reason": v["reason"],
+        "pref_suppressed": False, "cooldown_overridden": False, "reask_overridden": False,
+    })
     if not v["unusable"]:
         return res                     # 画面可用 → 不询问（黄条/徽章等 week7/8 反馈保持不变）
+    # ---- ① 偏好闸门：never_ask ⇒ 绝不弹窗，只亮黄条 + 后台记录（原因全部写清）----
+    if not pref["popup"]:
+        decision = "决定不弹窗（用户偏好「关闭主动提醒」：只亮黄条 + 后台记录，不打扰用户）"
+        with prompt_lock:
+            res["reason"] = "pref_never_ask"
+            res["ask"] = False
+            res["pref_suppressed"] = True
+            res["note"] = ("用户偏好「%s」（%s）→ 绝不弹窗：黄条 / 徽章照旧显示，本次判定仅后台记录"
+                           % (pref["short"], pref_note))
+            if register and rid and rid not in prompt_gate["suppressed_ids"]:
+                prompt_gate["suppressed_ids"].add(rid)
+                prompt_gate["suppressed"] += 1
+                prompt_gate["suppressed_last"] = {"request_id": rid, "reason": "pref_never_ask",
+                                                  "ts_ms": int(now * 1000)}
+                if len(prompt_gate["suppressed_ids"]) > 256:
+                    prompt_gate["suppressed_ids"] = set(list(prompt_gate["suppressed_ids"])[-128:])
+            res["cooldown_active"] = prompt_gate["cooldown_until"] > now
+            res["cooldown_remaining"] = round(max(0.0, prompt_gate["cooldown_until"] - now), 1)
+            res["suppressed"] = prompt_gate["suppressed"]
+        if register:
+            pref_note_prompt_cycle(
+                pref, rid, v["reason"], "no_popup_by_preference", decision, stage=source, persist=True,
+                memory_key="blocked_by_pref",
+                memory_text="系统已记住：按偏好「关闭主动提醒」不打扰（%s）" % v["reason"],
+                memory_detail="preference=%s · popup=False" % pref["preference"])
+            print(f"【主动询问·偏好压制】request_id={rid or '-'} 画面不可用（{v['reason']}），"
+                  f"但用户偏好「{pref['short']}」（{pref['config_version']}）→ 不弹窗，"
+                  f"仅黄条 + 后台记录（累计压制 {res['suppressed']} 次）")
+        return res
+    # ---- ② 常规门控（week9 既有策略）；偏好「总是提醒」不受静默期 / 去重限制 ----
     with prompt_lock:
         handled = prompt_gate["handled"].get(rid)
         cooling = prompt_gate["cooldown_until"] > now
         asked = prompt_gate["asked"].get(rid)
         recent_ask = bool(asked) and (now - float(asked.get("ts") or 0)) < PROMPT_REASK_SECONDS
+        relaxed = not pref["respect_cooldown"]
         if handled:
             res["reason"] = "handled"
             res["note"] = f"用户已处理该画面（{handled}），不再重复询问"
-        elif cooling:
+            decision = "决定不弹窗（用户已处理该画面：%s）" % handled
+        elif (cooling or recent_ask) and not relaxed:
+            if cooling:
             # 硬性要求：用户刚点“忽略” → 30s 内即使再次判定不可用也【不弹窗】，只在后台记录
-            res["reason"] = "cooldown"
-            res["note"] = (f"用户刚选择忽略 → 静默 {PROMPT_COOLDOWN_SECONDS:.0f}s 内不弹窗，"
-                           f"仅后台记录（黄条/徽章照旧显示）")
-            if register and rid and rid not in prompt_gate["suppressed_ids"]:
-                # 同一张画面在冷却期内被反复轮询只计一次（计数=被压制的不同画面数，不虚高）
-                prompt_gate["suppressed_ids"].add(rid)
-                prompt_gate["suppressed"] += 1
-                prompt_gate["suppressed_last"] = {"request_id": rid, "reason": v["reason"],
-                                                  "ts_ms": int(now * 1000)}
-                if len(prompt_gate["suppressed_ids"]) > 256:
-                    prompt_gate["suppressed_ids"] = set(
-                        list(prompt_gate["suppressed_ids"])[-128:])
-        elif recent_ask:
-            res["reason"] = "already_asked"
-            res["note"] = f"同一张画面 {PROMPT_REASK_SECONDS:.0f}s 内已询问过 → 不重复弹窗"
+                res["reason"] = "cooldown"
+                res["note"] = (f"用户刚选择忽略 → 静默 {PROMPT_COOLDOWN_SECONDS:.0f}s 内不弹窗，"
+                               f"仅后台记录（黄条/徽章照旧显示）")
+                decision = ("决定不弹窗（静默期剩余 %.1fs：用户刚选择忽略）"
+                            % max(0.0, prompt_gate["cooldown_until"] - now))
+                if register and rid and rid not in prompt_gate["suppressed_ids"]:
+                    # 同一张画面在冷却期内被反复轮询只计一次（计数=被压制的不同画面数，不虚高）
+                    prompt_gate["suppressed_ids"].add(rid)
+                    prompt_gate["suppressed"] += 1
+                    prompt_gate["suppressed_last"] = {"request_id": rid, "reason": v["reason"],
+                                                      "ts_ms": int(now * 1000)}
+                    if len(prompt_gate["suppressed_ids"]) > 256:
+                        prompt_gate["suppressed_ids"] = set(
+                            list(prompt_gate["suppressed_ids"])[-128:])
+            else:
+                res["reason"] = "already_asked"
+                res["note"] = f"同一张画面 {PROMPT_REASK_SECONDS:.0f}s 内已询问过 → 不重复弹窗"
+                decision = "决定不弹窗（同一张画面 %.0fs 内已询问过）" % PROMPT_REASK_SECONDS
         else:
             title, msg = PROMPT_TEXT.get(v["reason"],
                                          ("画面不可用", "⚠️ 画面不可用。是否立即重新抓拍？"))
             res.update(ask=True, title=title, msg=msg)
+            if cooling or recent_ask:
+                # 偏好「总是提醒」：明确覆盖 week9 的静默期 / 去重，并把“为什么照样弹”写进 note
+                res["cooldown_overridden"] = bool(cooling)
+                res["reask_overridden"] = bool(recent_ask)
+                res["note"] = ("偏好「%s」（%s）不受%s限制 → 仍然弹窗（用户明确要求总提醒）"
+                               % (pref["short"], pref_note,
+                                  "静默期" if cooling else "同一张画面的去重窗口"))
+            decision = (("决定弹窗询问是否重拍（偏好「总是提醒」覆盖了%s）"
+                         % ("静默期" if cooling else "去重窗口")) if (cooling or recent_ask)
+                        else ("决定弹窗询问是否重拍（画面不可用：%s）" % v["reason"]))
             if register:
                 prompt_gate["asked"][rid] = {"prompt_id": res["prompt_id"], "ts": now,
                                              "reason": v["reason"]}
@@ -2718,9 +3343,18 @@ def evaluate_proactive_prompt(request_id=None, filename=None, register=True, sou
         res["cooldown_remaining"] = round(max(0.0, prompt_gate["cooldown_until"] - now), 1)
         res["suppressed"] = prompt_gate["suppressed"]
     if register:
+        # week12: 决策落账（触发判定 → 查偏好 → 决定）—— 面板可逐条回放“为什么这次没弹窗”
+        pref_note_prompt_cycle(
+            pref, rid, v["reason"], ("ask_retake" if res["ask"] else (res["reason"] or "none")),
+            decision or "决定不弹窗", stage=source, persist=True,
+            cooldown_remaining=(res["cooldown_remaining"] if res["reason"] == "cooldown" else None),
+            memory_key=("ask" if res["ask"] else None),
+            memory_text=(("系统已记住：本次已弹窗询问是否重拍（偏好 %s · 配置 %s）"
+                          % (pref["preference"], pref["config_version"])) if res["ask"] else None))
         if res["ask"]:
             print(f"【主动询问】request_id={rid or '-'} 判定画面不可用（{res['reason']}：{res['detail']}）"
-                  f" → 下发询问「{res['msg']}」（prompt_id={res['prompt_id']}）")
+                  f" → 下发询问「{res['msg']}」（prompt_id={res['prompt_id']}）"
+                  f"｜偏好 {pref['preference']}（{pref['config_version']}）")
         elif res["reason"] == "cooldown":
             print(f"【主动询问·冷却压制】request_id={rid or '-'} 画面仍不可用（{v['reason']}），"
                   f"静默期剩余 {res['cooldown_remaining']:.1f}s → 不弹窗，仅后台记录"
@@ -2796,6 +3430,14 @@ def submit_prompt_action(action, prompt_id=None, request_id=None, filename=None,
         if len(prompt_gate["handled"]) > 128:
             for k in list(prompt_gate["handled"].keys())[:-64]:
                 prompt_gate["handled"].pop(k, None)
+    # week12: 记住用户对主动询问的处理方式（并写进决策日志；与偏好设置同一条时间线）
+    pref_remember(
+        ("ignored_retake" if act == "ignored_retake" else "confirmed_retake"),
+        (("用户忽略重拍建议 → 系统记住：%.0fs 内不再为该画面弹窗（仅后台记录）" % PROMPT_COOLDOWN_SECONDS)
+         if act == "ignored_retake" else
+         ("用户确认重拍 → 系统记住：立即发起新的单张采集（原 request_id=%s）" % (rid or "-"))),
+        detail="prompt_id=%s · 来源 %s" % ((pid or expect_pid) or "-", source or "front"),
+        request_id=rid, save=True)
     if act == "ignored_retake":
         print(f"【主动询问·忽略】request_id={rid} → 台账 user_action=ignored_retake，"
               f"进入 {PROMPT_COOLDOWN_SECONDS:.0f}s 静默期（期间画面不可用也不弹窗，仅后台记录）")
@@ -3224,6 +3866,13 @@ def correct_label():
         return jsonify({"status": "not_found", "msg": "找不到对应的图片记录"}), 404
     ledger_save_ai(entry, ai_label_manual=label, ai_corrected=True, ai_source="manual",
                    ai_correct_ts_ms=int(time.time() * 1000), ai_manual_note=note)
+    # week12: 记住这次人工纠正（用户纠正过一次，就别再拿模型结论去打扰他）
+    pref_remember("corrected_label",
+                  "用户纠正了 AI 标签「%s → %s」→ 系统记住：这张画面以人工标签为准"
+                  % (entry.get("ai_label") or "（拒识）", label),
+                  detail="filename=%s · request_id=%s · 来源 manual"
+                         % (entry.get("name"), entry.get("request_id") or rid or "-"),
+                  request_id=entry.get("request_id") or rid or None, save=True)
     print(f"【人工纠正】{entry.get('name')} 模型原判 "
           f"{entry.get('ai_label') or '(拒识)'} → 人工标签: {label}")
     res = _ai_public(entry)
@@ -3339,6 +3988,15 @@ def get_status():
         "blocked_min_size": BLOCKED_MIN_SIZE,            # 空帧阈值（<500B）
         "voice": PROMPT_VOICE_TEXT,                      # 浏览器 TTS 播报文案
         "actions": ["confirmed_retake", "ignored_retake"],
+    }
+    # ---- week12: 用户交互提醒偏好（轻量快照；完整日志 / 版本历史走 /api/preferences）----
+    data["preferences"] = pref_public(compact=True)
+    data["preference_policy"] = {
+        "default_preference": PREF_DEFAULT,              # 默认偏好（= v1 配置）
+        "default_config_version": PREF_VERSION_DEFAULT,
+        "choices": list(PREF_ORDER),
+        "endpoint": "/api/preferences",
+        "note": "偏好只改变“要不要打扰用户”（弹窗 / 追问），不改变任何传感器判定；每次修改都会产生新的 config_version。",
     }
     with timer_lock:
         data["timer_running"] = timer_state["running"]

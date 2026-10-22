@@ -335,6 +335,61 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
 .ctx-empty{padding:9px 10px; font-size:12px; line-height:1.7; color:var(--dim2);}
 .ctx-foot{margin-top:2px; font-size:11px; line-height:1.8; color:var(--dim2);}
 .ctx-foot b{color:var(--yellow);}
+/* ---- week12: 交互提醒偏好（用户偏好设置：三选项 + 保存/恢复默认 + 版本化 + 决策日志） ---- */
+.ctx-layer.prf .ctx-layer-h{color:var(--cyan); background:rgba(34,211,238,.10); border-bottom-color:rgba(34,211,238,.28);}
+.ctx-layer.prf .ctx-n{background:rgba(34,211,238,.18); color:var(--cyan);}
+.pref-wrap{display:flex; flex-direction:column; gap:12px;}
+.pref-bar{display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12.5px; line-height:1.65; color:var(--dim);}
+.pref-hl{font-weight:800; color:var(--txt);}
+.pref-ver{font-size:11.5px; font-weight:800; padding:2px 9px; border-radius:999px; white-space:nowrap;
+  color:var(--cyan); border:1px solid rgba(34,211,238,.45); background:rgba(34,211,238,.12);}
+.pref-state{font-size:11.5px; font-weight:800; padding:2px 9px; border-radius:999px; white-space:nowrap;}
+.pref-state.on{color:var(--green); border:1px solid rgba(52,211,153,.45); background:rgba(52,211,153,.12);}
+.pref-state.off{color:var(--yellow); border:1px solid rgba(251,191,36,.5); background:rgba(251,191,36,.12);}
+.pref-opt{display:flex; gap:10px; align-items:flex-start; padding:10px 12px; border-radius:10px; cursor:pointer;
+  border:1px solid var(--line); background:rgba(11,18,32,.5); transition:border-color .15s, background .15s;}
+.pref-opt:hover{border-color:rgba(34,211,238,.4);}
+.pref-opt.on{border-color:rgba(34,211,238,.65); background:rgba(34,211,238,.10);}
+.pref-opt input{margin-top:3px; flex:0 0 auto; accent-color:#22d3ee;}
+.pref-opt-b{min-width:0; flex:1;}
+.pref-opt-t{display:flex; align-items:center; gap:8px; font-size:13px; font-weight:800; color:var(--txt); flex-wrap:wrap;}
+.pref-opt-d{margin-top:5px; font-size:11.5px; line-height:1.75; color:var(--dim2);}
+.pref-tag{flex:0 0 auto; font-size:10px; font-weight:800; padding:2px 7px; border-radius:6px; color:var(--violet);
+  border:1px solid rgba(167,139,250,.45); background:rgba(167,139,250,.14);}
+.pref-btn-row{display:flex; gap:8px; flex-wrap:wrap; padding:0 12px 12px;}
+.pref-btn{padding:8px 13px; border-radius:9px; cursor:pointer; font-size:12.5px; font-weight:800; color:var(--txt);
+  background:rgba(2,6,23,.55); border:1px solid var(--line); transition:transform .12s, filter .15s;}
+.pref-btn:hover{transform:translateY(-1px); filter:brightness(1.25);}
+.pref-btn:disabled{opacity:.45; cursor:not-allowed; transform:none; filter:none;}
+.pref-btn.primary{border-color:rgba(34,211,238,.5); color:var(--cyan);}
+.pref-btn.warn{border-color:rgba(251,191,36,.5); color:var(--yellow);}
+.pref-btn.ghost{color:var(--dim);}
+.pref-log{display:flex; flex-direction:column; gap:7px; padding:11px 12px;}
+.pref-ev{display:flex; gap:9px; align-items:flex-start; padding:8px 10px; border-radius:9px;
+  border:1px solid var(--line); background:rgba(148,163,184,.05);}
+.pref-ev-k{flex:0 0 auto; font-size:10.5px; font-weight:800; padding:2px 8px; border-radius:6px; white-space:nowrap;
+  border:1px solid var(--line); color:var(--dim);}
+.pref-ev-k.pref_change{color:var(--cyan); border-color:rgba(34,211,238,.4); background:rgba(34,211,238,.12);}
+.pref-ev-k.capture_verdict{color:var(--red); border-color:rgba(248,113,113,.45); background:rgba(248,113,113,.12);}
+.pref-ev-k.pref_check{color:var(--violet); border-color:rgba(167,139,250,.45); background:rgba(167,139,250,.12);}
+.pref-ev-k.decision{color:var(--green); border-color:rgba(52,211,153,.45); background:rgba(52,211,153,.12);}
+.pref-ev-k.user_action{color:var(--orange); border-color:rgba(251,146,60,.45); background:rgba(251,146,60,.12);}
+.pref-ev-b{min-width:0; flex:1;}
+.pref-ev-t{font-size:12.5px; line-height:1.65; color:var(--txt); word-break:break-word;}
+.pref-ev-m{margin-top:4px; font-size:10.5px; line-height:1.7; color:var(--dim2); word-break:break-word;}
+.pref-chain{display:flex; flex-direction:column; gap:5px; margin-top:7px; padding:9px 11px; border-radius:9px;
+  border:1px dashed rgba(52,211,153,.4); background:rgba(52,211,153,.06);}
+.pref-chain-r{font-size:11.5px; line-height:1.7; color:var(--dim);}
+.pref-chain-r b{color:var(--txt);}
+.pref-kv{display:flex; gap:7px; flex-wrap:wrap; font-size:11px; line-height:1.7; color:var(--dim2);}
+.pref-kv span{font-size:10.5px; font-weight:700; padding:2px 8px; border-radius:999px; border:1px solid var(--line);
+  background:rgba(148,163,184,.06);}
+.pref-empty{padding:9px 10px; font-size:12px; line-height:1.7; color:var(--dim2);}
+.pref-history{display:flex; flex-direction:column; gap:6px; padding:0 12px 10px;}
+.pref-hist{display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:9px; flex-wrap:wrap;
+  border:1px solid var(--line); background:rgba(11,18,32,.5); font-size:11.5px; color:var(--dim);}
+.pref-hist.cur{border-color:rgba(34,211,238,.5); background:rgba(34,211,238,.08);}
+.pref-hist-m{margin-left:auto;}
 </style>
 </head>
 <body>
@@ -543,6 +598,63 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
         <b>口径：</b>本面板只渲染后端 <span class="mono">/api/context</span> 回传的原文，不做任何前端推测；
         阈值与规则参数一律取后端 <span class="mono">policy</span>（前端不写死）。追问只问选择题，已作答 / 已静默 / 超额的会被压制成
         <span class="mono">ask=false</span>（仍回传并显示原因），回答经 <span class="mono">/api/context_answer</span> 落台账、可溯源。
+      </div>
+    </div>
+  </section>
+  <!-- week12: 用户交互提醒偏好（交互提醒偏好卡片：三选项 + 保存 / 恢复默认 + 版本与决策日志） -->
+  <section class="card gallery-card" id="pref_card">
+    <div class="card-h"><span class="card-t">🎛 交互提醒偏好（用户偏好设置）</span>
+      <span class="pill pill-info" id="pref_ver_pill" title="当前生效的偏好配置版本（/api/preferences.config_version）">配置 --</span>
+      <span class="pill pill-dim" id="pref_state_pill" title="这份偏好会怎么改变“打扰”行为">状态 --</span>
+      <span class="pill pill-dim mono" id="pref_poll_pill" style="margin-left:auto">轮询 2s · 等待首次读取</span>
+    </div>
+    <div class="pref-wrap">
+      <div class="pref-bar"><span id="pref_headline">⏳ 正在读取 /api/preferences …</span></div>
+      <div class="ctx-err" id="pref_err" style="display:none">--</div>
+
+      <div class="ctx-layer prf">
+        <div class="ctx-layer-h"><span class="ctx-n">①</span><span>提醒方式（三选一 · 保存后立刻生效）</span>
+          <span class="ctx-cnt" id="pref_choice_cnt">--</span></div>
+        <div class="ctx-layer-d" id="pref_choice_desc">--</div>
+        <div class="ctx-list" id="pref_opts"><div class="pref-empty">⏳ 正在读取可选项…</div></div>
+        <div class="ctx-layer-d" id="pref_effect_line">--</div>
+        <div class="pref-btn-row">
+          <button class="pref-btn primary" id="pref_save_btn" onclick="savePreference()">💾 保存偏好</button>
+          <button class="pref-btn warn" id="pref_default_btn" onclick="restorePreferenceDefault()">♻️ 恢复默认</button>
+          <button class="pref-btn ghost" id="pref_undo_btn" onclick="undoPreference()">↩️ 撤回上一次修改</button>
+          <button class="pref-btn ghost" id="pref_reload_btn" onclick="loadPreferences(true)">🔄 重新读取</button>
+        </div>
+      </div>
+
+      <div class="ctx-layer prf">
+        <div class="ctx-layer-h"><span class="ctx-n">②</span><span>最近一次“要不要打扰”的决策链路（可逐条回放）</span>
+          <span class="ctx-cnt" id="pref_chain_cnt">--</span></div>
+        <div class="ctx-layer-d">回答“为什么这次没弹窗”：修改偏好 → 触发抓拍失败 → 系统检查偏好 → 决定，每一步都带后端时间戳。</div>
+        <div class="ctx-list" id="pref_chain"><div class="pref-empty">⏳ 正在读取决策链路…</div></div>
+      </div>
+
+      <div class="ctx-layer prf">
+        <div class="ctx-layer-h"><span class="ctx-n">③</span><span>决策日志（改偏好 / 触发判定 / 查偏好 / 决定 / 用户动作）</span>
+          <span class="ctx-cnt" id="pref_log_cnt">--</span></div>
+        <div class="ctx-layer-d">后端持久化记录（最近若干条）；“系统记住了什么”逐条可查，绝不静默吞掉用户选择。</div>
+        <div class="pref-log" id="pref_log"><div class="pref-empty">⏳ 正在读取决策日志…</div></div>
+      </div>
+
+      <div class="ctx-layer prf">
+        <div class="ctx-layer-h"><span class="ctx-n">④</span><span>版本历史（可回退）与“系统记住了什么”</span>
+          <span class="ctx-cnt" id="pref_hist_cnt">--</span></div>
+        <div class="ctx-layer-d" id="pref_storage_line">--</div>
+        <div class="pref-history" id="pref_history"><div class="pref-empty">--</div></div>
+        <div class="ctx-list" id="pref_memory"><div class="pref-empty">--</div></div>
+      </div>
+
+      <div class="ctx-foot" id="pref_foot">
+        <b>口径：</b>偏好只改变“要不要打扰用户”，不改变任何传感器判定与 week7/8/10/11 的结论 ——
+        <span class="mono">never_ask</span> 只亮黄条 + 后台记录（连 week11 追问也压制成 <span class="mono">ask=false</span>，只展示不打扰）；
+        <span class="mono">always_ask</span> 不受 30s 静默期与同一张画面去重限制；
+        <span class="mono">low_conf_only</span> 即默认配置 <span class="mono">v1</span>。<br>
+        版本规则：每次【内容变化】产生新的 <span class="mono">config_version</span>，历史版本一律保留（可撤回 / 可回退到任意版本）；
+        <span class="mono">v1</span> 恒为默认配置 ——「恢复默认」= 偏好回到默认且版本重置为 v1。
       </div>
     </div>
   </section>
@@ -1190,8 +1302,16 @@ function renderPromptLine(){
   const dot = $('prompt_dot'), txt = $('prompt_line_txt');
   const st = _proState || {};
   const rid = _pro && _pro.request_id ? _pro.request_id : null;
+  // week12: 偏好以后端为权威（优先取本次决策对象里的字段，其次取 /api/preferences|/api/status 的偏好快照）
+  const pref = (_pro && _pro.preference) ? _pro : _prefPolicy;
+  const popupAllowed = (pref && pref.pref_popup_allowed != null) ? pref.pref_popup_allowed
+    : (pref && pref.effect ? !!pref.effect.popup : null);
   let cls = 'ready', s = '';
-  if (st.cooldown_active && st.cooldown_remaining > 0){
+  if (popupAllowed === false){
+    cls = 'cool';
+    s = '🔕 主动询问：<b>已被用户偏好关闭</b> <span class="mono">(配置 ' + esc(prefLine(pref.config_version))
+      + '「' + esc(prefLine(pref.preference_label || pref.preference)) + '」→ 只亮黄条 + 后台记录，不弹窗)</span>';
+  } else if (st.cooldown_active && st.cooldown_remaining > 0){
     cls = 'cool';
     s = '🔔 主动询问：已忽略重拍建议 · 冷却中 <span class="mono">(' + Math.ceil(st.cooldown_remaining)
       + 's 后恢复；期间只后台记录不弹窗)</span>';
@@ -1203,6 +1323,10 @@ function renderPromptLine(){
   } else {
     s = '🔔 主动询问：就绪（画面不可用 → 弹窗询问是否重拍；忽略后 '
       + (st.cooldown_seconds || 30) + 's 内不弹窗）';
+  }
+  if (pref && pref.preference){
+    s += ' <span class="mono">· 偏好 ' + esc(pref.preference) + '（配置 '
+      + esc(prefLine(pref.config_version)) + '）</span>';
   }
   if (st.suppressed) s += ' <span class="mono">· 冷却期内已压制 ' + st.suppressed + ' 次（仅后台记录）</span>';
   if (dot) dot.className = 'prompt-dot ' + cls;
@@ -1600,6 +1724,12 @@ function updateStatus(st){
   // week9: 主动询问（Proactive Prompt）——策略/冷却状态以后端为权威；未弹过的询问可由状态轮询兜底弹出
   if (st.prompt_policy) _proPolicy = st.prompt_policy;
   if (st.prompt_state) _applyPromptState(st.prompt_state);
+  // week12: 用户偏好（/api/status 的轻量快照）—— 只更新状态行口径，不在此重绘偏好面板（面板由自己的 2s 轮询负责）
+  if (st.preferences){
+    _prefPolicy = st.preferences;
+    if (!_prefDirty && st.preferences.preference) _prefSel = st.preferences.preference;
+    renderPromptLine();
+  }
   if (st.prompt){
     if (st.prompt.ask && st.prompt.request_id && st.prompt.request_id === _capRid){
       const key = st.prompt.prompt_id || st.prompt.request_id;
@@ -2311,6 +2441,322 @@ document.addEventListener('touchstart', function(e){
 document.addEventListener('touchend', function(){ _ctxPointerDown = false; });
 pollContext();                                     // week11: 首帧立刻取一次（不必等 2s）
 setInterval(pollContext, CTX_POLL_MS);             // week11: 每 2 秒刷新三层上下文
+
+// ============ Week12: 交互提醒偏好（用户偏好设置 · 记住用户选择 · 版本化 · 可回退） ============
+// 任务书要求：/api/preferences 记住用户选择（always_ask / low_conf_only / never_ask），带 config_version，
+// 支持「恢复默认」（重置 v1）且必须持久化；week9 主动询问在【弹窗之前】必须先查偏好
+// （never_ask ⇒ 只亮黄条 + 后台记录，绝不弹窗）。
+// 纪律（与 week9~week11 一脉相承）：
+//   * 偏好以后端为唯一权威：本面板只渲染 /api/preferences 的原文（选项文案也取后端 choices）；
+//   * 未保存的选择只是“草稿”（_prefDirty），2s 轮询重绘绝不把它冲掉；
+//   * 任何修改都要看得见结果：版本号 + 状态 + 决策日志 + “系统记住了什么”，改错可撤回 / 可回退。
+const PREF_POLL_MS = 2000;
+let _prefData = null;          // 最近一次成功的偏好快照
+let _prefSig = '';             // 渲染签名：无实质变化就不重绘（避免打断选项点击）
+let _prefBusy = false;         // 轮询重入保护
+let _prefPosting = false;      // 正在提交修改（期间不轮询、不重绘）
+let _prefPointerDown = false;  // 指针按在面板里时暂缓重绘
+let _prefSel = null;           // 面板上的当前选择（草稿值）
+let _prefDirty = false;        // 草稿是否与后端生效值不同
+let _prefPolicy = null;        // /api/status.preferences（轻量快照，供 week9 状态行使用）
+const PREF_EV_LABEL = {pref_change:'改偏好', capture_verdict:'触发判定', pref_check:'查偏好',
+                       decision:'决定', user_action:'用户动作'};
+
+function prefArg(s){ return String(s == null ? '' : s).replace(/[^A-Za-z0-9_.:+-]/g, ''); }  // 与 w10Arg / ctxArg 同口径
+function prefLine(v){ return (v == null || v === '') ? '--' : String(v); }
+function prefEvLabel(k){ return PREF_EV_LABEL[k] || k; }
+function prefStamp(){
+  const p = $('pref_poll_pill'); if (!p) return;
+  const s = (_prefData || {}).storage || {};
+  p.innerText = '轮询 ' + (PREF_POLL_MS / 1000) + 's · 已落盘 ' + (s.writes == null ? '--' : s.writes)
+    + ' 次 · 配置 ' + prefLine((_prefData || {}).config_version);
+}
+function prefErr(msg){
+  const box = $('pref_err'); if (!box) return;
+  box.style.display = msg ? 'block' : 'none';
+  if (msg) box.innerText = msg;
+}
+function prefErrHint(){
+  return _prefData ? ('；以下为最后一次成功快照（配置 ' + prefLine(_prefData.config_version) + '），不是当前状态') : '';
+}
+function prefSignature(d){
+  const hist = (d.history || []).slice(0, 6).map(h => [h.config_version, h.preference, h.changed_at].join('|')).join('~');
+  const evs = (d.events || []).map(e => e.id).join('~');
+  const mem = Object.keys(d.memory || {}).sort().map(k => k + ':' + d.memory[k]).join('~');
+  const ld = d.last_decision ? [d.last_decision.ts_ms, d.last_decision.decision].join('|') : '';
+  return [d.config_version, d.preference, d.source, d.source_label, d.rev, d.history_count, d.event_count,
+          hist, evs, mem, ld, (d.undo ? d.undo.target_version : ''), _prefDirty ? 'dirty' : 'clean'].join('#');
+}
+// 后端偏好被外部改掉时（另一个标签页 / 直接调接口），只要本地没有未保存草稿就跟随
+function prefSyncDraft(d){
+  _prefPolicy = d;
+  const known = (d.choices || []).some(c => c.value === _prefSel);
+  if (!_prefDirty || !_prefSel || !known){
+    _prefSel = d.preference;
+    _prefDirty = false;
+  }
+}
+function prefApply(d, force){
+  if (!d || d.status !== 'ok'){ prefErr('❌ 偏好快照无效（未返回 status=ok）—— 不展示任何猜测数据'); return; }
+  if (!force){
+    if (_prefPointerDown || _prefPosting) return;                      // 不打断正在进行的点击 / 提交
+    if (prefSignature(d) === _prefSig){ _prefData = d; prefSyncDraft(d); prefStamp(); return; }
+  }
+  _prefData = d;
+  _prefSig = prefSignature(d);
+  prefSyncDraft(d);
+  renderPreferencePanel(d);
+  prefStamp();
+}
+function loadPreferences(manual){
+  if (_prefBusy || _prefPosting) return;
+  _prefBusy = true;
+  fetch('/api/preferences')
+    .then(r => r.json().then(j => ({code: r.status, j: j})).catch(() => ({code: r.status, j: null})))
+    .then(function(res){
+      _prefBusy = false;
+      if (res.code !== 200 || !res.j){
+        prefErr('❌ 读取偏好失败（HTTP ' + res.code + '）' + prefErrHint());
+        return;
+      }
+      prefErr('');
+      prefApply(res.j, !!manual);
+      if (manual) showToast('ok', '已重新读取偏好（配置 ' + prefLine(res.j.config_version) + '）');
+    })
+    .catch(function(){
+      _prefBusy = false;
+      prefErr('❌ 读取偏好失败：后端不可达' + prefErrHint());
+    });
+}
+function prefPickChoice(v){
+  _prefSel = v;
+  _prefDirty = !(_prefData && _prefData.preference === v);
+  if (_prefData) renderPreferencePanel(_prefData);
+  prefStamp();
+}
+function prefSetBtns(busy){
+  ['pref_save_btn', 'pref_default_btn', 'pref_undo_btn', 'pref_reload_btn'].forEach(function(id){
+    const b = $(id); if (b) b.disabled = !!busy;
+  });
+}
+// 偏好修改的唯一入口：POST /api/preferences —— 每次修改都由后端生成新 config_version 并落盘
+function prefPost(payload, okText){
+  if (_prefPosting) return;
+  _prefPosting = true;
+  prefSetBtns(true);
+  fetch('/api/preferences', {method:'POST', headers:{'Content-Type':'application/json'},
+                             body: JSON.stringify(payload)})
+    .then(r => r.json().then(j => ({code: r.status, j: j})).catch(() => ({code: r.status, j: null})))
+    .then(function(res){
+      _prefPosting = false;
+      prefSetBtns(false);
+      if (!res.j){
+        prefErr('❌ 偏好修改失败（HTTP ' + res.code + '）—— 配置未改动');
+        showToast('err', '偏好修改失败：后端返回无法解析（HTTP ' + res.code + '）');
+        return;
+      }
+      if (res.code !== 200){
+        prefErr('❌ 偏好修改被拒绝：' + prefLine(res.j.msg));
+        showToast('err', res.j.msg || ('偏好修改被拒绝（HTTP ' + res.code + '）'));
+        prefApply(res.j, true);                // 错误响应同样带完整快照（含现有版本列表）
+        return;
+      }
+      prefErr('');
+      _prefDirty = false;
+      prefApply(res.j, true);
+      showToast('ok', okText ? okText(res.j) : (res.j.msg || '偏好已更新'));
+      renderPromptLine();                      // week9 状态行立刻反映新偏好（不等下一轮轮询）
+    })
+    .catch(function(){
+      _prefPosting = false;
+      prefSetBtns(false);
+      prefErr('❌ 偏好修改失败：后端不可达 —— 配置未改动');
+      showToast('err', '偏好修改失败：后端不可达 —— 配置未改动');
+    });
+}
+function savePreference(){
+  if (!_prefSel) return;
+  if (_prefData && _prefData.preference === _prefSel){
+    showToast('ok', '当前偏好已经是「' + prefLine(_prefData.preference_short) + '」，无需保存');
+    return;
+  }
+  prefPost({action:'save', preference:_prefSel}, function(j){
+    return j.changed === false ? (j.msg || '无需保存')
+      : ('已保存偏好「' + prefLine(j.preference_short) + '」→ 配置 ' + prefLine(j.config_version)
+         + '（上一版 ' + prefLine(j.previous_config_version) + ' 可撤回 / 可回退）');
+  });
+}
+function restorePreferenceDefault(){
+  prefPost({action:'restore_default'}, function(j){
+    return j.changed === false ? (j.msg || '当前已是默认配置 v1')
+      : ('已恢复默认：偏好「' + prefLine(j.preference_short) + '」，配置版本重置为 ' + prefLine(j.config_version));
+  });
+}
+function undoPreference(){
+  if (_prefData && _prefData.undo && !_prefData.undo.available){
+    showToast('ok', '没有可撤回的修改（当前仍是系统默认配置 v1）');
+    return;
+  }
+  prefPost({action:'undo'}, function(j){
+    return j.changed === false ? (j.msg || '没有可撤回的修改')
+      : ('已撤回上一次修改：偏好「' + prefLine(j.preference_short) + '」，新配置 ' + prefLine(j.config_version));
+  });
+}
+function rollbackPreference(ver){
+  prefPost({action:'rollback', version:ver}, function(j){
+    return j.changed === false ? (j.msg || ('配置 ' + ver + ' 无需回退'))
+      : ('已回退到历史版本 ' + ver + '：偏好「' + prefLine(j.preference_short) + '」，新配置 ' + prefLine(j.config_version));
+  });
+}
+// 指针按在本面板里时暂缓重绘：保证选项点击 / 按钮点击不被 2s 轮询重绘“吃掉”（下一轮再画）
+document.addEventListener('mousedown', function(e){
+  const t = e && e.target;
+  _prefPointerDown = !!(t && t.closest && t.closest('#pref_card'));
+});
+document.addEventListener('mouseup', function(){ _prefPointerDown = false; });
+document.addEventListener('touchstart', function(e){
+  const t = e && e.target;
+  _prefPointerDown = !!(t && t.closest && t.closest('#pref_card'));
+}, {passive: true});
+document.addEventListener('touchend', function(){ _prefPointerDown = false; });
+loadPreferences(true);                                  // week12: 首帧立刻取一次（不必等 2s）
+setInterval(loadPreferences, PREF_POLL_MS);             // week12: 每 2 秒同步一次偏好快照
+
+// 面板渲染（全部取后端原文；前端只负责排版与状态标注）
+function renderPreferencePanel(d){
+  renderPrefHead(d);
+  renderPrefOptions(d);
+  renderPrefChain(d);
+  renderPrefLog(d);
+  renderPrefHistory(d);
+}
+function renderPrefHead(d){
+  const eff = d.effect || {};
+  const head = $('pref_headline');
+  if (head){
+    head.innerHTML = '<span class="pref-ver" title="当前生效的偏好配置版本（config_version）">配置 '
+      + esc(prefLine(d.config_version)) + '</span> <span class="pref-state ' + (eff.popup ? 'on' : 'off') + '">'
+      + (eff.popup ? '会弹窗提醒' : '不弹窗（只亮黄条）') + '</span> <span class="pref-hl">'
+      + esc(prefLine(d.preference_label)) + '</span> <span class="mono">（来源：' + esc(prefLine(d.source_label))
+      + (d.updated_at ? (' · ' + esc(d.updated_at)) : '') + '）</span>';
+  }
+  const vp = $('pref_ver_pill'); if (vp) vp.innerText = '配置 ' + prefLine(d.config_version);
+  const sp = $('pref_state_pill');
+  if (sp){
+    sp.innerText = eff.popup ? '🟢 允许弹窗' : '🟡 仅黄条（不弹窗）';
+    sp.className = 'pill ' + (eff.popup ? 'pill-info' : 'pill-err');
+  }
+  const cd = $('pref_choice_desc');
+  if (cd) cd.innerText = '保存后立刻生效：后端 /api/prompt_check 在弹窗【之前】会先读这份偏好（前端无法绕过；'
+    + 'week11 追问的闸门同样先读它）。';
+  const cc = $('pref_choice_cnt');
+  if (cc) cc.innerText = (d.choices || []).length + ' 个选项 · 当前生效 ' + prefLine(d.preference);
+  const ef = $('pref_effect_line');
+  if (ef){
+    ef.innerHTML = '影响 → week9 主动询问：' + esc(prefLine(eff.against_week9)) + '；week11 追问：'
+      + esc(prefLine(eff.against_week11)) + '；遵守「忽略后 30s 静默期」：' + (eff.respect_cooldown ? '是' : '否');
+  }
+}
+function renderPrefOptions(d){
+  const list = $('pref_opts');
+  if (list){
+    list.innerHTML = (d.choices || []).map(function(c){
+      const on = (c.value === _prefSel), isCur = (c.value === d.preference);
+      return '<label class="pref-opt' + (on ? ' on' : '') + '">'
+        + '<input type="radio" name="pref_choice" value="' + esc(prefArg(c.value)) + '"' + (on ? ' checked' : '')
+        + ' onchange="prefPickChoice(\'' + esc(prefArg(c.value)) + '\')">'
+        + '<div class="pref-opt-b"><div class="pref-opt-t">' + esc(prefLine(c.label))
+        + (isCur ? '<span class="pref-tag">当前生效</span>' : '')
+        + (c.is_default ? '<span class="pref-tag">默认 v1</span>' : '')
+        + '<span class="pref-tag">' + (c.popup ? '会弹窗' : '不弹窗') + '</span></div>'
+        + '<div class="pref-opt-d">' + esc(prefLine(c.desc)) + '</div></div></label>';
+    }).join('');
+  }
+  const sb = $('pref_save_btn');
+  if (sb){
+    sb.disabled = !!_prefPosting || !_prefDirty;
+    sb.innerText = _prefDirty ? '💾 保存偏好（有未保存的选择）' : '💾 保存偏好';
+  }
+  const db = $('pref_default_btn'); if (db) db.disabled = !!_prefPosting;
+  const ub = $('pref_undo_btn');
+  if (ub){
+    const u = d.undo || {};
+    ub.disabled = !!_prefPosting || !u.available;
+    ub.title = u.available ? ('撤回 → 回到配置 ' + prefLine(u.target_version) + '（' + prefLine(u.target_label) + '）')
+                           : '没有可撤回的修改';
+  }
+}
+// ② 决策链路：修改偏好 → 触发抓拍失败 → 系统检查偏好 → 决定（时间戳全部来自后端）
+function renderPrefChain(d){
+  const box = $('pref_chain'), cnt = $('pref_chain_cnt');
+  const ld = d.last_decision;
+  if (cnt) cnt.innerText = (ld && (ld.chain || []).length) ? ((ld.chain || []).length + ' 步') : '--';
+  if (!box) return;
+  if (!ld){
+    box.innerHTML = '<div class="pref-empty">还没有决策记录：等一次采集判定“画面不可用”后，'
+      + '这里会显示“改偏好 → 触发抓拍失败 → 系统检查偏好 → 决定”的完整链路。</div>';
+    return;
+  }
+  box.innerHTML = '<div class="pref-ev"><span class="pref-ev-k decision">最近决定 '
+    + esc(prefLine(ld.time)) + '</span><div class="pref-ev-b"><div class="pref-ev-t">'
+    + esc(prefLine(ld.decision)) + '</div><div class="pref-ev-m mono">绑定采集 ' + esc(prefLine(ld.request_id))
+    + ' · 触发原因 ' + esc(prefLine(ld.verdict_reason)) + ' · 依据配置 ' + esc(prefLine(ld.config_version))
+    + '（' + esc(prefLine(ld.preference_short)) + '）· 来源 ' + esc(prefLine(ld.stage)) + '</div>'
+    + '<div class="pref-chain">' + (ld.chain || []).map(function(x, i){
+        return '<div class="pref-chain-r"><b>' + (i + 1) + '. ' + esc(prefLine(x.time)) + '</b> '
+          + esc(prefLine(x.text)) + '</div>';
+      }).join('') + '</div></div></div>';
+}
+// ③ 决策日志（倒序展示最近几条；每条都带 kind / 时间 / 配置版本 / 追责字段）
+function renderPrefLog(d){
+  const box = $('pref_log'), cnt = $('pref_log_cnt');
+  if (cnt) cnt.innerText = '展示 ' + (d.events || []).length + ' / 共 ' + prefLine(d.event_count) + ' 条';
+  if (!box) return;
+  const evs = (d.events || []).slice().reverse();
+  box.innerHTML = evs.length ? evs.map(function(e){
+    return '<div class="pref-ev"><span class="pref-ev-k ' + esc(prefArg(e.kind)) + '">' + esc(prefEvLabel(e.kind))
+      + '</span><div class="pref-ev-b"><div class="pref-ev-t">' + esc(prefLine(e.text)) + '</div>'
+      + '<div class="pref-ev-m mono">' + esc(prefLine(e.time)) + ' · 配置 ' + esc(prefLine(e.config_version))
+      + (e.request_id ? (' · 采集 ' + esc(e.request_id)) : '')
+      + (e.memory_key ? (' · 已记住 ' + esc(e.memory_key) + ' ×' + esc(prefLine(e.memory_count))) : '')
+      + '</div>' + (e.detail ? ('<div class="pref-ev-m">' + esc(e.detail) + '</div>') : '')
+      + '</div></div>';
+  }).join('') : '<div class="pref-empty">暂无日志。</div>';
+}
+// ④ 版本历史（可回退到任意历史版本）+ 持久化位置 + “系统记住了什么”
+function renderPrefHistory(d){
+  const hl = $('pref_history'), hc = $('pref_hist_cnt');
+  const hs = d.history || [], u = d.undo || {};
+  if (hc) hc.innerText = prefLine(d.history_count) + ' 个历史版本 · 撤回 ' + (u.available ? '可用' : '不可用');
+  if (hl){
+    hl.innerHTML = hs.length ? hs.map(function(h){
+      const isCur = (h.config_version === d.config_version);
+      return '<div class="pref-hist' + (isCur ? ' cur' : '') + '">'
+        + '<span class="mono">' + esc(prefLine(h.config_version)) + '</span>'
+        + '<span>' + esc(prefLine(h.preference)) + '</span>'
+        + '<span class="pref-tag">' + esc(prefLine(h.source_label)) + '</span>'
+        + '<span class="mono">' + esc(prefLine(h.changed_at)) + '</span>'
+        + (isCur ? '<span class="pref-tag">当前生效</span>'
+                 : '<span class="pref-hist-m"><button class="pref-btn ghost" onclick="rollbackPreference(\''
+                   + esc(prefArg(h.config_version)) + '\')">↩️ 回退到此版本</button></span>')
+        + '</div>';
+    }).join('') : '<div class="pref-empty">还没有历史版本（当前是系统默认配置 v1 —— 默认配置同样已落盘）。</div>';
+  }
+  const stl = $('pref_storage_line');
+  if (stl){
+    const s = d.storage || {};
+    stl.innerHTML = '持久化：<span class="mono">' + esc(prefLine(s.file)) + '</span>（' + esc(prefLine(s.format))
+      + ' · ' + (s.exists ? '已落盘' : '未落盘') + ' · 本次运行写入 ' + prefLine(s.writes) + ' 次 · '
+      + esc(prefLine(s.atomic)) + '）';
+  }
+  const mb = $('pref_memory');
+  if (mb){
+    const mem = d.memory || {}, labels = d.memory_labels || {}, keys = Object.keys(labels);
+    mb.innerHTML = '<div class="pref-kv"><span>已记住的选择共 ' + prefLine(d.memory_total) + ' 次</span>'
+      + keys.map(function(k){ return '<span>' + esc(prefLine(labels[k])) + ' ' + (mem[k] || 0) + '</span>'; }).join('')
+      + '</div>';
+  }
+}
 
 // ============ Week6: request-id isolation, clarification & stop ============
 let _currentRequestId = null;    // id of the live task (text or voice)
