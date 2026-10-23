@@ -390,6 +390,62 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
   border:1px solid var(--line); background:rgba(11,18,32,.5); font-size:11.5px; color:var(--dim);}
 .pref-hist.cur{border-color:rgba(34,211,238,.5); background:rgba(34,211,238,.08);}
 .pref-hist-m{margin-left:auto;}
+/* ---- week14: 断网感知 / 本地缓存队列 / 恢复后补传（本地已保存 ⇄ 远端待接收） ---- */
+.btn-net{padding:6px 11px; border-radius:999px; border:1px solid rgba(148,163,184,.35); background:rgba(148,163,184,.1);
+  color:var(--dim); font-size:12px; font-weight:700; cursor:pointer; white-space:nowrap; transition:filter .15s;}
+.btn-net:hover{filter:brightness(1.25);}
+.btn-net.offline{border-color:rgba(248,113,113,.55); background:rgba(248,113,113,.14); color:var(--red);}
+.btn-net.busy{opacity:.55; cursor:progress;}
+.net-wrap{display:flex; flex-direction:column; gap:12px;}
+.net-bar{padding:9px 12px; border-radius:10px; border:1px solid var(--line); background:rgba(11,18,32,.55);
+  font-size:13px; line-height:1.7;}
+.net-btn-row{display:flex; gap:9px; flex-wrap:wrap; margin-top:9px;}
+.net-btn{padding:9px 13px; border-radius:9px; border:1px solid var(--line); background:var(--card2); color:var(--txt);
+  font-size:12.5px; font-weight:700; cursor:pointer;}
+.net-btn:disabled{opacity:.4; cursor:not-allowed;}
+.net-btn.danger{background:rgba(248,113,113,.14); border-color:rgba(248,113,113,.45); color:var(--red);}
+.net-btn.ok{background:rgba(52,211,153,.14); border-color:rgba(52,211,153,.45); color:var(--green);}
+.net-btn.ghost{background:transparent; color:var(--dim);}
+.net-queue{display:flex; flex-direction:column; gap:7px;}
+.net-item{display:flex; align-items:center; gap:9px; padding:8px 11px; border-radius:10px; flex-wrap:wrap;
+  border:1px solid var(--line); background:rgba(11,18,32,.5); font-size:11.5px; color:var(--dim);}
+.net-item.pending{border-left:3px solid var(--dim2); background:rgba(148,163,184,.07);}
+.net-item.missing{border-left:3px solid var(--yellow); background:rgba(251,191,36,.07);}
+.net-item.done{border-left:3px solid var(--green); background:rgba(52,211,153,.07);}
+.net-item-m{margin-left:auto; font-family:Consolas,monospace; font-size:10.8px; color:var(--dim2);}
+.net-tag{font-size:10.5px; font-weight:700; padding:2px 8px; border-radius:999px; border:1px solid var(--line);
+  color:var(--dim2); white-space:nowrap;}
+.net-tag.pending{color:var(--dim2); border-color:rgba(148,163,184,.5); background:rgba(148,163,184,.12);}
+.net-tag.done{color:var(--green); border-color:rgba(52,211,153,.5); background:rgba(52,211,153,.12);}
+.net-tag.missing{color:var(--yellow); border-color:rgba(251,191,36,.5); background:rgba(251,191,36,.12);}
+.net-tag.busy{color:var(--cyan); border-color:rgba(34,211,238,.5); background:rgba(34,211,238,.12);}
+.net-empty{padding:9px 10px; font-size:12px; line-height:1.7; color:var(--dim2);}
+.net-progress{position:relative; height:23px; margin-top:9px; border-radius:999px; overflow:hidden;
+  border:1px solid rgba(34,211,238,.4); background:rgba(11,18,32,.6);}
+.net-progress-fill{position:absolute; top:0; bottom:0; left:0; background:linear-gradient(90deg,#22d3ee,#0ea5e9); opacity:.35;}
+.net-progress span{position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  font-size:11.5px; font-weight:700;}
+.net-ev{display:flex; gap:9px; padding:8px 10px; border-radius:9px; border:1px solid var(--line);
+  background:rgba(11,18,32,.5); font-size:11.5px; line-height:1.65;}
+.net-ev-k{flex:0 0 auto; height:fit-content; font-size:10.5px; font-weight:700; padding:2px 8px; border-radius:999px;
+  border:1px solid var(--line); color:var(--dim2);}
+.net-ev-k.offline_enter{color:var(--red); border-color:rgba(248,113,113,.5); background:rgba(248,113,113,.12);}
+.net-ev-k.offline_exit,.net-ev-k.restore_done{color:var(--green); border-color:rgba(52,211,153,.5); background:rgba(52,211,153,.12);}
+.net-ev-k.restore_start,.net-ev-k.restore_item{color:var(--cyan); border-color:rgba(34,211,238,.5); background:rgba(34,211,238,.1);}
+.net-ev-k.restore_fail,.net-ev-k.restore_stop,.net-ev-k.restore_skip{color:var(--yellow); border-color:rgba(251,191,36,.5); background:rgba(251,191,36,.1);}
+.net-ev-b{min-width:0;}
+.net-ev-t{font-weight:700; color:var(--txt);}
+.net-ev-m{margin-top:3px; font-size:10.8px; color:var(--dim2); font-family:Consolas,monospace; word-break:break-all;}
+/* 画廊 / 采集面板里的“待远端接收”灰色标记（离线刚拍的那条一眼可辨） */
+.pcard.pcard-pending{border-style:dashed; border-color:rgba(148,163,184,.5); background:rgba(148,163,184,.07);}
+.pcard.pcard-pending .thumb img{filter:grayscale(.7) brightness(.88);}
+.pcard.pcard-pending .pname{color:var(--dim);}
+.tag-pending{background:rgba(148,163,184,.16); color:#cbd5e1; border:1px dashed rgba(148,163,184,.6);}
+.tag-delivered{background:rgba(52,211,153,.15); color:var(--green); border:1px solid rgba(52,211,153,.4);}
+.tag-missing{background:rgba(251,191,36,.15); color:var(--yellow); border:1px solid rgba(251,191,36,.4);}
+.tag-busy{background:rgba(34,211,238,.15); color:var(--cyan); border:1px solid rgba(34,211,238,.4);}
+.cap-preview .cap-tag.pending{background:rgba(11,18,32,.9); color:#cbd5e1; border:1px dashed rgba(148,163,184,.7);
+  left:8px; right:auto; filter:grayscale(.5);}
 </style>
 </head>
 <body>
@@ -399,6 +455,8 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
   <span class="pill pill-dim">目标节点: esp32s3-eye-01</span>
   <div class="top-right">
     <span class="pill" id="online_pill">● 检测中</span>
+    <span class="pill" id="net_pill" title="远端投递通道状态（/api/network/status）：断网时新采集先进本地队列（💾 本地已保存 · ⏳ 远端待接收），恢复后自动按原始采集时间补传">🟢 在线</span>
+    <button class="btn-net" id="net_toggle_btn" onclick="toggleNetwork()" title="手动模拟断网 / 恢复网络（等价于系统变量 NETWORK_SIMULATED_OFFLINE）">🔌 模拟断网</button>
     <span class="clock" id="clock">--:--:--</span>
   </div>
 </header>
@@ -658,6 +716,60 @@ button.btn:disabled{opacity:.4; cursor:not-allowed; filter:none;}
       </div>
     </div>
   </section>
+<!-- week14: 断网感知 · 本地缓存队列 · 恢复后补传（本地已保存 ⇄ 远端待接收） -->
+  <section class="card gallery-card" id="net_card">
+    <div class="card-h"><span class="card-t">🔌 网络与补传（本地已保存 · 远端待接收）</span>
+      <span class="pill pill-live" id="net_state_pill" title="远端投递通道状态（/api/network/status.mode）">状态 --</span>
+      <span class="pill pill-dim" id="net_pending_pill" title="本地队列里“待远端接收”的条数：断网期间收集，恢复后按原始采集时间依次补传">待发送 -- 条</span>
+      <span class="pill pill-dim mono" id="net_poll_pill" style="margin-left:auto">轮询 2s · 等待首次读取</span>
+    </div>
+    <div class="net-wrap">
+      <div class="net-bar"><span id="net_headline">⏳ 正在读取 /api/network/status …</span></div>
+      <div class="ctx-err" id="net_err" style="display:none">--</div>
+
+      <div class="ctx-layer net">
+        <div class="ctx-layer-h"><span class="ctx-n">①</span><span>网络模拟开关（系统变量 NETWORK_SIMULATED_OFFLINE）</span>
+          <span class="ctx-cnt" id="net_mode_cnt">--</span></div>
+        <div class="ctx-layer-d" id="net_mode_desc">--</div>
+        <div class="net-btn-row">
+          <button class="net-btn danger" id="net_off_btn" onclick="setNetworkOffline(true)">🔌 模拟断网</button>
+          <button class="net-btn ok" id="net_on_btn" onclick="setNetworkOffline(false)">✅ 恢复网络（自动补传）</button>
+          <button class="net-btn ghost" id="net_restore_btn" onclick="restoreNow()">⬆️ 立即补传</button>
+          <button class="net-btn ghost" id="net_reload_btn" onclick="loadNetwork(true)">🔄 重新读取</button>
+        </div>
+        <div class="ctx-layer-d" id="net_effect_line">--</div>
+      </div>
+
+      <div class="ctx-layer net">
+        <div class="ctx-layer-h"><span class="ctx-n">②</span><span>待发送队列（本地已保存 · 远端待接收）</span>
+          <span class="ctx-cnt" id="net_queue_cnt">--</span></div>
+        <div class="ctx-layer-d">断网期间每一条采集结果（成功 / 失败）都进本地队列；补传顺序按 <b>原始采集时间</b> 升序，
+          板端没上报采集时间的条目用本地排队时间兜底，且逐条标注来源。</div>
+        <div class="ctx-list net-queue" id="net_queue"><div class="net-empty">⏳ 正在读取本地队列…</div></div>
+      </div>
+
+      <div class="ctx-layer net">
+        <div class="ctx-layer-h"><span class="ctx-n">③</span><span>补传进度与记录（恢复后按原始采集时间依次补传）</span>
+          <span class="ctx-cnt" id="net_restore_cnt">--</span></div>
+        <div class="net-progress" id="net_progress" style="display:none">
+          <div class="net-progress-fill" id="net_progress_fill" style="width:0%"></div>
+          <span id="net_progress_txt">--</span>
+        </div>
+        <div class="ctx-list" id="net_restore"><div class="net-empty">⏳ 正在读取补传进度…</div></div>
+        <div class="ctx-layer-d">事件日志（断网 / 进队 / 补传 / 失败 —— 由后端持久化记录，倒序展示）</div>
+        <div class="ctx-list" id="net_log"><div class="net-empty">⏳ 正在读取事件日志…</div></div>
+      </div>
+
+      <div class="ctx-foot" id="net_foot">
+        <b>口径：</b>模拟的是 <b>远端投递通道</b>（不是板端 ↔ 本机的 LAN）：断网时板端照常上传、图片照常落盘、
+        week7~week12 的遮挡判定 / 主动询问 / 偏好闸门一个字都不变 —— 只有“远端是否已接收”变成
+        <span class="mono">pending_upload</span>（本地已保存 · 远端待接收）；恢复网络由后台线程
+        <span class="mono">net-restore</span> 按原始采集时间（<span class="mono">collected_at</span>）升序补传，
+        逐条记录补传时间（<span class="mono">delivered_at_ms</span>）；本地副本已被清理的条目如实报
+        <span class="mono">missing_local</span> 并保留记录，绝不假装送达。
+      </div>
+    </div>
+  </section>
 </main>
 <!-- week9: 主动询问交互框（视觉判定“画面不可用”时弹出；与本次采集 request_id/prompt_id 强绑定） -->
 <div class="prompt-mask" id="prompt_mask" role="dialog" aria-modal="true" aria-labelledby="prompt_title">
@@ -739,6 +851,7 @@ let _capAvgGray = null;        // 本次采集的平均灰度（用于告警文�
 let _capResult = null;         // 本次采集的图片条目（照片名/灰度/毫秒时间）
 let _capLockTimer = null;      // 连续失败 30s 锁定倒计时
 let _capLockRemaining = 0;
+let _capDelivery = null;       // week14: 本次采集的投递状态（在线直传 / 断网待远端接收 / 未送达）
 
 function newCaptureId(){ return 'cap_web_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8); }
 function labelTrigger(t){ return TRIGGER_LABEL[t] || t || '--'; }
@@ -785,6 +898,14 @@ function renderCaptureState(){
     }
     if (st === 'TIMEOUT') t += '（超过 ' + (CAPTURE_TIMEOUT_MS / 1000) + ' 秒未收到图片）';
     if (st === 'FAIL' && _capFailDetail) t += '（' + _capFailDetail + '）';
+    // week14: 本地已保存 / 远端待接收 / 已补传 —— 采集状态行如实带上投递结论
+    if (_capDelivery && _capDelivery.status === 'pending_upload'){
+      t += '　💾 本地已保存 · ⏳ 远端待接收';
+    } else if (_capDelivery && _capDelivery.status === 'missing_local'){
+      t += '　⚠️ 未送达（本地副本已清理）';
+    } else if (_capDelivery && _capDelivery.delivered_at && st === 'COMPLETED'){
+      t += '　✅ 远端已接收（' + _capDelivery.delivered_at + '）';
+    }
     txt.innerText = t;
   }
   const ridPill = $('capture_rid_pill');
@@ -950,6 +1071,9 @@ function renderCaptureFromStatus(cap){
   _capState = st;
   // week7 fix(Bug1): blocked / unusable 任一为真都要亮黄色遮挡告警（<500B 空帧走 unusable 分支）
   _capBlocked = !!(cap.blocked || cap.unusable);
+  // week14: 本次采集的投递状态（只按后端回传原文显示，前端不猜“远端收到没有”）
+  _capDelivery = {status: cap.delivery_status || null, label: cap.delivery_label || null,
+                  delivered_at: cap.delivered_at || null, queued_at: cap.queued_at || null};
   if (cap.avg_gray != null) _capAvgGray = cap.avg_gray;
   if (st === 'TIMEOUT' || st === 'FAIL'){
     _capFailDetail = cap.detail || (st === 'TIMEOUT' ? '超过 10 秒未收到图片' : '设备返回错误');
@@ -974,7 +1098,10 @@ function updateCapturePreview(photos){
   }
   if (mine.status === 'stored' && mine.url){
     const bad = !!(mine.blocked || mine.unusable);   // week7 fix(Bug1): 遮挡/空帧都要标黄
-    const changed = (!_capResult || _capResult.name !== mine.name);
+    // week14: 投递状态变化也要立刻重绘（“待远端接收” → “🔄 补传中 / ✅ 已接收”）
+    const changed = (!_capResult || _capResult.name !== mine.name
+      || (_capResult.delivery_status || '') !== (mine.delivery_status || '')
+      || (_capResult.delivered_at || '') !== (mine.delivered_at || ''));
     _capResult = mine;
     _capBlocked = bad;
     if (mine.avg_gray != null) _capAvgGray = mine.avg_gray;
@@ -1011,10 +1138,18 @@ function paintCapturePreview(mine){
   if (!mine.url){ _capPreviewDirty = false; return; }   // 失败记录没有图 → 保留“未产生图片”文案
   const bad = !!(mine.blocked || mine.unusable);
   const ignored = isIgnoredRetake(mine);
+  // week14: 投递状态写进标签（💾 本地已保存 · ⏳ 待远端接收 → 🔄 补传中... → ✅ 已接收）
+  const dv = mine.delivery_status || 'delivered';
+  const dvBusy = _netRestoreRunning && dv === 'pending_upload';
+  const dvTxt = dvBusy ? ' · 🔄 补传中...'
+    : (dv === 'pending_upload' ? ' · 💾 本地已保存 · ⏳ 待远端接收'
+       : (dv === 'missing_local' ? ' · ⚠️ 未送达（本地副本已清理）'
+          : (' · ✅ 已接收' + (mine.delivery_mode === 'restore'
+              ? ('（补传 ' + netLine(mine.delivered_at) + '）') : ''))));
   box.innerHTML = '<img src="' + mine.url + '" alt="本次采集">'
-    + '<span class="cap-tag' + (bad ? ' warn' : '') + '">'
+    + '<span class="cap-tag' + (bad ? ' warn' : (dv === 'pending_upload' ? ' pending' : '')) + '">'
     + (bad ? '⚠️ 画面不可用 · ' : '') + (ignored ? '🚫 已忽略重拍建议 · ' : '')
-    + esc(mine.name) + '</span>';
+    + esc(mine.name) + dvTxt + '</span>';
   _capPreviewDirty = false;
 }
 
@@ -1701,6 +1836,8 @@ function updateStatus(st){
   const op=$('online_pill');
   if (devOffline){ op.innerText='● 离线（无心跳）'; op.className='pill pill-err'; }
   else { op.innerText='● 在线 (LAN)'; op.className='pill pill-live'; }
+  // week14: 远端投递通道（断网 / 待发送条数）—— 与“设备在线”胶囊分开显示，绝不混为一谈
+  if (st.network) netPill(st.network);
   setImuOffline(devOffline);        // 离线 → 立即冻结 IMU 波形并停止刷新模拟数据
   const link=$('dev_link');
   if (link){
@@ -1769,6 +1906,16 @@ function renderGallery(photos){
     const trig = labelTrigger(p.trigger);
     const rid = p.request_id ? esc(p.request_id) : '--';
     const when = p.time_ms_str || p.time_str || '--';
+    // week14: 投递状态（本地已保存 ⇄ 远端待接收）—— 断网时刚拍的这条必须一眼看出“待远端接收”
+    const dv = p.delivery_status || 'delivered';
+    const dvBusy = _netRestoreRunning && dv === 'pending_upload';
+    const dvTag = '<span class="tag tag-' + netDvCls(dv, dvBusy) + '" title="投递状态：'
+      + (dv === 'pending_upload' ? '本地已保存（已落盘 / 已记账），远端投递通道断网 → 恢复后按原始采集时间补传'
+         : dv === 'missing_local' ? '恢复后补传时本地副本已不存在 → 如实报未送达，记录保留'
+         : '远端已接收（在线直传 = 接收时刻；恢复后补传 = 补传时刻）') + '">' + netDvLabel(dv, dvBusy) + '</span>';
+    const dvRow = '<div class="prow psub" title="本地已保存 · 远端待接收 / ✅ 已接收"><span>' + dvTag + '</span>'
+      + (p.delivered_at ? ('<span class="mono">📤 投递 ' + esc(p.delivered_at) + '</span>')
+                        : (p.queued_at ? ('<span class="mono">🧺 排队 ' + esc(p.queued_at) + '</span>') : '')) + '</div>';
     if (p.status==='failed'){
       const reason = p.reason==='timeout' ? '设备超时（10s 内未收到图片）'
                    : p.reason==='offline' ? '设备未联机（指令未下发）'
@@ -1784,6 +1931,7 @@ function renderGallery(photos){
           '<div class="prow psub mono ptimes" title="服务器接收时间（权威）"><span>🛰 接收 '+esc(p.received_at || when)+'</span></div>'+
           '<div class="prow psub"><span><button class="btn-mini" onclick="openObsPanel(\''+w10Arg(p.request_id)+'\',\'\')" title="这条失败记录的观测对照（时间/位置/来源）">🔍 观测对照</button></span></div>'+
           (isIgnoredRetake(p) ? '<div class="prow"><span class="tag tag-ignored" title="用户在主动询问中选择忽略；30 秒内不再弹窗">🚫 用户已忽略重拍建议</span></div>' : '')+
+          dvRow +
         '</div></div>';
     }
     const tag = p.status==='stored' ? '<span class="tag tag-stored">已入库</span>' : '<span class="tag tag-cleaned">已清理</span>';
@@ -1793,7 +1941,9 @@ function renderGallery(photos){
       : '<div class="placeholder"><div class="icon">📦</div><div>配额到期已清除原图</div><div>元数据与哈希完整保留</div></div>';
     const sizeTxt = p.status==='stored' ? fmtSize(p.size) : '已清理';
     const grayTxt = (p.avg_gray != null) ? ('灰度 '+p.avg_gray) : '';
-    return '<div class="pcard'+(p.blocked?' pcard-warn':'')+(isIgnoredRetake(p)?' pcard-ignored':'')+'">'+thumb+
+    // week14: pending → 卡片走灰色虚线样式（本地已保存、远端待接收）
+    return '<div class="pcard'+(p.blocked?' pcard-warn':'')+(isIgnoredRetake(p)?' pcard-ignored':'')
+      +(dv === 'pending_upload' ? ' pcard-pending' : '')+'">'+thumb+
       '<div class="pmeta"><div class="prow"><span class="pname" title="'+esc(p.name)+'">'+esc(p.name)+'</span>'+tag+'</div>'+
       '<div class="prow psub"><span>🕒 '+esc(when)+'</span><span>'+sizeTxt+'</span></div>'+
       '<div class="prow psub"><span>🎯 '+esc(trig)+'</span>'+(grayTxt?'<span>'+grayTxt+'</span>':'')+'</div>'+
@@ -1803,7 +1953,7 @@ function renderGallery(photos){
       '<div class="prow psub mono ptimes" title="浏览器展示刷新时间（displayed_at，由 /api/display_ack 上报）"><span>🖥 展示 '+(p.displayed_at ? esc(p.displayed_at)+(p.display_latency_ms!=null?(' · 刷新 +'+p.display_latency_ms+'ms'):'') : '未回执（点🔍对照上报）')+'</span></div>'+
       '<div class="prow psub" title="'+(p.location_fix ? '本次观测有位置解（与 request_id 绑定）' : esc(p.location_note||'本次无位置数据（no_fix）—— 不使用历史位置顶替'))+'"><span class="'+(p.location_fix?'':'w10-nofix')+'">📍 '+(p.location_fix ? ('已定位 '+(((p.location||{}).latitude!=null) ? ((p.location||{}).latitude+', '+(p.location||{}).longitude) : '经纬度 --')) : '本次无位置数据（no_fix）')+'</span></div>'+
       '<div class="prow psub"><span><button class="btn-mini" onclick="openObsPanel(\''+w10Arg(p.request_id)+'\',\''+w10Arg(p.name)+'\')" title="原图 + 采集/接收/展示三时间 + 推理耗时 + 位置观测">🔍 原始数据观测对照</button></span></div>'+
-      aiCardLine(p)+'</div></div>';
+      dvRow + aiCardLine(p)+'</div></div>';
   }).join('');
 }
 // ======================================================================
@@ -2107,7 +2257,14 @@ function refresh(){
           showToast('err', '⚠️ 画面可能被遮挡或采集失败，请检查');
           // week9: 遮挡/偏黑 = 画面不可用 → 让后端判定是否【主动询问重拍】（黄条照旧保留）
           proactivePromptCheck({ request_id: _capRid, filename: cap.photo || null });
-        } else showToast('ok','✅ 本次采集完成 · 图片已入库');
+        } else if (cap.delivery_status === 'pending_upload'){
+          // week14: 离线时如实显示【本地已保存 · 远端待接收】，绝不冒充“已入库 / 已接收”
+          showToast('ok', '💾 本地已保存 · ⏳ 待远端接收（离线，恢复后自动按原始采集时间补传）');
+        } else if (cap.delivery_status === 'missing_local'){
+          showToast('err', '⚠️ 未送达：本地副本已清理（记录保留，绝不假装送达）');
+        } else {
+          showToast('ok','✅ 本次采集完成 · 本地已保存且远端已接收');
+        }
       }
       else if (st.status==='TIMEOUT'||st.status==='FAIL') showToast('err','❌ 采集失败：设备超时/错误');
     }
@@ -2758,6 +2915,336 @@ function renderPrefHistory(d){
   }
 }
 
+// ============ Week14: 断网感知 · 本地缓存队列 · 恢复后补传 ============
+// 任务书要求“断网时明确告知，恢复后正确补传”，前端只做三件事，绝不自己编网络状态：
+//   * 状态只信后端：/api/status.network（顶部胶囊，2s 快照）+ /api/network/status（本卡片，明细）；
+//   * 断网时抓拍照旧下发（板端 ↔ 本机 LAN 不受影响），但记录显示“💾 本地已保存 · ⏳ 待远端接收”（灰色）；
+//   * 恢复后后端后台线程按原始采集时间补传 → 本页显示“🔄 补传中... X/Y”，完成后变绿色“✅ 已接收”。
+const NET_POLL_MS = 2000;
+let _netData = null;            // 最近一次成功的网络快照（面板渲染唯一数据源）
+let _netSig = '';               // 渲染签名：无实质变化就不重绘（避免打断按钮点击）
+let _netBusy = false;           // 轮询重入保护
+let _netPosting = false;        // 正在提交断网 / 恢复请求（期间不轮询、不重绘）
+let _netPointerDown = false;    // 指针按在本卡片里时暂缓重绘
+let _netPolicy = null;          // /api/status.network（轻量快照，供顶部胶囊使用）
+let _netRestoreRunning = false; // 补传进行中（画廊 / 采集面板据此显示“补传中...”）
+let _netWasRunning = false;     // 上一轮是否在补传（用于检测 running→false 的“补传完成”提示）
+let _netPillSig = '';           // 顶部胶囊签名（避免每 2s 无意义重写 DOM）
+const NET_EV_LABEL = {offline_enter:'断网', offline_exit:'恢复', queue_enter:'进队',
+                      restore_start:'开始补传', restore_item:'补传', restore_done:'补传完成',
+                      restore_skip:'无需补传', restore_stop:'中途停止', restore_fail:'补传失败'};
+const NET_DV_LABEL = {delivered:'✅ 已接收', pending_upload:'⏳ 待远端接收', missing_local:'⚠️ 未送达'};
+
+function netArg(s){ return String(s == null ? '' : s).replace(/[^A-Za-z0-9_.:+-]/g, ''); }  // 与 w10Arg / prefArg 同口径
+function netLine(v){ return (v == null || v === '') ? '--' : String(v); }
+function netEvLabel(k){ return NET_EV_LABEL[k] || k; }
+function netDvLabel(s, delivering){
+  if (delivering && s === 'pending_upload') return '🔄 补传中...';
+  return NET_DV_LABEL[s] || netLine(s);
+}
+function netDvCls(s, delivering){
+  if (delivering && s === 'pending_upload') return 'busy';
+  return (s === 'pending_upload') ? 'pending' : (s === 'missing_local' ? 'missing' : 'done');
+}
+function netStateLabel(n){
+  if (!n || !n.offline) return '🟢 在线';
+  return '🔴 离线（待发送 ' + netLine(n.pending_count) + ' 条）';
+}
+// 顶部胶囊 + 全局开关按钮：只改文字/样式，绝不整页重绘
+//（与设备在线胶囊分开：一个是“板端 ↔ 本机”链路，一个是“本机 → 远端”投递通道）
+function netPill(n){
+  if (!n) return;
+  _netPolicy = n;
+  _netRestoreRunning = !!(n.restore && n.restore.running);
+  const sig = [n.offline, n.pending_count, n.stuck_count, n.restore && n.restore.running,
+               n.restore && n.restore.done, n.restore && n.restore.total, n.mode].join('#');
+  if (sig === _netPillSig) return;
+  _netPillSig = sig;
+  const pill = $('net_pill'), btn = $('net_toggle_btn');
+  if (pill){
+    pill.innerText = (n.restore && n.restore.running)
+      ? ('🔄 补传中 ' + netLine(n.restore.done) + '/' + netLine(n.restore.total))
+      : netStateLabel(n);
+    pill.className = 'pill ' + (n.offline ? 'pill-err' : 'pill-live');
+  }
+  if (btn){
+    btn.innerText = n.offline ? '✅ 恢复网络' : '🔌 模拟断网';
+    btn.className = 'btn-net' + (n.offline ? ' offline' : '');
+    btn.title = n.offline
+      ? '当前为模拟断网（远端投递通道不可达）：点此恢复网络，恢复后自动按原始采集时间补传'
+      : '点此模拟断网（等价于系统变量 NETWORK_SIMULATED_OFFLINE=True）：新采集先本地保存、远端待接收';
+  }
+}
+function netErr(msg){
+  const box = $('net_err'); if (!box) return;
+  box.style.display = msg ? 'block' : 'none';
+  if (msg) box.innerText = msg;
+}
+function netErrHint(){
+  return _netData ? ('；以下为最后一次成功快照（待发送 ' + netLine(_netData.pending_count) + ' 条），不是当前状态') : '';
+}
+function netSignature(d){
+  const qs = (d.pending || []).map(x => [x.queue_id, x.status, x.attempts].join('|')).join('~');
+  const dl = (d.recent_delivered || []).slice(0, 4).map(x => [x.queue_id, x.uploaded_at_ms].join('|')).join('~');
+  const evs = (d.events || []).map(e => [e.id, e.count, e.ts_ms].join('|')).join('~');
+  const r = d.restore || {}, st = d.storage || {}, c = d.counters || {};
+  return [d.offline, d.pending_count, d.stuck_count, d.pending_bytes, c.resent, st.writes,
+          r.running, r.done, r.total, r.last_result, r.started_ms, r.finished_ms,
+          (d.recent_delivered || []).length, qs, dl, evs].join('#');
+}
+function netStamp(){
+  const p = $('net_poll_pill'); if (!p || !_netData) return;
+  const s = _netData.storage || {};
+  p.innerText = '轮询 ' + (NET_POLL_MS / 1000) + 's · 队列已落盘 ' + netLine(s.writes) + ' 次 · '
+    + netLine(s.file || 'offline_queue.json');
+}
+
+// 快照落地：先同步顶部胶囊；再按渲染签名决定是否重绘面板（force=true 用于手动提交后的强制刷新）
+function netApply(d, force){
+  if (!d || d.status !== 'ok'){ netErr('❌ 网络快照无效（未返回 status=ok）—— 不展示任何猜测数据'); return; }
+  netPill(d);                                  // 顶部胶囊与本卡片共用同一份后端口径
+  if (!force){
+    if (_netPointerDown || _netPosting) return;                         // 不打断正在进行的点击 / 提交
+    if (netSignature(d) === _netSig){ _netData = d; netStamp(); return; }
+  }
+  _netWasRunning = !!(_netData && _netData.restore && _netData.restore.running);
+  _netData = d;
+  _netSig = netSignature(d);
+  renderNetworkPanel(d);
+  netStamp();
+  const running = !!(d.restore && d.restore.running);
+  if (_netWasRunning && !running && !force){    // 补传刚刚结束 → 明确告知（并刷新画廊：灰标记变绿）
+    const r = d.restore || {};
+    showToast('ok', '✅ 补传完成：' + netLine(r.sent) + ' 条已按原始采集时间送达'
+      + (r.failed ? ('（' + r.failed + ' 条未送达，本地副本已清理）') : ''));
+    refresh();
+  }
+  if (_galleryPhotos && _galleryPhotos.length) renderGallery(_galleryPhotos);  // 灰/绿标记随补传进度实时变
+}
+function loadNetwork(manual){
+  if (_netBusy || _netPosting) return;
+  _netBusy = true;
+  fetch('/api/network/status')
+    .then(r => r.json().then(j => ({code: r.status, j: j})).catch(() => ({code: r.status, j: null})))
+    .then(function(res){
+      _netBusy = false;
+      if (res.code !== 200 || !res.j){
+        netErr('❌ 读取网络状态失败（HTTP ' + res.code + '）' + netErrHint());
+        return;
+      }
+      netErr('');
+      netApply(res.j, !!manual);
+      if (manual) showToast('ok', '已重新读取网络状态（' + netStateLabel(res.j) + '）');
+    })
+    .catch(function(){
+      _netBusy = false;
+      netErr('❌ 读取网络状态失败：后端不可达' + netErrHint());
+    });
+}
+function netSetBtns(busy){
+  ['net_off_btn', 'net_on_btn', 'net_restore_btn', 'net_reload_btn'].forEach(function(id){
+    const b = $(id); if (b) b.disabled = !!busy;
+  });
+}
+// 断网 / 恢复的唯一入口：POST /api/network/toggle（恢复时由后端启动后台补传线程）
+function netPost(payload, okText){
+  if (_netPosting) return;
+  _netPosting = true;
+  netSetBtns(true);
+  fetch('/api/network/toggle', {method:'POST', headers:{'Content-Type':'application/json'},
+                                body: JSON.stringify(payload)})
+    .then(r => r.json().then(j => ({code: r.status, j: j})).catch(() => ({code: r.status, j: null})))
+    .then(function(res){
+      _netPosting = false;
+      netSetBtns(false);
+      if (!res.j){
+        netErr('❌ 切换失败（HTTP ' + res.code + '）—— 网络状态未改动');
+        showToast('err', '切换失败：后端返回无法解析（HTTP ' + res.code + '）');
+        return;
+      }
+      if (res.code !== 200){
+        netErr('❌ 切换被拒绝：' + netLine(res.j.msg));
+        showToast('err', res.j.msg || ('切换被拒绝（HTTP ' + res.code + '）'));
+        return;
+      }
+      netErr('');
+      netApply(res.j, true);
+      const txt = (typeof okText === 'function') ? okText(res.j) : (okText || res.j.msg);
+      showToast(res.j.offline ? 'err' : 'ok', txt || res.j.msg || '已切换');
+      refresh();
+    })
+    .catch(function(){
+      _netPosting = false;
+      netSetBtns(false);
+      netErr('❌ 切换失败：后端不可达（网络状态未改动）');
+      showToast('err', '切换失败：后端不可达');
+    });
+}
+function setNetworkOffline(off){
+  netPost({offline: !!off}, function(j){
+    return j.offline
+      ? ('已切到模拟断网：新采集先本地保存，标记 ⏳ 待远端接收（队列 ' + netLine(j.pending_count) + ' 条）')
+      : ('✅ 已恢复网络：' + (j.restore_started ? ('后台补传已启动（' + netLine(j.pending_count) + ' 条）')
+                                                : '本地队列为空，无需补传'));
+  });
+}
+function toggleNetwork(){ netPost({}, null); }
+function restoreNow(){
+  if (_netData && _netData.offline){ showToast('err', '当前是断网（模拟）状态：请先“恢复网络”'); return; }
+  fetch('/api/network/restore', {method:'POST', headers:{'Content-Type':'application/json'},
+                                 body: JSON.stringify({})})
+    .then(r => r.json().then(j => ({code: r.status, j: j})).catch(() => ({code: r.status, j: null})))
+    .then(function(res){
+      if (!res.j){ showToast('err', '补传请求失败（HTTP ' + res.code + '）'); return; }
+      netApply(res.j, true);
+      showToast(res.code === 200 ? 'ok' : 'err', res.j.msg || ('补传请求返回 ' + res.code));
+      refresh();
+    })
+    .catch(function(){ showToast('err', '补传请求失败：后端不可达'); });
+}
+
+// __W14JS_END__
+
+// ---- 面板渲染（全部取后端原文；前端只负责排版与状态标注，绝不自己推断网络状态）----
+function renderNetworkPanel(d){
+  renderNetHead(d);
+  renderNetQueue(d);
+  renderNetRestore(d);
+  renderNetLog(d);
+}
+function renderNetHead(d){
+  const r = d.restore || {}, p = d.policy || {}, st = d.storage || {}, c = d.counters || {};
+  const hl = $('net_headline');
+  if (hl){
+    hl.innerHTML = '<span class="net-tag ' + (d.offline ? 'missing' : 'done') + '">'
+      + esc(netLine(d.mode_label || netStateLabel(d))) + '</span> '
+      + '<b>待发送 ' + esc(netLine(d.pending_count)) + ' 条</b>'
+      + (d.pending_bytes ? ('（本地副本合计 ' + esc(fmtSize(d.pending_bytes)) + '）') : '')
+      + (d.stuck_count ? (' · ⚠️ 未送达 ' + esc(netLine(d.stuck_count)) + ' 条') : '')
+      + (d.offline && d.offline_since ? (' · 断网始于 <span class="mono">' + esc(d.offline_since) + '</span>') : '')
+      + ' · 补传：<b>' + esc(netLine(r.label)) + '</b>';
+  }
+  const sp = $('net_state_pill');
+  if (sp){
+    sp.innerText = d.offline ? ('🔴 离线（待发送 ' + netLine(d.pending_count) + ' 条）') : '🟢 在线（直传远端）';
+    sp.className = 'pill ' + (d.offline ? 'pill-err' : 'pill-live');
+  }
+  const pp = $('net_pending_pill');
+  if (pp){
+    pp.innerText = '待发送 ' + netLine(d.pending_count) + ' 条'
+      + (d.stuck_count ? (' / 未送达 ' + netLine(d.stuck_count)) : '');
+    pp.className = 'pill ' + ((d.pending_count || d.stuck_count) ? 'pill-err' : 'pill-dim');
+    pp.title = '本地队列 ' + netLine(st.file) + '（' + (st.exists ? '已落盘' : '未落盘')
+      + ' · 本次运行写入 ' + netLine(st.writes) + ' 次）';
+  }
+  const mc = $('net_mode_cnt');
+  if (mc) mc.innerText = (d.offline ? '当前：断网模拟' : '当前：在线直传') + ' · 断网 '
+    + netLine(d.offline_rounds) + ' 次 / 补传 ' + netLine(d.restore_rounds) + ' 轮';
+  const md = $('net_mode_desc');
+  if (md) md.innerHTML = '<b>' + esc(netLine(p.env_var)) + '</b> = '
+    + (d.offline ? '<span class="mono">True</span>（模拟断网生效）' : '<span class="mono">False</span>（在线）')
+    + ' · 模拟对象：' + esc(netLine(p.simulate_note));
+  const ef = $('net_effect_line');
+  if (ef) ef.innerHTML = '断网也能看：<b>本地已保存</b>（图片已落盘 / 台账已记录 / week7~week12 判定照常）'
+    + ' · 投递状态：' + esc(netLine((p.delivery_states || {}).pending_upload)) + '（队列 '
+    + esc(netLine(d.pending_count)) + ' 条） / ' + esc(netLine((p.delivery_states || {}).delivered))
+    + '（本次运行 ' + esc(netLine(c.delivered)) + ' 条，其中恢复后补传 ' + esc(netLine(c.resent)) + ' 条）';
+}
+function renderNetQueue(d){
+  const box = $('net_queue'), cnt = $('net_queue_cnt');
+  const qs = d.pending || [], stuck = d.stuck || [];
+  if (cnt){
+    cnt.innerText = '待发送 ' + netLine(d.pending_count) + ' 条'
+      + (stuck.length ? (' · 未送达 ' + netLine(d.stuck_count) + ' 条') : '') + ' · 展示 ' + qs.length;
+  }
+  if (!box) return;
+  const rows = qs.map(function(it){ return netItemHtml(it, d, false); })
+    .concat(stuck.map(function(it){ return netItemHtml(it, d, true); }));
+  box.innerHTML = rows.length ? rows.join('')
+    : '<div class="net-empty">本地队列为空：当前没有“本地已保存但远端待接收”的数据。'
+      + (d.offline ? '（断网状态生效中：下一次采集会先本地保存并进队列）'
+                   : '（在线直传：采集结果直接视为远端已接收）') + '</div>';
+}
+function netItemHtml(it, d, stuck){
+  const delivering = !!(d.restore && d.restore.running) && !stuck;
+  const cls = stuck ? 'missing' : (delivering ? 'pending' : 'pending');
+  const name = it.filename || ('（无图片：' + netLine(it.kind) + ' 采集记录）');
+  return '<div class="net-item ' + cls + '">'
+    + '<span class="mono" title="补传顺序">#' + esc(netLine(it.order_index || it.seq)) + '</span>'
+    + '<span class="net-tag ' + netDvCls(it.status, delivering) + '">'
+    + esc(netDvLabel(it.status, delivering)) + '</span>'
+    + '<span class="mono" title="request_id">' + esc(netLine(it.request_id)) + '</span>'
+    + '<span title="本地副本' + (it.local_exists ? '存在' : '已不存在') + '">' + esc(name) + '</span>'
+    + '<span class="mono" title="排序依据：' + esc(netLine(it.order_source_label)) + '">🧭 '
+    + esc(netLine(it.order_at)) + '</span>'
+    + '<span class="net-item-m">🧺 排队 ' + esc(netLine(it.queued_at)) + ' · 已等 '
+    + esc(netLine(Math.round((it.waited_ms || 0) / 1000))) + 's · 尝试 ' + esc(netLine(it.attempts))
+    + (stuck ? (' · ' + esc(netLine(it.error))) : '') + '</span>'
+    + '</div>';
+}
+
+function renderNetRestore(d){
+  const box = $('net_restore'), cnt = $('net_restore_cnt');
+  const r = d.restore || {};
+  const prog = $('net_progress'), fill = $('net_progress_fill'), txt = $('net_progress_txt');
+  if (prog){
+    prog.style.display = r.running ? 'block' : 'none';
+    if (fill) fill.style.width = netLine(r.percent || 0) + '%';
+    if (txt) txt.innerText = netLine(r.label) + (r.current ? (' · 当前：'
+      + netLine(r.current.filename || r.current.request_id)) : '');
+  }
+  if (cnt) cnt.innerText = r.running ? ('补传中 ' + netLine(r.done) + '/' + netLine(r.total)) : netLine(r.label);
+  if (!box) return;
+  const rows = [];
+  rows.push('<div class="net-bar">补传顺序：<b>' + esc(netLine(r.order_note || (d.policy || {}).sort_by))
+    + '</b><br>触发 <span class="mono">' + esc(netLine(r.trigger)) + '</span> · 开始 <span class="mono">'
+    + esc(netLine(r.started_at)) + '</span> · 结束 <span class="mono">' + esc(netLine(r.finished_at))
+    + '</span> · 已送达 ' + esc(netLine(r.sent)) + ' 条 / 未送达 ' + esc(netLine(r.failed)) + ' 条 · 共 '
+    + esc(netLine(r.total)) + ' 条</div>');
+  if (r.current && r.running){
+    rows.push('<div class="net-item pending"><span class="net-tag busy">🔄 补传中...</span>'
+      + '<span class="mono">#' + esc(netLine(r.current.order_index)) + '/' + esc(netLine(r.order_total)) + '</span>'
+      + '<span>' + esc(netLine(r.current.filename || r.current.request_id)) + '</span>'
+      + '<span class="net-item-m">🧭 原始采集 ' + esc(netLine(r.current.collected_at || r.current.order_at)) + '</span></div>');
+  }
+  const dl = d.recent_delivered || [];
+  rows.push(dl.length ? dl.map(function(it){
+    return '<div class="net-item done"><span class="net-tag done">'
+      + esc(it.mode === 'direct' ? '在线直传' : '恢复后补传') + '</span>'
+      + '<span class="mono">' + esc(netLine(it.filename || it.request_id)) + '</span>'
+      + '<span class="mono">🧭 原始采集 ' + esc(netLine(it.collected_at || it.order_at)) + '</span>'
+      + '<span class="net-item-m">📤 投递时间 ' + esc(netLine(it.uploaded_at)) + ' · '
+      + esc(fmtSize(it.resent_bytes || 0)) + '（重读本地副本）</span></div>';
+  }).join('') : '<div class="net-empty">还没有送达记录（在线时每次采集都会登记一条“在线直传”）。</div>');
+  box.innerHTML = rows.join('');
+}
+function renderNetLog(d){
+  const box = $('net_log'); if (!box) return;
+  const evs = d.events || [];
+  box.innerHTML = evs.length ? evs.map(function(e){
+    return '<div class="net-ev"><span class="net-ev-k ' + esc(netArg(e.kind)) + '">'
+      + esc(netEvLabel(e.kind)) + '</span><div class="net-ev-b"><div class="net-ev-t">'
+      + esc(netLine(e.text)) + (e.count > 1 ? (' <span class="mono">×' + esc(netLine(e.count)) + '</span>') : '')
+      + '</div><div class="net-ev-m">' + esc(netLine(e.time))
+      + (e.request_id ? (' · 采集 ' + esc(e.request_id)) : '')
+      + (e.detail ? (' — ' + esc(e.detail)) : '') + '</div></div></div>';
+  }).join('') : '<div class="net-empty">暂无事件（断网 / 进队 / 补传都会记录）。</div>';
+}
+// 指针按在本卡片里时暂缓重绘：保证“模拟断网 / 恢复网络”点击不被 2s 轮询重绘“吃掉”
+document.addEventListener('mousedown', function(e){
+  const t = e && e.target;
+  _netPointerDown = !!(t && t.closest && t.closest('#net_card'));
+});
+document.addEventListener('mouseup', function(){ _netPointerDown = false; });
+document.addEventListener('touchstart', function(e){
+  const t = e && e.target;
+  _netPointerDown = !!(t && t.closest && t.closest('#net_card'));
+}, {passive: true});
+document.addEventListener('touchend', function(){ _netPointerDown = false; });
+loadNetwork(true);                              // week14: 首帧立刻取一次（不必等 2s）
+setInterval(loadNetwork, NET_POLL_MS);          // week14: 每 2 秒同步一次网络 / 补传快照
+
+// __W14JS_END__
 // ============ Week6: request-id isolation, clarification & stop ============
 let _currentRequestId = null;    // id of the live task (text or voice)
 let _currentAbort = null;        // AbortController of the in-flight fetch

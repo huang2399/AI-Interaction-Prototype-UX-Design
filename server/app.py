@@ -2376,6 +2376,721 @@ def api_preferences():
 _pref_load()                        # 启动即载入（不存在则写出默认 v1）；此后每次修改都会立即落盘
 
 
+# ================== week14: 断网感知 · 本地缓存队列 · 恢复后补传 ==================
+# 任务书要求“断网时明确告知，恢复后正确补传”，核心是【双重状态】的如实表达：
+#     本地已保存（本机 server/ 落盘成功）  ⇄  远端待接收（上游云端投递通道不可达）
+# 实现纪律（与 week7~week12 一脉相承，任何一条都不许糊弄）：
+#   * 模拟的是【远端投递通道】，不是“板端 ↔ 本机”的 LAN：断网时板端照常上传、图片照常落盘、
+#     week7~week12 的遮挡判定 / 主动询问 / 偏好闸门一个字都不变 —— 否则“本地已保存”根本不成立；
+#   * 断网期间每一条采集结果（成功与失败）都进本地队列并标记 pending_upload，
+#     每条都带 request_id / 原始采集时间 / 排队时间 / 重试次数，可逐条审计；
+#   * 恢复网络由【后台线程】按【原始采集时间】升序逐条补传，并逐条记录补传时间；
+#     板端没上报采集时间的条目用“本地排队时间”兜底排序，同时如实标注 order_source（绝不冒充采集时间）；
+#   * 队列独立存 server/offline_queue.json（与台账 / 偏好分开），写盘用临时文件 + os.replace；
+#     已送达历史只保留最近 NET_QUEUE_HISTORY 条，待发送的一条都不丢。
+NETWORK_SIMULATED_OFFLINE = os.environ.get("NETWORK_SIMULATED_OFFLINE", "").strip().lower() in \
+    ("1", "true", "yes", "on")     # 系统变量：启动即视为断网（也可用 /api/network/toggle 手动切换）
+QUEUE_FILE = os.path.join(_BASE_DIR, 'offline_queue.json')
+NET_QUEUE_HISTORY = 50            # 已送达记录保留上限（防队列文件无限增长）
+NET_QUEUE_PREVIEW = 20            # /api/network/status 最多回传多少条待发送明细
+NET_RESTORE_STEP_SECONDS = 0.25   # 每条补传之间的间隔（前端看得见“补传中... X/Y”）
+NET_EVENT_KEEP = 40               # 事件日志保留上限
+NET_DELIVERY_LABEL = {            # 三种投递状态（前后端共用同一份文案，前端不写死）
+    "delivered": "✅ 已接收",
+    "pending_upload": "⏳ 待远端接收",
+    "missing_local": "⚠️ 未送达（本地副本已清理）",
+}
+NET_ORDER_SRC_LABEL = {"device": "板端上报的采集时间",
+                       "queue_time": "本地排队时间（板端未上报采集时间 → 兜底排序）"}
+
+network_lock = threading.Lock()
+network_state = {
+    "since_ms": None,             # 本次断网开始时刻（毫秒）
+    "offline_rounds": 0,          # 断网轮次（人工模拟）
+    "restore_rounds": 0,          # 补传轮次
+    "writes": 0,                  # 队列写盘次数
+    "seq": 0,                     # 排队序号（同刻采集时间的稳定排序依据）
+    "ev_id": 0,                   # 事件序号
+    "pending": [],                # 待发送明细（本地已保存 → 远端待接收）
+    "delivered": [],              # 已送达明细（含恢复后补传），保留最近 NET_QUEUE_HISTORY 条
+    "events": [],                 # 事件日志（断网 / 进队 / 补传 / 失败）
+    "counters": {"queued": 0, "delivered": 0, "resent": 0, "restore_fail": 0, "direct": 0},
+    "restore": {                  # 补传进度（前端据 running 显示“补传中...”）
+        "running": False, "trigger": None, "total": 0, "done": 0, "sent": 0, "failed": 0,
+        "started_ms": None, "started_at": None, "finished_ms": None, "finished_at": None,
+        "order": [], "order_note": None, "current": None, "last_result": None,
+    },
+}
+_net_restore_thread = None
+
+
+def net_is_offline():
+    """远端投递通道是否不可达（True = 断网：板端仍能上传、本地照常落盘，新采集进本地队列）。"""
+    return bool(NETWORK_SIMULATED_OFFLINE)
+
+
+def _net_ms():
+    return int(time.time() * 1000)
+
+
+def _net_effective_ms(item):
+    """补传排序用的时间去哪儿了：板端上报过采集时间就用它（source=device）；没上报 → 本地排队时间兜底。
+    绝不用“接收时间”冒充采集时间，也绝不让前端自己猜（来源逐条回传给前端显示）。"""
+    cms = item.get("collected_at_ms")
+    if cms:
+        return int(cms), "device"
+    return int(item.get("queued_at_ms") or item.get("received_at_ms") or 0), "queue_time"
+
+
+def _net_order(items):
+    """按【原始采集时间】升序（同一时刻用排队序号保证稳定）；缺失采集时间的用排队时间兜底参与同一轮排序。"""
+    return sorted(items, key=lambda it: (_net_effective_ms(it)[0], int(it.get("seq") or 0)))
+
+
+def _net_event_locked(kind, text, detail=None, request_id=None, dedup_key=None):
+    """写一条网络/补传事件（调用方需持有 network_lock）。dedup_key 相同 → 只累加次数不重复堆日志。"""
+    now_ms = _net_ms()
+    if dedup_key:
+        for e in network_state["events"]:
+            if e.get("dedup_key") == dedup_key:
+                e.update({"ts_ms": now_ms, "time": _ms_str(now_ms), "text": text, "detail": detail,
+                          "count": int(e.get("count") or 1) + 1, "offline": net_is_offline()})
+                return e
+    network_state["ev_id"] = int(network_state.get("ev_id") or 0) + 1
+    ev = {"id": network_state["ev_id"], "kind": kind, "text": text, "detail": detail,
+          "request_id": request_id, "dedup_key": dedup_key, "count": 1, "offline": net_is_offline(),
+          "ts_ms": now_ms, "time": _ms_str(now_ms)}
+    network_state["events"].append(ev)
+    if len(network_state["events"]) > NET_EVENT_KEEP * 3:
+        network_state["events"] = network_state["events"][-NET_EVENT_KEEP * 3:]
+    return ev
+
+
+def net_event(kind, text, detail=None, request_id=None, dedup_key=None):
+    with network_lock:
+        return _net_event_locked(kind, text, detail, request_id, dedup_key)
+
+
+def _net_item_public(item, now_ms=None, idx=None, total=None):
+    """一条待发送/已送达记录的对外视图（前端只渲染这些原文，不做任何推测）。"""
+    now_ms = int(now_ms or _net_ms())
+    eff, src = _net_effective_ms(item)
+    status = item.get("status") or "pending_upload"
+    name = item.get("filename")
+    doc = {
+        "queue_id": item.get("queue_id"), "seq": item.get("seq"),
+        "request_id": item.get("request_id"), "filename": name,
+        "kind": item.get("kind"), "size": item.get("size"), "trigger": item.get("trigger"),
+        "status": status, "status_label": NET_DELIVERY_LABEL.get(status, status),
+        "attempts": int(item.get("attempts") or 0),
+        "queued_at_ms": item.get("queued_at_ms"), "queued_at": item.get("queued_at"),
+        "collected_at_ms": item.get("collected_at_ms"), "collected_at": item.get("collected_at"),
+        "collected_at_source": item.get("collected_at_source") or "unknown",
+        "order_at_ms": eff, "order_at": _ms_str(eff), "order_source": src,
+        "order_source_label": NET_ORDER_SRC_LABEL.get(src, src),
+        "waited_ms": max(0, now_ms - int(item.get("queued_at_ms") or now_ms)),
+        "uploaded_at_ms": item.get("uploaded_at_ms"), "uploaded_at": item.get("uploaded_at"),
+        "resent_bytes": item.get("resent_bytes"), "resent_count": item.get("resent_count"),
+        "mode": item.get("mode"), "reason": item.get("reason"), "detail": item.get("detail"),
+        "error": item.get("last_error"),
+        "local_exists": (not name) or os.path.exists(os.path.join(UPLOAD_FOLDER, name)),
+    }
+    if idx is not None:
+        doc["order_index"] = idx
+    if total is not None:
+        doc["order_total"] = total
+    return doc
+
+def _net_queue_payload_locked():
+    """队列落盘内容：pending = 本地已保存 · 远端待接收；delivered = 已送达（含恢复后补传）。"""
+    now_ms = _net_ms()
+    return {"version": 1, "seq": int(network_state["seq"]),
+            "saved_at_ms": now_ms, "saved_at": _ms_str(now_ms),
+            "simulated_offline": net_is_offline(),
+            "note": "本地缓存队列（week14）：pending 待远端接收 / delivered 已送达；按原始采集时间补传",
+            "pending": list(network_state["pending"]),
+            "delivered": list(network_state["delivered"])[-NET_QUEUE_HISTORY:]}
+
+
+def _net_queue_save_locked():
+    """原子写盘（临时文件 + os.replace）—— 崩溃/断电不会把队列写坏。"""
+    try:
+        tmp = QUEUE_FILE + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(_net_queue_payload_locked(), f, ensure_ascii=False, indent=1)
+        os.replace(tmp, QUEUE_FILE)
+        network_state["writes"] += 1
+        return True
+    except Exception as e:
+        print(f"【告警】本地队列保存失败: {e}")
+        return False
+
+
+def net_save():
+    with network_lock:
+        return _net_queue_save_locked()
+
+
+def net_load():
+    """启动读回队列：断网期间排队的数据绝不因为重启而丢。"""
+    with network_lock:
+        network_state["pending"] = []
+        network_state["delivered"] = []
+        doc = None
+        if os.path.exists(QUEUE_FILE):
+            try:
+                with open(QUEUE_FILE, 'r', encoding='utf-8') as f:
+                    doc = json.load(f)
+            except Exception as e:
+                print(f"【告警】本地队列读取失败（按空队列启动）: {e}")
+        if isinstance(doc, dict):
+            network_state["pending"] = [it for it in (doc.get("pending") or []) if isinstance(it, dict)]
+            network_state["delivered"] = [it for it in (doc.get("delivered") or [])
+                                         if isinstance(it, dict)][-NET_QUEUE_HISTORY:]
+            network_state["seq"] = max([int(doc.get("seq") or 0)]
+                                       + [int(it.get("seq") or 0) for it in network_state["pending"]])
+        elif isinstance(doc, list):
+            network_state["pending"] = [it for it in doc if isinstance(it, dict)]
+            network_state["seq"] = len(network_state["pending"])
+        for it in network_state["pending"]:        # 重启后重算“原始采集时间”排序字段（来源照旧如实标注）
+            eff, src = _net_effective_ms(it)
+            it["order_at_ms"], it["order_source"] = eff, src
+            it.setdefault("status", "pending_upload")
+        for it in network_state["delivered"]:
+            it.setdefault("status", "delivered")
+            it.setdefault("mode", "restore")
+        if not os.path.exists(QUEUE_FILE):
+            _net_queue_save_locked()               # 首次启动即落盘：文件真实存在，不是内存里的幻觉
+        return {"pending": len(network_state["pending"]), "delivered": len(network_state["delivered"]),
+                "writes": network_state["writes"]}
+
+
+def _net_enqueue_locked(entry):
+    """把一条【本地已保存】的采集结果放进待发送队列（同一 request_id 只保留一条，重入只累加次数）。"""
+    rid, name = entry.get("request_id"), entry.get("name")
+    key = rid or name or ("ts_%s" % entry.get("ts_ms"))
+    now_ms = _net_ms()
+    for it in network_state["pending"]:
+        if it.get("key") == key:
+            it["attempts"] = int(it.get("attempts") or 0) + 1
+            it["last_seen_ms"] = now_ms
+            return it, False
+    network_state["seq"] += 1
+    item = {
+        "key": key, "seq": network_state["seq"],
+        "queue_id": "q_%d_%s" % (now_ms, uuid.uuid4().hex[:6]),
+        "request_id": rid, "filename": name,
+        "kind": entry.get("kind") or ("photo" if name else "failed"),
+        "size": int(entry.get("size") or 0), "trigger": entry.get("trigger"),
+        "status": "pending_upload", "attempts": 1,
+        "queued_at_ms": now_ms, "queued_at": _ms_str(now_ms),
+        "collected_at_ms": entry.get("collected_at_ms"), "collected_at": entry.get("collected_at"),
+        "collected_at_source": entry.get("collected_at_source") or "unknown",
+        "received_at_ms": entry.get("received_at_ms"),
+        "reason": entry.get("reason"), "detail": entry.get("detail"),
+    }
+    eff, src = _net_effective_ms(item)
+    item["order_at_ms"], item["order_source"] = eff, src
+    network_state["pending"].append(item)
+    network_state["counters"]["queued"] += 1
+    _net_queue_save_locked()
+    return item, True
+
+
+def _net_record_delivered_locked(item, at_ms, mode, resent_bytes=0, note=None):
+    """登记一条【已送达】记录（mode：direct=在线直传 / restore=恢复后补传），并保留补传时间。"""
+    rec = dict(item)
+    rec.update({"status": "delivered", "mode": mode, "uploaded_at_ms": at_ms,
+                "uploaded_at": _ms_str(at_ms), "resent_bytes": resent_bytes, "note": note})
+    network_state["delivered"].append(rec)
+    if len(network_state["delivered"]) > NET_QUEUE_HISTORY:
+        network_state["delivered"] = network_state["delivered"][-NET_QUEUE_HISTORY:]
+    network_state["counters"]["delivered"] += 1
+    network_state["counters"]["resent" if mode == "restore" else "direct"] += 1
+    return rec
+
+def _net_fields_direct(now_ms):
+    """在线直传的投递字段（台账写入）。"""
+    return {
+        "delivery_status": "delivered", "delivery_label": NET_DELIVERY_LABEL["delivered"],
+        "delivery_mode": "online_direct", "delivery_stage": "远端已接收（在线直传）",
+        "delivered_at_ms": now_ms, "delivered_at": _ms_str(now_ms),
+        "queue_id": None, "queued_at_ms": None, "queued_at": None,
+        "delivery_note": ("在线直传：本地落盘与远端投递同时完成（delivered_at = received_at）；"
+                          "demo 的远端通道为模拟通道，时间戳与顺序全部真实记录，绝不假装"),
+    }
+
+
+def _net_fields_pending(item):
+    """断网缓存的投递字段（台账写入）：本地已保存，远端待接收，等恢复后按原始采集时间补传。"""
+    return {
+        "delivery_status": "pending_upload", "delivery_label": NET_DELIVERY_LABEL["pending_upload"],
+        "delivery_mode": "offline_cache", "delivery_stage": "本地已保存 · 远端待接收",
+        "queue_id": item.get("queue_id"), "queued_at_ms": item.get("queued_at_ms"),
+        "queued_at": item.get("queued_at"), "delivered_at_ms": None, "delivered_at": None,
+        "delivery_note": ("本地已保存（图片已落盘、台账已记录、判定照常），但远端投递通道断网 → "
+                          "已进本地队列第 %s 条，恢复后按原始采集时间依次补传" % item.get("seq")),
+    }
+
+
+def net_track_delivery(entry):
+    """week14 核心钩子：给一条刚入库的采集记录打【投递状态】。
+
+    断网 → pending_upload（本地已保存 · 远端待接收，进本地队列，同一 request_id 不重复计数）；
+    在线 → delivered（直传远端，投递时间 = 服务器接收时间）。
+    返回写入台账的字段；entry 为空返回 None（绝不伪造记录）。"""
+    if not entry:
+        return None
+    now_ms = _net_ms()
+    # week14: 在线直传的“投递时间” = 服务器接收时间（delivered_at == received_at，不留凭空多出的几毫秒）
+    recv_ms = int(entry.get("received_at_ms") or entry.get("ts_ms") or now_ms)
+    if net_is_offline():
+        with network_lock:
+            item, created = _net_enqueue_locked(entry)
+            still_pending = (item.get("status") == "pending_upload")
+            item_pub = dict(item)
+        if still_pending:
+            fields = _net_fields_pending(item_pub)
+        else:                                   # 极端情况：排队瞬间就被补传线程送达
+            fields = _net_fields_direct(int(item_pub.get("uploaded_at_ms") or recv_ms))
+            fields["delivery_mode"] = "restore"
+            fields["delivery_stage"] = "远端已接收（排队瞬间已被补传线程送达）"
+            fields["queue_id"] = item_pub.get("queue_id")
+        net_event("queue_enter",
+                  ("断网：本地已保存，远端待接收（第 %s 条进本地队列）" % item_pub.get("seq")) if created
+                  else "断网：同一次采集重复入库 → 队列不重复计数（只累加遇到次数）",
+                  detail=("图片已落盘、台账已记录、week7~week12 判定不变；远端投递等网络恢复后"
+                          "按原始采集时间升序补传"),
+                  request_id=entry.get("request_id"), dedup_key="queue:%s" % item_pub.get("key"))
+    else:
+        with network_lock:
+            _net_record_delivered_locked(
+                {"key": entry.get("request_id") or entry.get("name") or ("ts_%s" % entry.get("ts_ms")),
+                 "queue_id": "d_%d_%s" % (now_ms, uuid.uuid4().hex[:6]), "seq": 0,
+                 "request_id": entry.get("request_id"), "filename": entry.get("name"),
+                 "kind": entry.get("kind") or "photo", "size": int(entry.get("size") or 0),
+                 "trigger": entry.get("trigger"), "status": "delivered",
+                 "collected_at_ms": entry.get("collected_at_ms"),
+                 "collected_at": entry.get("collected_at"),
+                 "collected_at_source": entry.get("collected_at_source") or "unknown",
+                 "queued_at_ms": recv_ms, "queued_at": _ms_str(recv_ms)},
+                recv_ms, "direct", resent_bytes=int(entry.get("size") or 0),
+                note="在线直传：服务器接收即视为远端已接收（delivered_at = received_at）")
+            _net_queue_save_locked()
+        fields = _net_fields_direct(recv_ms)
+    with ledger_lock:
+        entry.update(fields)
+        ledger_save()
+    return fields
+
+
+def _net_item_send_locked(item, at_ms):
+    """把一条待发送记录补传到远端（调用方需持有 network_lock）。
+
+    真实地从【本地副本】读回字节（照片还会校验 JPEG 头），本地副本缺失/损坏 → 如实失败：
+    记录保留、状态标为 missing_local、绝不假装送达（也绝不静默丢弃）。"""
+    name = item.get("filename")
+    payload, err = b"", None
+    if name:
+        path = os.path.join(UPLOAD_FOLDER, name)
+        if not os.path.exists(path):
+            err = "本地副本已不存在（可能被“只保留 50 张”策略清理）：%s" % name
+        else:
+            try:
+                with open(path, 'rb') as f:
+                    payload = f.read()
+            except Exception as e:
+                err = "本地副本读取失败：%s" % e
+            else:
+                if item.get("kind") == "photo" and payload[:2] != b'\xff\xd8':
+                    err = "本地副本不是有效 JPEG（完整性校验失败）"
+    item["attempts"] = int(item.get("attempts") or 0) + 1
+    if err:
+        item["status"] = "missing_local"
+        item["last_error"] = err
+        item["failed_at_ms"] = at_ms
+        network_state["counters"]["restore_fail"] += 1
+        return False, err
+    item["status"] = "delivered"
+    item["mode"] = "restore"
+    item["uploaded_at_ms"] = at_ms
+    item["uploaded_at"] = _ms_str(at_ms)
+    item["resent_bytes"] = len(payload) if name else 0
+    item["resent_count"] = int(item.get("resent_count") or 0) + 1
+    return True, None
+
+
+def _net_write_entry_delivery(item, at_ms, ok, detail=None):
+    """把补传结果回写台账（按 request_id / 文件名定位；台账已轮转则如实返回 False，不新建记录）。"""
+    entry = ledger_find_any(request_id=item.get("request_id"), filename=item.get("filename"))
+    if not entry:
+        return False
+    with ledger_lock:
+        if ok:
+            entry["delivery_status"] = "delivered"
+            entry["delivery_label"] = NET_DELIVERY_LABEL["delivered"]
+            entry["delivery_mode"] = "restore"
+            entry["delivery_stage"] = "远端已接收（恢复网络后补传）"
+            entry["delivered_at_ms"] = at_ms
+            entry["delivered_at"] = _ms_str(at_ms)
+            entry["delivery_note"] = ("恢复网络后补传完成：从本地副本重读 %s B 并按原始采集时间顺序重传"
+                                      % (item.get("resent_bytes") or 0))
+        else:
+            entry["delivery_status"] = "missing_local"
+            entry["delivery_label"] = NET_DELIVERY_LABEL["missing_local"]
+            entry["delivery_mode"] = "restore_failed"
+            entry["delivery_stage"] = "未送达（本地副本已清理）"
+            entry["delivery_note"] = detail or "本地副本不存在，无法补传（记录保留，绝不假装送达）"
+        ledger_save()
+    return True
+
+def _net_restore_begin_locked(trigger, total):
+    now_ms = _net_ms()
+    network_state["restore"].update({
+        "running": True, "trigger": trigger, "total": total, "done": 0, "sent": 0, "failed": 0,
+        "started_ms": now_ms, "started_at": _ms_str(now_ms), "finished_ms": None, "finished_at": None,
+        "order": [], "order_note": None, "current": None, "last_result": None})
+    network_state["restore_rounds"] += 1
+
+
+def _net_restore_worker(trigger="toggle", paced=True):
+    """后台补传线程主体：按【原始采集时间】升序逐条补传，并逐条记录补传时间。
+
+    规则（硬性）：
+      * 顺序 = 原始采集时间（collected_at）升序；板端没上报采集时间的条目用本地排队时间兜底，
+        且本轮 order_note 与每条 order_source 都如实回传（绝不把排队时间冒充成采集时间）；
+      * 每条补传都写 uploaded_at_ms（补传时间）+ 从本地副本重读的字节数；
+      * 补传途中若又被切回断网 → 立即停手，剩余条目留在队列里（绝不丢）；
+      * 本地副本已清理 → 如实失败（missing_local），记录保留。"""
+    try:
+        with network_lock:
+            todo = _net_order([it for it in network_state["pending"] if it.get("status") == "pending_upload"])
+            _net_restore_begin_locked(trigger, len(todo))
+            if not todo:
+                now_ms = _net_ms()
+                network_state["restore"].update({"running": False, "finished_ms": now_ms,
+                                                 "finished_at": _ms_str(now_ms), "last_result": "empty"})
+                _net_event_locked("restore_skip", "恢复网络：本地队列为空，无需补传",
+                                  dedup_key="restore_empty")
+                _net_queue_save_locked()
+                return "empty"
+            fallback = [_net_effective_ms(it)[1] == "queue_time" for it in todo]
+            note = ("按原始采集时间（collected_at）升序补传" if not any(fallback) else
+                    "按原始采集时间升序补传；其中 %d 条缺失板端采集时间 → 用本地排队时间兜底排序"
+                    "（逐条标注 order_source，绝不冒充采集时间）" % sum(1 for f in fallback if f))
+            network_state["restore"]["order_note"] = note
+            _net_event_locked("restore_start", "恢复网络：后台线程开始补传（共 %d 条）" % len(todo),
+                              detail=note + "；每条都会记录补传时间（uploaded_at_ms）",
+                              dedup_key="restore_start")
+        for idx, item in enumerate(todo, 1):
+            if net_is_offline():          # 补传途中又被切回离线 → 立刻停手，剩下的留在队列里
+                with network_lock:
+                    now_ms = _net_ms()
+                    network_state["restore"].update({"running": False, "current": None,
+                                                     "finished_ms": now_ms, "finished_at": _ms_str(now_ms),
+                                                     "last_result": "offline_again"})
+                    _net_event_locked("restore_stop",
+                                      "补传中途切回断网 → 立即停止（剩余 %d 条留在本地队列）"
+                                      % max(0, len(todo) - idx + 1), dedup_key="restore_stop")
+                    _net_queue_save_locked()
+                return "offline_again"
+            with network_lock:
+                network_state["restore"]["current"] = _net_item_public(item, idx=idx, total=len(todo))
+                network_state["restore"]["order"].append(item.get("queue_id"))
+            at_ms = _net_ms()
+            with network_lock:
+                ok, err = _net_item_send_locked(item, at_ms)
+                sent_item = dict(item)
+                if ok:
+                    network_state["pending"] = [x for x in network_state["pending"] if x is not item]
+                    _net_record_delivered_locked(sent_item, at_ms, "restore",
+                                                 resent_bytes=int(sent_item.get("resent_bytes") or 0),
+                                                 note="恢复网络后补传（按原始采集时间顺序）")
+                rest = network_state["restore"]
+                rest["done"] = idx
+                rest["sent" if ok else "failed"] = int(rest["sent" if ok else "failed"]) + 1
+                rest["current"] = _net_item_public(sent_item, idx=idx, total=len(todo))
+                _net_event_locked("restore_item",
+                                  "第 %d/%d 条补传%s：%s" % (idx, len(todo), "成功" if ok else "失败",
+                                                             sent_item.get("filename")
+                                                             or sent_item.get("request_id") or "--"),
+                                  detail=("补传时间 %s · 从本地副本重读 %s B"
+                                          % (_ms_str(at_ms), sent_item.get("resent_bytes") or 0)) if ok
+                                  else ("未送达：%s（记录保留）" % err),
+                                  request_id=sent_item.get("request_id"),
+                                  dedup_key="restore_item:%s" % sent_item.get("queue_id"))
+                _net_queue_save_locked()
+            _net_write_entry_delivery(sent_item, at_ms, ok, err)
+            if paced and idx < len(todo):
+                time.sleep(NET_RESTORE_STEP_SECONDS)
+        with network_lock:
+            now_ms = _net_ms()
+            rest = network_state["restore"]
+            rest.update({"running": False, "current": None, "finished_ms": now_ms,
+                         "finished_at": _ms_str(now_ms),
+                         "last_result": ("done" if not rest["failed"] else "partial")})
+            _net_event_locked("restore_done",
+                              "补传完成：%d 条已送达%s"
+                              % (rest["sent"], ("，%d 条未送达（本地副本已清理）" % rest["failed"])
+                                 if rest["failed"] else ""),
+                              detail="顺序：%s" % rest["order_note"], dedup_key="restore_done")
+            _net_queue_save_locked()
+        return "done"
+    except Exception as e:
+        print(f"【补传异常】后台补传线程出错: {e}")
+        with network_lock:
+            now_ms = _net_ms()
+            network_state["restore"].update({"running": False, "current": None, "finished_ms": now_ms,
+                                             "finished_at": _ms_str(now_ms), "last_result": "error: %s" % e})
+            _net_event_locked("restore_fail", "补传线程异常：%s" % e, dedup_key="restore_error")
+            _net_queue_save_locked()
+        return "error"
+
+
+def net_start_restore(trigger="toggle", paced=True):
+    """启动后台补传线程（恢复网络时调用）。返回 (started, msg)。"""
+    global _net_restore_thread
+    with network_lock:
+        if network_state["restore"]["running"]:
+            return False, "补传已在进行中（trigger=%s）" % (network_state["restore"].get("trigger") or "--")
+    if net_is_offline():
+        return False, "当前仍是断网（模拟）状态：先恢复网络再补传"
+    t = threading.Thread(target=_net_restore_worker, args=(trigger, paced),
+                         name="net-restore", daemon=True)
+    _net_restore_thread = t
+    t.start()
+    return True, None
+
+
+def net_restore_wait(timeout=8.0):
+    """等后台补传线程结束（前端/测试/关停用）。"""
+    t = _net_restore_thread
+    if t is None:
+        return True
+    t.join(timeout)
+    return not t.is_alive()
+
+
+def net_backfill_sync(trigger="sync"):
+    """同步补传（人工触发 / 测试用）——与后台线程完全同一份逻辑。"""
+    return _net_restore_worker(trigger, paced=False)
+
+
+def net_set_offline(offline, reason="api"):
+    """切换（模拟）网络状态。返回本次调用前的状态。"""
+    global NETWORK_SIMULATED_OFFLINE
+    offline = bool(offline)
+    prev = net_is_offline()
+    NETWORK_SIMULATED_OFFLINE = offline
+    if offline == prev:
+        with network_lock:
+            return prev
+    now_ms = _net_ms()
+    with network_lock:
+        waiting = len([it for it in network_state["pending"] if it.get("status") == "pending_upload"])
+        if offline:
+            network_state["since_ms"] = now_ms
+            network_state["offline_rounds"] += 1
+            _net_event_locked("offline_enter", "模拟断网开启：远端投递通道不可达 → 新采集进本地队列",
+                              detail=("板端 ↔ 本机的 LAN 不受影响：图片照常落盘（本地已保存）、"
+                                      "week7~week12 判定不变；队列里已有 %d 条待发送" % waiting),
+                              dedup_key="offline_enter")
+        else:
+            network_state["since_ms"] = None
+            _net_event_locked("offline_exit", "模拟断网关闭：远端投递通道恢复 → 后台线程按原始采集时间补传",
+                              detail="待发送 %s 条（触发：%s）" % (waiting, reason),
+                              dedup_key="offline_exit")
+        _net_queue_save_locked()
+    print("【week14】远端投递通道 → %s（触发：%s，待发送 %d 条）"
+          % ("断网（本地已保存 · 远端待接收）" if offline else "在线（直传远端）", reason, waiting))
+    return prev
+
+
+def net_startup_check():
+    """启动自检：如实汇报队列现状；若上次运行遗留待发送数据而当前在线 → 自动启动后台补传。"""
+    with network_lock:
+        waiting = len([it for it in network_state["pending"] if it.get("status") == "pending_upload"])
+        stuck = len([it for it in network_state["pending"] if it.get("status") != "pending_upload"])
+    print("【week14】本地缓存队列：待发送 %d 条 / 未送达 %d 条（队列文件 %s）"
+          % (waiting, stuck, os.path.basename(QUEUE_FILE)))
+    info = {"offline": net_is_offline(), "pending": waiting, "stuck": stuck, "restore_started": False}
+    if waiting and not net_is_offline():
+        started, msg = net_start_restore("startup")
+        info["restore_started"] = started
+        print("【week14】启动时发现 %d 条待发送（应为上次断网遗留）→ %s"
+              % (waiting, "已启动后台补传线程" if started else ("未启动：%s" % msg)))
+    return info
+
+def net_policy():
+    """week14 策略参数与口径说明（前端一律从这里取，绝不写死）。"""
+    return {
+        "env_var": "NETWORK_SIMULATED_OFFLINE",
+        "simulated_offline": net_is_offline(),
+        "queue_file": os.path.basename(QUEUE_FILE),
+        "step_seconds": NET_RESTORE_STEP_SECONDS,
+        "history_keep": NET_QUEUE_HISTORY,
+        "preview": NET_QUEUE_PREVIEW,
+        "sort_by": ("collected_at_ms（原始采集时间）升序；板端未上报时用本地排队时间兜底，"
+                    "并逐条标注 order_source"),
+        "delivery_states": dict(NET_DELIVERY_LABEL),
+        "order_source_labels": dict(NET_ORDER_SRC_LABEL),
+        "enqueue_on": ["/api/device/upload_photo 成功", "/api/device/upload_photo 失败（含超时 / 空帧 / 板端报错）"],
+        "simulate_note": ("模拟的是【远端投递通道】：断网时板端 ↔ 本机 LAN 不受影响 —— 图片照常落盘"
+                          "（本地已保存）、week7~week12 的遮挡判定 / 主动询问 / 偏好闸门完全不变，"
+                          "只有“远端是否已接收”变成待接收"),
+        "restore_note": ("恢复网络时由后台线程 net-restore 按原始采集时间升序补传，逐条记录补传时间"
+                         "（uploaded_at_ms）；本地副本缺失则如实报 missing_local 并保留记录，绝不假装送达"),
+    }
+
+
+def _net_restore_public_locked():
+    """补传进度快照（调用方需持有 network_lock）。"""
+    rest = network_state["restore"]
+    total, done = int(rest.get("total") or 0), int(rest.get("done") or 0)
+    res = rest.get("last_result")
+    if rest.get("running"):
+        label = "🔄 补传中... %d/%d" % (done, total)
+    elif res == "empty":
+        label = "队列为空，无需补传"
+    elif res == "offline_again":
+        label = "补传中途切回断网 → 已停止（剩余条目留在队列）"
+    elif res == "done":
+        label = "✅ 补传完成：%d 条已送达（补传时间已记录）" % int(rest.get("sent") or 0)
+    elif res == "partial":
+        label = ("⚠️ 补传完成：%d 条已送达 / %d 条未送达（本地副本已清理）"
+                 % (int(rest.get("sent") or 0), int(rest.get("failed") or 0)))
+    elif res and str(res).startswith("error"):
+        label = "❌ 补传异常：%s" % res
+    else:
+        label = "尚未补传（idle）"
+    doc = dict(rest)
+    doc.update({"remaining": max(0, total - done),
+                "percent": (int(done * 100 / total) if total else 0), "label": label})
+    return doc
+
+
+def net_public(compact=False):
+    """网络 / 补传对外视图。compact=True → /api/status 用的轻量快照（不带明细列表，且只读不写盘）。"""
+    now_ms = _net_ms()
+    with network_lock:
+        pending = list(network_state["pending"])
+        delivered = list(network_state["delivered"])
+        events = list(network_state["events"])
+        restore = _net_restore_public_locked()
+        counters = dict(network_state["counters"])
+        writes = network_state["writes"]
+        since_ms = network_state["since_ms"]
+        offline_rounds, restore_rounds = network_state["offline_rounds"], network_state["restore_rounds"]
+    waiting = [it for it in pending if (it.get("status") or "pending_upload") == "pending_upload"]
+    stuck = [it for it in pending if (it.get("status") or "pending_upload") != "pending_upload"]
+    online = not net_is_offline()
+    doc = {
+        "status": "ok",
+        "online": online, "offline": not online, "simulated_offline": net_is_offline(),
+        "env_var": "NETWORK_SIMULATED_OFFLINE",
+        "mode": "online_direct" if online else "offline_cache",
+        "mode_label": "🟢 在线（直传远端）" if online else "🔴 离线（本地已保存 · 远端待接收）",
+        "pill_label": ("🟢 在线" if online else ("🔴 离线（待发送 %d 条）" % len(waiting))),
+        "pending_count": len(waiting), "stuck_count": len(stuck),
+        "pending_bytes": sum(int(it.get("size") or 0) for it in waiting),
+        "offline_since_ms": None if online else since_ms,
+        "offline_since": None if (online or not since_ms) else _ms_str(since_ms),
+        "offline_rounds": offline_rounds, "restore_rounds": restore_rounds,
+        "restore": restore, "counters": counters,
+        "storage": {"file": os.path.basename(QUEUE_FILE), "path": QUEUE_FILE,
+                    "exists": os.path.exists(QUEUE_FILE), "writes": writes, "format": "JSON（version 1）",
+                    "atomic": "临时文件 + os.replace（崩溃/断电不会写坏队列）",
+                    "note": ("队列独立存放：photos_ledger.json 是采集记录（一次采集一条），"
+                             "offline_queue.json 是投递进度（待发送 / 已送达）")},
+        "policy": net_policy(),
+        "server_time_ms": now_ms,
+    }
+    if compact:
+        doc["recent_delivered"] = len(delivered)
+        doc["latest_event"] = events[-1] if events else None
+        return doc
+    doc["pending"] = [_net_item_public(it, now_ms=now_ms, idx=i, total=len(waiting))
+                      for i, it in enumerate(waiting[:NET_QUEUE_PREVIEW], 1)]
+    doc["stuck"] = [_net_item_public(it, now_ms=now_ms) for it in stuck[:NET_QUEUE_PREVIEW]]
+    doc["recent_delivered"] = [_net_item_public(it, now_ms=now_ms) for it in delivered[-10:][::-1]]
+    doc["events"] = events[-NET_EVENT_KEEP:][::-1]
+    doc["event_count"] = len(events)
+    return doc
+
+@app.route('/api/network/status', methods=['GET'])
+def api_network_status():
+    """week14: 网络与补传快照（在线/离线、待发送数量与明细、补传进度与记录、事件日志、策略参数）。
+
+    ?compact=1 → 只回轻量快照（与 /api/status.network 同一份口径）。"""
+    compact = (request.args.get("compact") or "").strip().lower() in ("1", "true", "yes")
+    return jsonify(net_public(compact=compact)), 200
+
+
+@app.route('/api/network/toggle', methods=['POST'])
+def api_network_toggle():
+    """week14: 手动模拟断网 / 恢复网络。
+
+    入参 JSON（可省略）：{"offline": true|false} 或 {"action": "offline"|"online"}；
+    都不给 → 直接翻转当前状态。恢复网络时自动启动后台补传线程（按原始采集时间升序）。"""
+    d = request.get_json(silent=True) or {}
+    raw = d.get("offline", request.args.get("offline"))
+    action = str(d.get("action") or request.args.get("action") or "").strip().lower()
+    if raw is None and action:
+        if action in ("offline", "off", "simulate_offline", "disconnect"):
+            raw = True
+        elif action in ("online", "on", "recover", "connect"):
+            raw = False
+        else:
+            return jsonify({"status": "error", "ok": False, "action": action,
+                            "msg": "action 只支持 offline / online（收到：%s）" % action}), 400
+    if raw is None:
+        target = (not net_is_offline())
+    elif isinstance(raw, str):
+        target = raw.strip().lower() in ("1", "true", "yes", "on", "offline")
+    else:
+        target = bool(raw)
+    prev = net_set_offline(target, reason="api/toggle")
+    changed = (prev != target)
+    started, rmsg = False, None
+    if changed and not target:
+        with network_lock:
+            waiting = len([it for it in network_state["pending"] if it.get("status") == "pending_upload"])
+        if waiting:
+            started, rmsg = net_start_restore("toggle")
+    payload = net_public()
+    payload["changed"] = changed
+    payload["restore_started"] = started
+    payload["restore_msg"] = rmsg
+    payload["msg"] = ("已切到模拟断网：新采集将进本地队列（本地已保存 · 远端待接收）" if target else
+                      ("已恢复网络：远端投递通道可用"
+                       + ("，后台补传线程已启动" if started else "（队列为空，无需补传）")))
+    return jsonify(payload), 200
+
+
+@app.route('/api/network/restore', methods=['POST'])
+def api_network_restore():
+    """week14: 人工触发补传（仅在线时有效）。默认起后台线程；{"sync": true} 或 ?sync=1 走同步补传。"""
+    if net_is_offline():
+        return jsonify({"status": "error", "ok": False, "offline": True,
+                        "msg": "当前是断网（模拟）状态：先恢复网络再补传"}), 409
+    d = request.get_json(silent=True) or {}
+    sync = bool(d.get("sync")) or (request.args.get("sync") or "").lower() in ("1", "true", "yes")
+    if sync:
+        result = net_backfill_sync("api")
+        payload = net_public()
+        payload.update({"ok": True, "sync": True, "result": result, "restore_started": True,
+                        "msg": "同步补传结束：%s" % result})
+        return jsonify(payload), 200
+    started, msg = net_start_restore("api", paced=bool(d.get("paced", True)))
+    payload = net_public()
+    payload.update({"ok": True, "sync": False, "restore_started": started, "restore_msg": msg,
+                    "msg": ("后台补传线程已启动（按原始采集时间升序）" if started else (msg or "补传未启动"))})
+    return jsonify(payload), 200
+
+
+net_load()      # 启动即读回本地队列（不存在则立刻写出一份空队列）；断网期间排队的数据重启不丢
+
+
 def check_timeout():
     """推进 week7 单张采集状态机（/api/status 与设备/AI 路径都会调用）。
       ACCEPTED --(板端 2s 冷却结束)--> COLLECTING（“采集中...”）
@@ -2511,7 +3226,7 @@ def _capture_public():
     remaining = None
     if ts["status"] in ("PENDING", "ACCEPTED", "COLLECTING") and ts.get("deadline"):
         remaining = max(0.0, round(ts["deadline"] - now, 1))
-    return {
+    pub = {
         "state": ts["status"],
         "request_id": ts.get("request_id"),
         "task_id": ts.get("task_id"),
@@ -2537,6 +3252,21 @@ def _capture_public():
         "retake_of": ts.get("retake_of"),
         "prompt_id": ts.get("prompt_id"),
     }
+    # week14: 本次采集的【投递状态】—— 在线直传（delivered）/ 断网待远端接收（pending_upload）/ 未送达。
+    # 前端采集面板据此如实显示，绝不自己猜“远端到底收到没有”。
+    ent = None
+    if ts.get("request_id") or ts.get("latest_photo"):
+        ent = ledger_find_any(request_id=ts.get("request_id"), filename=ts.get("latest_photo"))
+    pub.update({
+        "delivery_status": (ent or {}).get("delivery_status"),
+        "delivery_label": (ent or {}).get("delivery_label"),
+        "delivery_stage": (ent or {}).get("delivery_stage"),
+        "delivered_at_ms": (ent or {}).get("delivered_at_ms"),
+        "delivered_at": (ent or {}).get("delivered_at"),
+        "queued_at_ms": (ent or {}).get("queued_at_ms"),
+        "queued_at": (ent or {}).get("queued_at"),
+    })
+    return pub
 
 def photo_avg_gray(path):
     """平均灰度（0-255）与暗像素占比 —— 用于“镜头遮挡/画面不可用”初判。
@@ -2922,6 +3652,17 @@ def ledger_load():
         e.setdefault("upload_latency_ms", None)
         e.setdefault("location_fix", False)
         e.setdefault("location_note", None)
+        # week14: 旧记录补齐【投递状态】字段（week14 之前没有投递追踪 → 如实标注“按已接收”，不伪造投递时间）
+        e.setdefault("delivery_status", "delivered")
+        e.setdefault("delivery_label", NET_DELIVERY_LABEL["delivered"])
+        e.setdefault("delivery_mode", "legacy_assumed")
+        e.setdefault("delivery_stage", "历史记录（week14 之前无投递追踪，按“已接收”标注）")
+        e.setdefault("delivered_at_ms", None)
+        e.setdefault("delivered_at", None)
+        e.setdefault("queue_id", None)
+        e.setdefault("queued_at_ms", None)
+        e.setdefault("queued_at", None)
+        e.setdefault("delivery_note", "week14 之前的记录：当时没有投递追踪，按“已接收”如实标注")
     ledger_save()
 
 ledger_load()
@@ -3013,6 +3754,12 @@ def ledger_add_attempt(request_id, task_id, trigger, ok, reason=None, detail=Non
         if len(ledger) > 200:
             ledger[:] = ledger[-200:]
         ledger_save()
+    # week14: 每条采集结果都要有明确的【投递状态】—— 在线直传（delivered）/ 断网进本地队列（pending_upload）。
+    # 这里是所有采集结果（成功 + 失败 + 未联机）的唯一落台账出口，因此钩子放在这里，绝不漏记。
+    try:
+        net_track_delivery(entry)
+    except Exception as e:
+        print(f"【告警】投递状态记账失败（不影响采集结果与台账）: {e}")
     return entry
 
 def ledger_mark_cleaned(names):
@@ -3800,6 +4547,19 @@ def list_photos():
                 "satellites": e.get("location_satellites"),
                 "request_id": e.get("location_request_id"),
             },
+            # ---- week14: 投递状态（本地已保存 ⇄ 远端待接收 / ✅ 已接收 / ⚠️ 未送达）----
+            "delivery_status": e.get("delivery_status") or "delivered",
+            "delivery_label": e.get("delivery_label") or NET_DELIVERY_LABEL["delivered"],
+            "delivery_mode": e.get("delivery_mode") or "legacy_assumed",
+            "delivery_stage": e.get("delivery_stage"),
+            "delivery_note": e.get("delivery_note"),
+            "delivered_at_ms": e.get("delivered_at_ms"),
+            "delivered_at": e.get("delivered_at"),
+            "queue_id": e.get("queue_id"),
+            "queued_at_ms": e.get("queued_at_ms"),
+            "queued_at": e.get("queued_at"),
+            "pending_upload": ((e.get("delivery_status") or "delivered") == "pending_upload"),
+            "delivery_missing_local": ((e.get("delivery_status") or "") == "missing_local"),
             "historical_location": {
                 "available": bool(e.get("location_historical_available")),
                 "latitude": e.get("location_historical_latitude"),
@@ -3998,6 +4758,9 @@ def get_status():
         "endpoint": "/api/preferences",
         "note": "偏好只改变“要不要打扰用户”（弹窗 / 追问），不改变任何传感器判定；每次修改都会产生新的 config_version。",
     }
+    # ---- week14: 网络与补传（轻量快照；完整队列明细 / 事件日志走 /api/network/status）----
+    data["network"] = net_public(compact=True)
+    data["network_policy"] = net_policy()
     with timer_lock:
         data["timer_running"] = timer_state["running"]
         data["timer_current_batch"] = timer_state["current_batch"]
@@ -5172,4 +5935,5 @@ if __name__ == '__main__':
     print(f"   API Key : {key_display}")
     print(f"   Ready   : {'✅ 可用' if key_ok else '❌ 缺少 API Key'}")
     print("=" * 55)
+    net_startup_check()      # week14: 如实汇报本地缓存队列；上次断网遗留的待发送数据 → 启动即补传
     app.run(host='0.0.0.0', port=5000, threaded=True)
